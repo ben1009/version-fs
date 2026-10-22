@@ -165,6 +165,7 @@ ordering, and retention.
 | Generation | A published, immutable, independently readable logical state. |
 | Workspace | An authorized namespace of branches and retained Generations. |
 | Branch | A mutable named reference representing a line of history. |
+| History (agent history) | A stable identity for one coordinated version lineage; forking a coordinated version creates a distinct descendant history identity. |
 | Overlay | Unpublished mutable changes above a base Generation. |
 | Checkpoint | Capture and durable publication of a coherent state boundary. |
 | Publication | The authoritative transition making a prepared Generation visible. |
@@ -172,7 +173,7 @@ ordering, and retention.
 | Log position | A location within one ordered log history. |
 | Global Timestamp Service (GTS) | A global time authority providing comparable version coordinates under a declared ordering contract. |
 | GlobalTimestamp | An abstract global version coordinate T, interpreted in its declared timestamp domain. |
-| Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state, scoped by timestamp domain and agent history. |
+| Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state, scoped by timestamp domain and stable history ID. |
 | Runtime snapshot | Captured process memory and execution context, possibly including its containing sandbox or VM. |
 
 Generation identity, object identity, log position, branch concurrency state,
@@ -615,12 +616,24 @@ their native snapshot and storage identities. That binding MUST be immutable
 and unambiguous within its timestamp domain and agent history, including forks.
 Selecting a historical version does not rewind the time authority.
 
+Branch names may refer to histories but do not define their identities. A
+history ID MUST NOT be reassigned to another lineage, including after branch
+deletion or name reuse. A coordinated version is conceptually identified by:
+
+```text
+GlobalVersionKey {
+    timestamp_domain,
+    history_id,
+    timestamp,
+}
+```
+
 ```text
                   Global Timestamp Service
                              |
                    GlobalTimestamp T
                              |
-           AgentCheckpoint(domain, history, T)
+           AgentCheckpoint(domain, history_id, T)
                    /         |         \
           Process @ T      DB @ T     Version FS @ T
           snapshot M      snapshot D   Generation G
@@ -640,12 +653,13 @@ Checkpoint {
 }
 ```
 
-T is the common version coordinate. Lookup MUST be scoped by timestamp domain
-and agent history, including forks, and resolves M, D, and G through that binding.
+T is the common version coordinate. Lookup MUST use its timestamp domain, stable
+history ID, and timestamp to resolve M, D, and G through the immutable binding.
 An unscoped T is not a globally unique checkpoint identifier. Participants may
 expose T as their logical snapshot version under the same scoped contract. This
 is an optional integration capability; Generations can exist without a global
-timestamp. The structure above describes relationships rather than a wire format.
+timestamp. These structures describe semantic identities and relationships;
+they do not prescribe a wire format.
 
 ### 18.4 Participant state and ownership
 
@@ -738,7 +752,7 @@ request parameters, or a release checklist:
 | Read / write | Access a declared view or mutate working state. |
 | Append / read log | Durably extend a log or read its live/captured view. |
 | Pin / unpin | Add or release explicit retention interest. |
-| Open coordinated version | Resolve participant state using its timestamp domain, agent history, and GlobalTimestamp. |
+| Open coordinated version | Resolve participant state using its timestamp domain, stable history ID, and GlobalTimestamp. |
 
 Conflict detection, retry identity, cursor formats, and concrete API parameters
 are defined by implementation RFCs. Coordinated version access belongs to the
