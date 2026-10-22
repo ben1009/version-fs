@@ -238,6 +238,11 @@ G100 + delta101 + delta102 -> reconstructed G102
 Distinct Generations may describe identical state and share the same root.
 Generation identity does not imply a timestamp, a Git commit, or a content hash.
 
+A published Generation MAY be detached, with no branch pointing to it. Its
+visibility and retention protection are established independently of branch
+references. It is readable by identity while retained and authorized, and may
+later be selected by a branch or referenced by a future global checkpoint.
+
 ### 6.2 Logical completeness and independent restore
 
 Every required state edge MUST be reachable through the Generation's declared
@@ -388,10 +393,18 @@ Publication must establish that its complete required graph is durable and
 protected, including references to reused state.
 
 The publication boundary atomically establishes the Generation's authoritative
-visibility, reference movement, and required retention effects. A successful
-checkpoint means both state and publication are durable. A pending asynchronous
-capture cannot report the same successful completion before those conditions
-hold.
+visibility, required retention protection, and operation outcome. Publication
+does not require moving a branch reference.
+
+An operation MAY combine publication with a conditional branch update. When it
+does, publication and that reference update MUST succeed or fail atomically.
+A later, separate branch operation can also select an already published
+Generation. Detached publication supports independently retained snapshots and
+future global checkpoints without changing a workspace branch.
+
+A successful checkpoint means both state and publication are durable. A pending
+asynchronous capture cannot report the same successful completion before those
+conditions hold.
 
 ### 11.2 Failure and retry
 
@@ -578,7 +591,7 @@ are defined by implementation RFCs.
 | I2 | A Generation's roots resolve its complete declared state. |
 | I3 | State resolution requires neither ancestor Generation replay nor an inter-Generation journal. |
 | I4 | Every required object is durable before a Generation is published. |
-| I5 | Publication visibility, authoritative reference movement, required retention effects, and the operation's outcome are atomic and consistent. |
+| I5 | Publication atomically establishes visibility, required retention protection, the operation outcome, and any reference updates included in that operation; a branch update is optional. |
 | I6 | Shared content remains durable while any live retention root or protected operation can require it. |
 | I7 | A stale writer cannot mutate authoritative state after its authority has been replaced. |
 | I8 | Uploads and auxiliary markers alone cannot make partial state visible. |
