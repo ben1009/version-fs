@@ -43,9 +43,10 @@ The views can use different internal representations and storage engines while
 participating in the same Generation boundary.
 
 Version FS does not replace a transactional database or a process runtime. A
-shared TSO can provide logical versions across process memory, database state,
-and Version FS. A future global checkpoint binds their snapshots and Generation
-at a common boundary through explicit participant interfaces.
+Global Timestamp Service (GTS) can provide common version coordinates across
+process memory, database state, and Version FS. A future global checkpoint binds
+their snapshots and Generation at a common boundary through explicit participant
+interfaces.
 
 The design principle is: **unify version semantics, not storage engines.**
 
@@ -147,8 +148,9 @@ coordination, semantic merge, and remote execution can extend this model without
 weakening its invariants.
 
 Coordinated process and database checkpoints are a separate extension. The
-architecture supports TSO as their shared logical version domain. Their protocol
-needs its own specification of participant boundaries, ordering, and retention.
+architecture supports a shared global timestamp domain for their logical
+versions. Their protocol needs its own specification of participant boundaries,
+ordering, and retention.
 
 ## 4. Terminology
 
@@ -165,14 +167,16 @@ needs its own specification of participant boundaries, ordering, and retention.
 | Publication | The authoritative transition making a prepared Generation visible. |
 | Pin | A retention reference keeping a Generation's reachable state live. |
 | Log position | A location within one ordered log history. |
-| TSO | A service allocating timestamps in a shared logical ordering domain. |
-| TSO version | A scoped logical version binding a TSO value to captured participant state. |
+| Global Timestamp Service (GTS) | A global time authority providing comparable version coordinates under a declared ordering contract. |
+| GlobalTimestamp | An abstract global version coordinate T, interpreted in its declared timestamp domain. |
+| Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state within an agent history. |
 | Runtime snapshot | Captured process memory and execution context, possibly including its containing sandbox or VM. |
 
 Generation identity, object identity, log position, branch concurrency state,
-and optional TSO versions serve different purposes. A TSO version can select a
-retained Generation or participant snapshot without replacing its native
-identity. Wall-clock time alone does not establish any of them.
+and optional global version coordinates serve different purposes. A coordinated
+version can select a retained Generation or participant snapshot without
+replacing its native identity. A local wall-clock reading alone does not
+establish a coordinated version.
 
 ## 5. Architecture and authority
 
@@ -243,8 +247,8 @@ G100 + delta101 + delta102 -> reconstructed G102
 
 Distinct Generations may describe identical state and share the same root.
 Generation identity does not imply a timestamp, a Git commit, or a content hash.
-A Generation MAY also be addressed through a TSO logical version that binds to
-its immutable identity and root, as described in Section 18.
+A Generation MAY also be addressed through a global version coordinate that
+binds to its immutable identity and root, as described in Section 18.
 
 A published Generation MAY be detached, with no branch pointing to it. Its
 visibility and retention protection are established independently of branch
@@ -330,7 +334,8 @@ a required service dependency.
 
 A successful log append establishes a durable, ordered, atomic set of records.
 It does not by itself publish a Generation or make filesystem changes durable.
-Log order, Generation identity, and optional TSO ordering remain distinct.
+Log order, Generation identity, and optional global timestamp ordering remain
+distinct.
 
 ### 9.2 Generation-bound log semantics
 
@@ -554,21 +559,60 @@ Encryption and cache isolation must preserve those boundaries. Digest
 algorithms, key management, signed access mechanisms, and encoding versions are
 selected by implementation and deployment specifications.
 
-## 18. TSO versions across process memory, databases, and Version FS
+## 18. Global timestamps across process memory, databases, and Version FS
 
-### 18.1 Shared logical version
+### 18.1 Global time authority and required semantics
 
-A TSO value T MAY serve as the logical version of process memory, database state,
-and a Version FS Generation. T identifies a captured boundary within a declared
-TSO domain and agent history; it does not replace each participant's native
-snapshot or storage identity. The binding of a published version to those
-identities MUST be immutable. Version lookup must identify the domain and
-history, including forks, so a number alone cannot select an unrelated state.
+A coordinated checkpoint MAY use a shared Global Timestamp Service (GTS), also
+called a global time authority, to identify its logical boundary. Version FS
+requires the following semantics from that service and its adapter:
+
+| Property | Required semantics |
+| --- | --- |
+| Global comparability | Participants compare coordinates in the same declared timestamp domain using one ordering contract. |
+| Monotonic ordering | Later version coordinates in an ordered history do not precede earlier ones, including after service handover or recovery. |
+| Common boundary | Each participant can bind captured state to the selected coordinate using its own snapshot and visibility contract. |
+
+`GlobalTimestamp` denotes the resulting abstract version coordinate. Its encoding,
+selection protocol, and treatment of uncertainty belong to the provider adapter;
+the architecture fixes no integer width or timestamp-allocation API. Values from
+different time authorities are not automatically comparable.
+
+**Version FS depends on timestamp semantics, not on a particular timestamp provider.**
+
+### 18.2 Provider adaptation examples
+
+The following are possible provider models, with different native semantics:
+
+| Provider model | Native capability | Adaptation to GlobalTimestamp |
+| --- | --- | --- |
+| [TiDB / PD TSO](https://docs.pingcap.com/tidb/stable/tso/) | Single-valued increasing timestamps combining physical milliseconds and a logical counter. | Preserve the oracle's domain and ordering guarantees when exposing T. |
+| [TrueTime-style service](https://research.google.com/archive/spanner-osdi2012.pdf) | Time uncertainty intervals such as `[earliest, latest]`. | Select a coordinate and satisfy the provider's uncertainty and ordering rules before finalizing it. |
+| [AWS Time Sync](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html) plus an ordering layer | Synchronized UTC clock readings. | Add a timestamp allocator or an HLC-based protocol with sufficient coordination and fencing to meet the GTS contract. |
+
+Spanner combines TrueTime with its transaction protocol, including
+[commit wait](https://docs.cloud.google.com/spanner/docs/whitepapers/life-of-reads-and-writes),
+to provide external consistency. A TrueTime interval must not be reduced to an
+arbitrary scalar while discarding the uncertainty on which ordering depends.
+
+AWS Time Sync is clock infrastructure; it does not by itself establish this
+RFC's timestamp-oracle contract. An adapter must demonstrate ordering across
+participants and through failover; local clock or local HLC monotonicity alone
+is insufficient. These are integration requirements of this RFC. Another global
+time service with equivalent guarantees can also satisfy them.
+
+### 18.3 Shared version bindings
+
+A `GlobalTimestamp` T MAY serve as the logical version of process memory,
+database state, and a Version FS Generation. The published version binds T to
+their native snapshot and storage identities. That binding MUST be immutable
+and unambiguous within its timestamp domain and agent history, including forks.
+Selecting a historical version does not rewind the time authority.
 
 ```text
-                         shared TSO
+                  Global Timestamp Service
                              |
-                    logical version T
+                   GlobalTimestamp T
                              |
                    AgentCheckpoint(T)
                    /         |         \
@@ -578,12 +622,24 @@ history, including forks, so a number alone cannot select an unrelated state.
                                    FS / Git / Logs / Artifacts
 ```
 
-The coordinator can expose T as the common version selector while resolving M,
-D, and G through the published checkpoint. Participants may also expose T as
-their logical snapshot version under the same binding contract. This is an
-optional integration capability; Generations can exist without a TSO version.
+Conceptually, a checkpoint including all three participants binds:
 
-### 18.2 Participant state and ownership
+```text
+Checkpoint {
+    timestamp: T,
+    runtime_snapshot: M,
+    db_snapshot: D,
+    generation: G,
+}
+```
+
+The coordinator can expose T as the common version selector while resolving M,
+D, and G through that binding. Participants may also expose T as their logical
+snapshot version under the same contract. This is an optional integration
+capability; Generations can exist without a global timestamp. The structure
+above describes relationships rather than a wire format.
+
+### 18.4 Participant state and ownership
 
 | Participant | Meaning of version T | Owner of capture and restore |
 | --- | --- | --- |
@@ -603,7 +659,7 @@ follow Generation integrity and retention rules; the runtime still owns their
 meaning and restore procedure. The database continues to own its transactions,
 indexes, snapshots, and recovery. Sharing T does not require a shared engine.
 
-### 18.3 Tensorlake as the process-memory reference
+### 18.5 Tensorlake as the process-memory reference
 
 [Tensorlake's Snapshot and Clone model](https://docs.tensorlake.ai/sandboxes/snapshots)
 provides the reference for process-memory semantics. It distinguishes filesystem
@@ -631,10 +687,11 @@ version must protect the complete dependency closure needed by its runtime
 snapshot, including shared data and required base images. This preserves
 recoverability without prescribing a runtime's physical representation.
 
-These are Version FS design implications. The TSO binding, database coordination,
-and retention contract in this RFC are not claims about Tensorlake's APIs.
+These are Version FS design implications. The global timestamp binding, database
+coordination, and retention contract in this RFC are not claims about Tensorlake's
+APIs.
 
-### 18.4 Consistency, durability, and retention
+### 18.6 Consistency, durability, and retention
 
 **A shared timestamp alone does not create a consistent snapshot.** The
 participants must establish the same application boundary, including causally
@@ -655,7 +712,7 @@ those states while preserving the original version's identity and protections.
 Participant snapshots remain valid on their own if global publication fails;
 they are not automatically a published coordinated checkpoint. A Version FS
 Generation can be published detached for this purpose without moving a branch.
-TSO allocation, completeness watermarks, runtime capture mechanisms, and
+Provider adaptation, completeness watermarks, runtime capture mechanisms, and
 coordinator recovery require a separate integration protocol.
 
 ## 19. Conceptual operations
@@ -673,7 +730,7 @@ request parameters, or a release checklist:
 | Read / write | Access a declared view or mutate working state. |
 | Append / read log | Durably extend a log or read its live/captured view. |
 | Pin / unpin | Add or release explicit retention interest. |
-| Open coordinated version | Resolve the declared process, database, and Version FS state bound to a TSO version. |
+| Open coordinated version | Resolve the declared process, database, and Version FS state bound to a GlobalTimestamp. |
 
 Conflict detection, retry identity, cursor formats, and concrete API parameters
 are defined by implementation RFCs. Coordinated version access belongs to the
@@ -697,7 +754,7 @@ optional integration described in Section 18.
 | I12 | Content identity never grants authorization. |
 | I13 | A successful log append atomically establishes an identified ordered range of durable records. |
 | I14 | Live trimming cannot change log bytes visible in a retained Generation. |
-| I15 | A published coordinated TSO version binds its declared participant states at one common boundary and protects all state required for the promised restore. |
+| I15 | A published coordinated global version binds its declared participant states at one common boundary and protects all state required for the promised restore. |
 
 These are architecture requirements across releases. Implementation choices and
 performance optimizations must preserve them. Release specifications must
@@ -766,10 +823,18 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
 - [chDB's durable layer](https://clickhouse.com/blog/chdb-durable-layer-for-agent-memory)
   informs explicit remote durability boundaries while retaining database ownership
   of database state.
-- [TiDB's TSO model](https://docs.pingcap.com/tidb/v7.1/tso/) and
+- [TiDB / PD TSO](https://docs.pingcap.com/tidb/stable/tso/) is one reference for
+  an increasing timestamp oracle. Its
   [historical snapshot reads](https://docs.pingcap.com/tidb/v7.5/read-historical-data/)
-  provide references for timestamp-based database versions. This RFC defines its
-  own cross-participant binding and publication contract.
+  inform timestamp-addressed database versions.
+- [The Spanner paper](https://research.google.com/archive/spanner-osdi2012.pdf),
+  [TrueTime and external consistency](https://docs.cloud.google.com/spanner/docs/true-time-external-consistency),
+  and [Spanner's commit protocol](https://docs.cloud.google.com/spanner/docs/whitepapers/life-of-reads-and-writes)
+  inform uncertainty-aware timestamp selection and ordering. External consistency
+  relies on the surrounding protocol as well as the time authority.
+- [Amazon Time Sync Service](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html)
+  supplies a synchronized UTC clock reference. Section 18 requires an ordering
+  adapter before such clock infrastructure can serve as a GTS for this design.
 - [Git Internals](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects),
   [Sapling](https://sapling-scm.com/), and
   [Mononoke](https://github.com/facebook/sapling/tree/main/eden/mononoke) provide
