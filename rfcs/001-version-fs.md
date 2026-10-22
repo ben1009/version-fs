@@ -42,9 +42,10 @@ state is published, which references may move, and which objects remain live.
 The views can use different internal representations and storage engines while
 participating in the same Generation boundary.
 
-Version FS does not replace a transactional database. A future global checkpoint
-can coordinate a database snapshot and a Version FS Generation through explicit
-participant interfaces.
+Version FS does not replace a transactional database or a process runtime. A
+shared TSO can provide logical versions across process memory, database state,
+and Version FS. A future global checkpoint binds their snapshots and Generation
+at a common boundary through explicit participant interfaces.
 
 The design principle is: **unify version semantics, not storage engines.**
 
@@ -128,10 +129,11 @@ Version FS does not implement SQL, relational constraints, query optimization,
 row-level MVCC, or application database transactions. A metadata service may use
 a database internally without making Version FS an application database.
 
-A Generation captures persisted logical state. It does not capture process
-memory, open network connections, external service state, or the effects of
-already-issued external actions. Restore does not promise exactly-once
-execution of those actions.
+A Generation captures persisted Version FS state. A process runtime owns capture
+and restore of process memory and execution context; its snapshot can participate
+in the shared version described in Section 18. External connections and service
+state require their own explicit recovery contracts. Restore does not promise
+exactly-once execution of already-issued external actions.
 
 Git's internal storage format does not define native Version FS storage.
 Full POSIX compatibility and automatic semantic merge are not prerequisites for
@@ -144,8 +146,9 @@ and durability modes. Mounts, sparse access, mutation journals, multi-writer
 coordination, semantic merge, and remote execution can extend this model without
 weakening its invariants.
 
-Coordinated database checkpoints are a separate extension. Their protocol needs
-its own specification of participant boundaries, ordering, and retention.
+Coordinated process and database checkpoints are a separate extension. The
+architecture supports TSO as their shared logical version domain. Their protocol
+needs its own specification of participant boundaries, ordering, and retention.
 
 ## 4. Terminology
 
@@ -163,10 +166,13 @@ its own specification of participant boundaries, ordering, and retention.
 | Pin | A retention reference keeping a Generation's reachable state live. |
 | Log position | A location within one ordered log history. |
 | TSO | A service allocating timestamps in a shared logical ordering domain. |
+| TSO version | A scoped logical version binding a TSO value to captured participant state. |
+| Runtime snapshot | Captured process memory and the execution context declared necessary for resume. |
 
 Generation identity, object identity, log position, branch concurrency state,
-and optional TSO timestamps serve different purposes. Wall-clock time alone
-does not establish any of them.
+and optional TSO versions serve different purposes. A TSO version can select a
+retained Generation or participant snapshot without replacing its native
+identity. Wall-clock time alone does not establish any of them.
 
 ## 5. Architecture and authority
 
@@ -237,6 +243,8 @@ G100 + delta101 + delta102 -> reconstructed G102
 
 Distinct Generations may describe identical state and share the same root.
 Generation identity does not imply a timestamp, a Git commit, or a content hash.
+A Generation MAY also be addressed through a TSO logical version that binds to
+its immutable identity and root, as described in Section 18.
 
 A published Generation MAY be detached, with no branch pointing to it. Its
 visibility and retention protection are established independently of branch
@@ -511,6 +519,10 @@ operations define liveness. Shared content remains live while any such reference
 can require it. Retention applies to all views, including log ranges and required
 artifact dependencies.
 
+A retained coordinated version protects its Version FS Generation even when no
+branch points to it. Other participants protect their own captured state under
+the shared retention contract described in Section 18.
+
 Lineage references do not automatically retain ancestor Generation descriptors.
 State reachability follows each retained root's complete declared graph.
 
@@ -542,27 +554,78 @@ Encryption and cache isolation must preserve those boundaries. Digest
 algorithms, key management, signed access mechanisms, and encoding versions are
 selected by implementation and deployment specifications.
 
-## 18. Database boundary and global checkpoints
+## 18. TSO versions across process memory, databases, and Version FS
+
+### 18.1 Shared logical version
+
+A TSO value T MAY serve as the logical version of process memory, database state,
+and a Version FS Generation. T identifies a captured boundary within a declared
+TSO domain and agent history; it does not replace each participant's native
+snapshot or storage identity. The binding of a published version to those
+identities MUST be immutable. Version lookup must identify the domain and
+history, including forks, so a number alone cannot select an unrelated state.
 
 ```text
-database snapshot ----+
-                      +---- global checkpoint
-Version FS Generation-+
+                         shared TSO
+                             |
+                    logical version T
+                             |
+                   AgentCheckpoint(T)
+                   /         |         \
+          Process @ T      DB @ T     Version FS @ T
+          snapshot M      snapshot D   Generation G
+                                           |
+                                   FS / Git / Logs / Artifacts
 ```
 
-The database owns its transactions, indexes, concurrency, snapshots, and
-recovery. Version FS owns its versioned state graph. A future global checkpoint
-may identify a database snapshot, a Version FS Generation, and a common logical
-boundary, with retention in both participants.
+The coordinator can expose T as the common version selector while resolving M,
+D, and G through the published checkpoint. Participants may also expose T as
+their logical snapshot version under the same binding contract. This is an
+optional integration capability; Generations can exist without a TSO version.
+
+### 18.2 Participant state and ownership
+
+| Participant | Meaning of version T | Owner of capture and restore |
+| --- | --- | --- |
+| Process runtime | A consistent snapshot of process memory and required execution context at the boundary. | Runtime or process checkpoint adapter. |
+| Database | An engine-confirmed snapshot at the boundary, using a supported MVCC read version or a snapshot bound to T. | Database engine. |
+| Version FS | An exact immutable Generation at the boundary, including its declared log ranges and artifacts. | Version FS. |
+
+The runtime declares which memory, threads, registers, and resources its snapshot
+can restore, along with environment compatibility. Its file mappings and handles
+must agree with the selected Version FS state. If a database runs inside the
+captured process, its memory and durable snapshot must also form an
+engine-consistent restore boundary. A filesystem checkpoint alone does not
+capture this execution state.
+
+Runtime snapshot images MAY be stored as Version FS artifacts. Their bytes then
+follow Generation integrity and retention rules; the runtime still owns their
+meaning and restore procedure. The database continues to own its transactions,
+indexes, snapshots, and recovery. Sharing T does not require a shared engine.
+
+### 18.3 Consistency, durability, and retention
 
 **A shared timestamp alone does not create a consistent snapshot.** The
-participants must capture the same application boundary and make their states
-durable before the coordinator publishes the global checkpoint.
+participants must establish the same application boundary, including causally
+related memory changes, database transactions, filesystem writes, and log records.
+Allocating T or attaching it to unrelated snapshots does not establish that cut.
+
+A checkpoint declares its participants and can claim durable coordinated restore
+only after their captured states and retention bindings are durable. A volatile
+memory image or an unprotected MVCC read timestamp alone is insufficient. A
+checkpoint without a runtime snapshot can restore declared data state but cannot
+claim to resume the process from that version.
+
+Opening a retained coordinated version T resolves its exact participant bindings.
+Unavailable or expired participant state must be reported rather than silently
+substituting another version. Forking T derives an independent history from
+those states while preserving the original version's identity and protections.
 
 Participant snapshots remain valid on their own if global publication fails;
-they are not automatically a published coordinated checkpoint. TSO watermarks,
-coordinator recovery, and cross-system retention require a separate integration
-protocol.
+they are not automatically a published coordinated checkpoint. A Version FS
+Generation can be published detached for this purpose without moving a branch.
+TSO allocation, completeness watermarks, runtime capture mechanisms, and
+coordinator recovery require a separate integration protocol.
 
 ## 19. Conceptual operations
 
@@ -579,9 +642,11 @@ request parameters, or a release checklist:
 | Read / write | Access a declared view or mutate working state. |
 | Append / read log | Durably extend a log or read its live/captured view. |
 | Pin / unpin | Add or release explicit retention interest. |
+| Open coordinated version | Resolve the declared process, database, and Version FS state bound to a TSO version. |
 
 Conflict detection, retry identity, cursor formats, and concrete API parameters
-are defined by implementation RFCs.
+are defined by implementation RFCs. Coordinated version access belongs to the
+optional integration described in Section 18.
 
 ## 20. Invariants
 
@@ -596,11 +661,12 @@ are defined by implementation RFCs.
 | I7 | A stale writer cannot mutate authoritative state after its authority has been replaced. |
 | I8 | Uploads and auxiliary markers alone cannot make partial state visible. |
 | I9 | Loss of worker compute or its cache cannot destroy successfully checkpointed state. |
-| I10 | Database integration uses explicit participant contracts and preserves database independence. |
+| I10 | Runtime and database integration use explicit participant contracts and preserve each system's capture and recovery responsibilities. |
 | I11 | A retry cannot silently apply the same identified logical operation twice. |
 | I12 | Content identity never grants authorization. |
 | I13 | A successful log append atomically establishes an identified ordered range of durable records. |
 | I14 | Live trimming cannot change log bytes visible in a retained Generation. |
+| I15 | A published coordinated TSO version binds its declared participant states at one common boundary and protects all state required for the promised restore. |
 
 These are architecture requirements across releases. Implementation choices and
 performance optimizations must preserve them. Release specifications must
@@ -664,6 +730,13 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
 - [chDB's durable layer](https://clickhouse.com/blog/chdb-durable-layer-for-agent-memory)
   informs explicit remote durability boundaries while retaining database ownership
   of database state.
+- [CRIU's checkpoint/restore design](https://criu.org/Checkpoint/Restore) provides
+  a reference for process memory and execution-state capture; selecting a runtime
+  checkpoint mechanism is a separate integration decision.
+- [TiDB's TSO model](https://docs.pingcap.com/tidb/v7.1/tso/) and
+  [historical snapshot reads](https://docs.pingcap.com/tidb/v7.5/read-historical-data/)
+  provide references for timestamp-based database versions. This RFC defines its
+  own cross-participant binding and publication contract.
 - [Git Internals](https://git-scm.com/book/en/v2/Git-Internals-Git-Objects),
   [Sapling](https://sapling-scm.com/), and
   [Mononoke](https://github.com/facebook/sapling/tree/main/eden/mononoke) provide
