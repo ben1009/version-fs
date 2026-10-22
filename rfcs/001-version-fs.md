@@ -27,10 +27,10 @@ unchanged data and metadata with other Generations.
                  FS       Git       Logs / artifacts
 ```
 
-A running workspace consists of a published Generation, a mutable overlay, and a
-local cache. A checkpoint freezes a coherent overlay boundary, makes its object
-graph durable, and atomically advances a branch to a new Generation. Fork,
-rollback, and promotion operate primarily on metadata.
+A running workspace has a published Generation, a mutable filesystem overlay,
+live log streams, and a local cache. A checkpoint captures their common boundary,
+makes its object graph durable, and atomically advances a branch to a new
+Generation. Fork, rollback, and promotion operate primarily on metadata.
 
 Version FS does not replace a transactional database. A database retains its own
 transactions, indexes, concurrency control, and recovery machinery. A future
@@ -94,7 +94,8 @@ Version FS v0 MUST provide:
 4. A mutable workspace overlay and explicit, synchronous durable checkpoints.
 5. One active writer per branch, with server-enforced fencing.
 6. Atomic branch updates, fork, rollback, deletion, and conditional promotion.
-7. Files, directories, supported metadata, and append-only segmented logs.
+7. Files, directories, supported metadata, and durable record streams with
+   atomic batch appends, sequence numbers, replay, and live tailing.
 8. Lazy reads through a native API and materialization into a local directory.
 9. Recovery on a new host without the previous host's cache or overlay.
 10. Retention, explicit pins, and conservative reachability-based collection.
@@ -157,17 +158,18 @@ different values. None is inferred from a wall-clock timestamp.
 ```text
                        Agent runtime
                             |
-              SDK / local materialized directory
+            SDK / local directory / log API
                             |
-                 base Generation + overlay
+             base Generation + overlay + live logs
                             |
-                    checkpoint builder
+                checkpoint / append builders
                       /           \
                      /             \
           immutable data plane       coordination service
           - file objects             - branch heads / revisions
           - manifest nodes           - writer epochs / leases
-          - log segments             - publication outcomes
+          - log segments             - live log tails / append receipts
+          - artifact objects         - publication outcomes
           - Generation descriptors   - retention roots / pins
                      |               - GC coordination
                  object store                  |
@@ -180,9 +182,10 @@ Generation descriptors may use the same object-store backend and cache. Separate
 logical APIs do not require separate physical storage engines.
 
 The coordination service is the authority for published Generations, branch
-heads, ownership, and retention. Its accepted updates MUST be durable and
-linearizable. Transactions that publish a Generation MUST atomically update the
-relevant branch, Generation catalog entry, retention state, and operation result.
+heads, live log positions, ownership, and retention. Its accepted updates MUST
+be durable and linearizable. Transactions that publish a Generation MUST
+atomically update the relevant branch, Generation catalog entry, retention
+state, and operation result.
 
 The exact metadata backend is left to the implementation RFC. A transactional
 store or an atomic update of an aggregate metadata record can satisfy the
@@ -401,36 +404,203 @@ behavior need an explicit contract before that adapter claims support.
 
 ## 9. Log and artifact views
 
-A log is an ordered sequence of immutable, sealed segments. A mutable segment
-stays in the overlay until sealing. Published segments are never extended in
-place.
+### 9.1 S2 as the log reference
+
+The log interface takes its reference model from [S2 streams](https://s2.dev/docs/concepts/streams):
+named, ordered records with atomic append batches, replay from a cursor, and
+live following. This RFC proposes Version FS semantics around that model;
+deploying S2 is not a v0 requirement.
+
+Following [S2's record model](https://s2.dev/docs/concepts/records), an application
+record has a byte body and optional byte-valued headers. Version FS adds its own
+stream identity and checkpoint integration:
+
+```text
+LogRecord {
+    seq_num,
+    timestamp,
+    headers: [(bytes, bytes)],
+    body: bytes,
+}
+```
+
+Sequence numbers are assigned by the log service and identify consecutive
+records within one stream incarnation. They are record positions, not byte
+offsets. A newly created empty log starts at zero. Arrival timestamps support
+inspection and seeking; they do not establish order across streams or supply a
+global TSO boundary.
+
+The **stream head** is its first retained sequence number. The **stream tail**
+is the next sequence number to assign. Neither is the branch head, which points
+to a Generation.
+
+### 9.2 Immutable storage and captured bounds
+
+Records are stored in immutable, sealed segments indexed by persistent metadata.
+Published segments are never extended in place. A Generation captures:
 
 ```text
 LogHead {
     log_id,
+    stream_id,
     segment_index_root,
-    first_offset,
-    end_offset_exclusive,
+    first_seq_num,
+    next_seq_num,
 }
 ```
 
-The segment index is persistent metadata mapping logical record offsets to
-segment objects. The selected interval and its index MUST be sufficient to read
-the Generation's log view. A partial final segment is either sealed at the
-boundary or referenced with an exact visible record boundary.
+Its visible records are exactly `[first_seq_num, next_seq_num)`. The segment
+index MUST resolve that interval independently of earlier Generations and of
+the current live stream. Framing and checksums MUST detect incomplete or corrupt
+records. The physical segment format is independent of the public record API.
 
-Append ordering is defined by the writer session. Record framing and checksums
-MUST detect incomplete or corrupt records. Retries that need duplicate
-suppression use a stable append request identity; arbitrary client retries do
-not imply exactly-once delivery.
+### 9.3 Atomic durable append
 
-Forks share the existing log prefix and append independently. Log offsets are
-scoped to a branch history; the same numeric offset on two forks can contain
-different records. Promotion selects the source Generation's log view. It does
-not interleave source and destination logs.
+[S2 appends](https://s2.dev/docs/concepts/appends) acknowledge a batch after
+durability and report the range it occupies. Version FS adopts that boundary
+for its log API: v0 `append_log` success MUST mean the complete batch is remotely
+durable and ordered. An append batch occupies one contiguous sequence range and
+is visible atomically. It must not expose a partial prefix on failure.
 
-Artifacts are named immutable object references stored under an artifact root or
-ordinary filesystem paths. They share the same integrity and retention rules.
+```text
+AppendReceipt {
+    stream_id,
+    append_id,
+    start_seq_num,
+    end_seq_num_exclusive,
+    durable_tail_seq_num,
+}
+```
+
+Two records appended at sequence 42 occupy `[42, 44)`. The receipt's tail is the
+observed durable tail and may be later than that batch's end. The receipt does
+not publish a Generation or establish filesystem durability.
+
+For a native v0 backend, the append path creates sealed segment objects and
+updated index nodes, then atomically advances the durable live tail, its
+retention root, and the append outcome in coordinated metadata. It validates
+the writer epoch at that update. Required objects MUST be durable before the
+tail becomes visible. Active append sessions participate in GC protection.
+
+Batch limits, buffering, and backpressure are implementation decisions. A local
+enqueue operation MAY exist, but it returns a pending result rather than an
+`AppendReceipt`. Server-side ordering is required even if clients pipeline
+requests; independent concurrent requests must not infer order from arrival at
+the caller.
+
+### 9.4 Conditional writes, fencing, and retries
+
+The API accepts an expected next sequence number, analogous to S2's
+`match_seq_num`, along with a stable append ID. A new append succeeds only at
+that position and under the current branch writer epoch. See [S2 concurrency
+control](https://s2.dev/docs/concepts/concurrency-control).
+
+v0 retains one logical writer per branch. Every new append MUST carry current
+writer authority. S2's fencing token is optional and cooperative; a Version FS
+adapter cannot rely on it while also allowing callers to bypass the adapter
+with unfenced writes. A future S2 backend must define token handover and access
+control alongside Version FS epochs.
+
+The service binds `(stream_id, append_id)` to the request contents, expected
+position, and recorded outcome. A timeout leaves the result unknown. Retrying
+the same request returns its recorded receipt or resolves the original attempt;
+changing its payload or expected position is an error. A recorded outcome may
+be returned after writer handover, but a new mutation under the old epoch is
+rejected.
+
+An advanced tail alone does not prove which request wrote the records. The
+client must resolve the append ID or verify the intended range. If outcome
+records have expired, it must reconcile instead of blindly appending again.
+These requirements make duplicate suppression explicit without promising
+exactly-once external effects. S2 also distinguishes conditional writes from
+unconditional retries in its [retry and duplicate discussion](https://s2.dev/blog/patterns).
+
+### 9.5 Replay, following, and resumable cursors
+
+[S2 reads](https://s2.dev/docs/concepts/reads) provide the reference for bounded
+scans and live following. Version FS readers use a cursor containing a stream
+incarnation ID and the next sequence number to consume. A consumer persists that
+cursor after processing records so it can resume after disconnecting.
+
+`read_log_at` is bounded by the Generation's captured interval and never follows
+the current live tail. A separate live-read API returns only durably appended
+records, can wait at the tail, and supports record/byte limits and bounded
+buffering. A slow reader may disconnect and resume without blocking writers.
+Read leases protect the selected content during access.
+
+A live reader's protection starts at its requested cursor and advances as the
+reader makes progress. Trim cannot reclaim its protected unread range while
+the lease remains valid. The consumer is responsible for persisting its own
+processing cursor; delivery alone does not acknowledge application processing.
+
+`check_log_tail` is a linearizable observation of the durable live tail: it
+reflects completed prior appends, not locally queued records. It is a freshness
+or catch-up boundary, not proof of a consistent filesystem checkpoint. Timestamp
+and tail-relative selectors MAY help interactive inspection; stored replay
+cursors use exact sequence positions.
+
+A cursor for a replaced stream returns `StreamReplaced`. A live cursor before
+the retained head returns `CursorExpired`; the API MUST NOT silently skip the
+missing records.
+
+### 9.6 Checkpoints, forks, and rollback
+
+A checkpoint selects the log prefix belonging to its logical mutation boundary
+and waits for included batches to become durable. It records the corresponding
+immutable index and exact exclusive end. A checkpoint MUST NOT split an atomic
+batch or include later records merely because a tail query observed them.
+Appends after the boundary can remain visible to live readers while being absent
+from that Generation.
+
+Forks share the captured prefix and create a distinct live stream incarnation
+for further appends, continuing after the inherited end. Rollback and promotion
+similarly require a successor live incarnation when replacing a writable
+history. Existing Generations keep their captured identities and bytes. The
+same numeric position on two divergent incarnations can contain different
+records, so sequence numbers alone are insufficient cursors.
+
+Promotion selects the source Generation's log view. It does not interleave the
+two branches' records or rewind a shared mutable stream.
+
+### 9.7 Trimming and retention
+
+Following S2's distinction between [trimming](https://s2.dev/docs/concepts/trimming)
+and retention, `trim_log(before_seq_num)` advances a live stream's logical head
+and releases that live view's reference to the prefix. Sequence numbers are
+never renumbered. Logical trim does not immediately delete physical segments.
+
+Retained Generations, forks, pins, active readers, and unresolved appends still
+protect their ranges. Trimming a live stream MUST NOT remove records required
+by any of those roots. Only GC may reclaim segments after their final reference
+is gone. Stream retention or an external TTL cannot override Generation
+retention.
+
+[S2's snapshot-and-follow pattern](https://s2.dev/docs/concepts/snapshots) informs
+a future mutation journal: a checkpoint stores the first sequence number not
+folded into state, and recovery follows from that cursor. Published Generation
+state remains independently readable. Trimming a journal additionally requires
+checking every retained recovery base that still needs its suffix.
+
+An external S2 stream URI and cursor alone are insufficient as a permanent
+Generation log view if that service can trim the required records. An adapter
+must preserve captured bytes in the immutable graph or establish an equivalent
+verified retention contract before publication.
+
+### 9.8 Storage pipeline and artifacts
+
+[S2's architecture](https://s2.dev/docs/platform/architecture) separates durable
+ingress chunks from later per-stream segment batching. Version FS may adopt a
+similar pipeline for scale. v0 may begin with one sealed segment per append
+batch and an indexed live tail; a multiplexed ingress WAL is a later
+optimization. Any WAL-to-segment handoff must preserve acknowledged records and
+their reader protections. A Generation must resolve immutable log bytes without
+replaying an inter-Generation mutation journal.
+
+Large payloads SHOULD be stored as artifacts with small log records referencing
+their immutable identity. Required artifact edges MUST appear in the manifest's
+reachability graph; a digest embedded only in an opaque record body is not a GC
+root. Artifacts stored under ordinary filesystem paths or an artifact root use
+the same integrity and retention rules.
 
 A storage mutation journal is a distinct log purpose. A future implementation
 may share segment encoding and transport with event logs, but recovery ordering,
@@ -483,9 +653,9 @@ Checking a lease only on the worker is insufficient. Expiration decisions use
 the authority's lease rules, not an untrusted client wall clock.
 
 A stale writer may finish uploading immutable objects. It MUST NOT advance a
-branch, publish a Generation, or modify ownership after it has been fenced. If a
-worker loses lease renewal, it must stop accepting mutations before its local
-lease deadline and reconnect or recover under a new epoch.
+branch or live log tail, publish a Generation, or modify ownership after it has
+been fenced. If a worker loses lease renewal, it must stop accepting mutations
+before its local lease deadline and reconnect or recover under a new epoch.
 
 During a coordination-service outage, pinned immutable reads may continue while
 their retention leases remain valid. Writer acquisition and publication fail
@@ -502,8 +672,9 @@ At most one checkpoint is in flight per branch writer in v0.
    Its registration participates in GC coordination.
 2. Establish the logical checkpoint boundary. Freeze the selected overlay and
    its exact log heads. Retain access to the base Generation.
-3. Build new immutable file objects, sealed log segments, and manifest nodes.
-   Reuse protected base subtrees and create or verify other referenced objects.
+3. Build new immutable file objects and manifest nodes, and select the durable
+   log segments captured by the boundary. Reuse protected base subtrees and
+   create or verify other referenced objects.
 4. Wait for successful durable completion of every required object upload,
    including manifest nodes and the root manifest.
 5. Write the immutable Generation descriptor. Its presence is preparation data,
@@ -630,11 +801,19 @@ Git commits and Generations is required.
 
 ### 14.1 Acknowledgement boundaries
 
+The following modes describe filesystem overlay mutations:
+
 | Mode | Acknowledged mutation | Host-loss recovery | Scope |
 | --- | --- | --- | --- |
 | Ephemeral overlay | Mutation accepted locally. | Latest successful durable checkpoint. | Required in v0. |
 | Logged overlay | Mutation accepted locally; a separate watermark reports asynchronously durable records. | Published Generation plus the confirmed durable journal prefix. | Deferred. |
 | Durable mutations | Selected mutation acknowledged after remote journal/data durability. | All mutations covered by the documented acknowledgement contract. | Deferred. |
+
+Log `append_log` has the separate remote durability boundary defined in Section
+9, including in v0. A host can lose uncheckpointed filesystem writes while its
+acknowledged live log records survive. Those records do not establish a coherent
+filesystem/log state until a Generation captures the common boundary. Optional
+local log buffering must report pending rather than durable append completion.
 
 Checkpoint is always a synchronous durability boundary, including in ephemeral
 mode. A future asynchronous API must return a pending operation and separate
@@ -656,6 +835,10 @@ durability guarantees.
 This path requires no previous worker disk and no ancestor replay. v0 makes no
 promise to recover uncheckpointed overlay writes after host loss.
 
+Durable live records after the Generation's captured end may be read separately
+from a protected live stream. They cannot reconstruct the filesystem overlay
+unless a future explicit mutation-journal protocol gives them that meaning.
+
 A corrupt cache entry is evicted and fetched again. A corrupt or missing
 required remote object is reported as a storage integrity failure. The service
 MUST NOT silently replace it with empty content, an older version, or a partial
@@ -669,7 +852,8 @@ Generation.
 | After descriptor upload, before metadata commit | Previous branch head. | Resolve session; collect abandoned data after protection expires. |
 | Metadata commit times out | Unknown to the caller. | Query the durable operation result before retrying or cleaning up. |
 | Metadata commit succeeds, reply is lost | New Generation is published. | Return the recorded successful outcome on retry. |
-| Old writer uploads after fencing | Objects may exist; branch is unchanged by that writer. | Reject its publication and expire orphaned preparation data. |
+| Live append reply is lost | The complete batch may be durable; no partial batch is accepted. | Resolve the append ID or retry the identical conditional request. |
+| Old writer uploads after fencing | Objects may exist; branch and live log tails remain unchanged by that writer. | Reject its publication/append commits and expire orphaned preparation data. |
 | Worker/cache disappears after checkpoint success | Published state remains durable. | Recover from the metadata authority and object store. |
 | Coordinator is unavailable | No new authoritative head changes. | Retry after recovery; respect existing read-lease limits. |
 | GC crashes during deletion | Published reachable data remains protected; the GC barrier stays closed. | Fence the old deletion executor and resolve pending deletes before reopening publication. |
@@ -702,8 +886,9 @@ request latency, and chunk size remain part of cold-start cost.
 ### 16.1 Roots and leases
 
 Retention roots include active branch heads, retained historical Generations,
-explicit pins/tags, active workspace bases, read leases, unresolved publication
-sessions, and future global-checkpoint references.
+live stream indexes and their retained ranges, explicit pins/tags, active
+workspace bases, read leases, unresolved append/publication sessions, and future
+global-checkpoint references.
 
 Example policy:
 
@@ -736,8 +921,9 @@ old object between a reachability check and deletion.
 
 The initial collector MUST use an exclusive coordination barrier:
 
-1. Block new publication sessions, root additions, and new read protections that
-   could change the live root set. Drain or resolve in-flight publications.
+1. Block new append/publication sessions, root additions, and new read
+   protections that could change the live root set. Drain or resolve in-flight
+   appends and publications.
 2. Abort and fence abandoned sessions before excluding them from protection.
    An unresolved metadata outcome blocks deletion of the affected data.
 3. Snapshot the authoritative retained roots, including existing reader and
@@ -748,7 +934,8 @@ The initial collector MUST use an exclusive coordination barrier:
    epoch, and release the barrier.
 
 Existing protected reads can continue because their roots are included in the
-mark. Local overlay work can continue, but new checkpoint publication waits.
+mark. Local overlay work can continue, but new durable log appends and checkpoint
+publication wait.
 If the collector loses contact with the metadata authority, it MUST stop issuing
 deletes. The barrier is durable state and MUST NOT automatically expire to admit
 new references. Recovery must fence the old deletion executor and settle all
@@ -762,8 +949,8 @@ physical object instances and cannot delete a newly reused instance. That
 protocol needs its own correctness argument before replacing the conservative
 recovery rule.
 
-After the barrier, publishers cannot rely on an old existence result for an
-unprotected object; they must ensure it again. Retained base subtrees remain
+After the barrier, appenders and publishers cannot rely on an old existence
+result for an unprotected object; they must ensure it again. Retained base subtrees remain
 safe through their roots. Late uploads from a fenced abandoned session may
 create garbage, but cannot publish references to it.
 
@@ -880,10 +1067,12 @@ or cleaned up by operation ID.
 
 ### 18.3 Timestamped logs
 
-Events MAY contain TSO values for correlation. A Generation's exact log head
-remains authoritative for reproducibility. If timestamps can arrive out of
-order, filtering through T requires a completeness watermark and cannot simply
-stop at the first event with a larger timestamp.
+Events MAY contain TSO values for correlation. Log sequence numbers establish
+stream order; neither an arrival timestamp nor an S2-assigned timestamp is a
+TSO. A Generation's exact log head remains authoritative for reproducibility.
+If application timestamps can arrive out of order, filtering through T requires
+a completeness watermark and cannot simply stop at the first event with a
+larger timestamp.
 
 ## 19. API sketch
 
@@ -921,8 +1110,13 @@ remove(writer, path)
 mkdir(writer, path)
 rename(writer, source, destination)
 
-append(writer, log, records, append_request_id) -> OffsetRange
-read_log_at(read_lease, log, offset, limit) -> Records
+open_log(branch, log) -> LiveLogLease + StreamBounds
+append_log(writer, stream, match_seq_num, append_id, records) -> AppendReceipt
+get_append_result(stream, append_id) -> Pending | Succeeded | Failed | Unknown
+check_log_tail(live_log_lease) -> DurableTail
+read_log(live_log_lease, cursor, limits, wait?) -> Records + NextCursor
+read_log_at(read_lease, log, from_seq_num, limits) -> Records + NextCursor
+trim_log(writer, stream, before_seq_num, operation_id)
 
 diff(generation_a, generation_b, cursor?) -> Changes
 materialize(read_lease, destination, selected_paths?)
@@ -930,12 +1124,14 @@ capture_quiesced_directory(writer, source_directory)
 ```
 
 Expected errors include `Conflict`, `StaleWriter`, `LeaseExpired`,
-`GenerationExpired`, `UnsupportedFeature`, `IntegrityError`, `Unavailable`, and
-an explicitly unresolved operation outcome. Error responses must distinguish
+`GenerationExpired`, `StreamReplaced`, `CursorExpired`, `UnsupportedFeature`,
+`IntegrityError`, `Unavailable`, and an explicitly unresolved operation outcome.
+Error responses must distinguish
 a rejected operation from an operation whose commit result is unknown.
 
-Log append acknowledgement in the overlay follows its configured durability
-mode. `checkpoint` success always follows the durable publication contract.
+`append_log` success returns a remotely durable batch receipt; local enqueue
+returns a pending result. `checkpoint` success always follows the durable
+Generation publication contract.
 
 ## 20. Invariants
 
@@ -953,6 +1149,8 @@ mode. `checkpoint` success always follows the durable publication contract.
 | I10 | Database integration relies on explicit snapshot and retention APIs rather than database implementation details. |
 | I11 | A retry cannot silently apply the same identified operation twice. |
 | I12 | Hash identity never grants authorization. |
+| I13 | A successful log append is a durable atomic batch with an identified sequence range. |
+| I14 | Live stream trimming cannot change the log bytes visible in a retained Generation. |
 
 These are release requirements. Performance optimizations may not weaken them.
 
@@ -965,6 +1163,7 @@ data bytes after chunking. The intended behavior is:
 | --- | --- |
 | Resolve one path | Traverse its manifest path and fetch demanded data. |
 | Checkpoint | Upload ΔB plus changed manifest paths and bounded publication metadata. |
+| Log append | Upload the batch and changed index paths, then atomically advance its durable tail and receipt. |
 | Fork | One coordinated branch/root update; no data copying. |
 | Rollback / promote | Coordinated pointer and retention updates; no data copying. |
 | Diff | Traverse unequal nodes and emit changed entries; skip identical subtrees. |
@@ -978,9 +1177,10 @@ hashing a changed file may read more bytes than its physical delta. Object
 packing, compression, and compaction introduce additional amplification.
 
 The implementation SHOULD report checkpoint capture/upload/publication latency,
-new versus reused data and manifest bytes, cache hit rate, remote request count,
-lease/fencing failures, operation outcomes awaiting resolution, retained bytes,
-GC pause duration, and deletion failures.
+new versus reused data and manifest bytes, append durability latency, tail/read
+lag, cache hit rate, remote request count, lease/fencing failures, operation
+outcomes awaiting resolution, retained bytes, GC pause duration, and deletion
+failures.
 
 Benchmarks must distinguish CPU work, bytes read locally, bytes uploaded,
 object-store request counts, and metadata coordination latency. No fixed latency,
@@ -1021,7 +1221,8 @@ of its declared state.
 
 Implement overlays, capture boundaries, durable metadata transactions, epochs,
 CAS revisions, operation identities, fork, rollback, and promotion. Add local
-directory capture/materialization and sealed log segments.
+directory capture/materialization, durable batch appends, resumable log reads,
+and sealed log segments.
 
 Demonstrate preservation of writes after a checkpoint boundary, rejection of a
 previous writer epoch, rejection of a stale revision after rollback, and correct
@@ -1049,6 +1250,10 @@ Collection failure validation MUST include a collector that loses ownership
 with remote deletion requests still in flight. Publication must remain blocked
 until those requests can no longer remove newly referenced content.
 
+Log validation MUST cover lost append replies, duplicate retries, stale writer
+epochs, all-or-nothing batch visibility, appends racing checkpoint capture,
+retained reads after live trim, and cursors across fork or rollback.
+
 Performance evaluation SHOULD include a large mostly unchanged namespace, many
 small files, large-file range edits, long segmented logs, repeated forks, and
 many discarded branches. Results must disclose capture mode, storage backend,
@@ -1067,7 +1272,7 @@ not assert that an implementation or its checks already exist.
 | Metadata authority | Durable backend, atomic record boundaries, scale/partitioning, backup and recovery. |
 | Writer sessions | Lease duration, renewal margins, failure handling, operation-result retention. |
 | Local integration | SDK details, reliable directory capture, eventual mount semantics and supported metadata. |
-| Logs | Record framing, segment/index size, append deduplication, trim semantics. |
+| Logs | Record/batch limits, segment/index size, append outcomes, live read backpressure, and retention-safe trim. |
 | Collection | Candidate grace period, barrier budget and recovery, deletion fencing, online collection protocol. |
 | Durability | Optional remote WAL, autosave cadence, `fsync` contract, storage classes. |
 | Git | Native Git object identity mapping, refs, protocol hosting, Generation associations. |
@@ -1107,6 +1312,13 @@ are this RFC's interpretation. Sources were consulted on 2026-10-22.
   and APIs. It informs the need for programmatic access alongside compatibility
   with existing source-control tools, without requiring Git to represent every
   kind of Version FS state.
+- [S2](https://s2.dev/docs/intro) supplies the reference for the log interface:
+  ordered record streams, durable atomic batch appends, sequence cursors,
+  conditional writes, replay, and live following. Its
+  [architecture](https://s2.dev/docs/platform/architecture) also informs the
+  separation between durable ingress and later segment batching. Version FS
+  adds Generation-bound log views, branch writer enforcement, and retention
+  rules that protect captured ranges from live-stream trimming.
 - [Turso's durability architecture](https://turso.tech/blog/how-does-the-turso-cloud-keep-your-data-durable-and-safe)
   describes shared database segments, remote WAL durability, and lazy reads.
   [Turso's database overview](https://turso.tech/what-is-turso) supplies the
