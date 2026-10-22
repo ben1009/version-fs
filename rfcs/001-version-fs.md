@@ -172,7 +172,7 @@ ordering, and retention.
 | Log position | A location within one ordered log history. |
 | Global Timestamp Service (GTS) | A global time authority providing comparable version coordinates under a declared ordering contract. |
 | GlobalTimestamp | An abstract global version coordinate T, interpreted in its declared timestamp domain. |
-| Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state within an agent history. |
+| Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state, scoped by timestamp domain and agent history. |
 | Runtime snapshot | Captured process memory and execution context, possibly including its containing sandbox or VM. |
 
 Generation identity, object identity, log position, branch concurrency state,
@@ -250,8 +250,8 @@ G100 + delta101 + delta102 -> reconstructed G102
 
 Distinct Generations may describe identical state and share the same root.
 Generation identity does not imply a timestamp, a Git commit, or a content hash.
-A Generation MAY also be addressed through a global version coordinate that
-binds to its immutable identity and root, as described in Section 18.
+A Generation MAY also be addressed through a scoped global version coordinate
+that binds to its immutable identity and root, as described in Section 18.
 
 A published Generation MAY be detached, with no branch pointing to it. Its
 visibility and retention protection are established independently of branch
@@ -567,19 +567,22 @@ selected by implementation and deployment specifications.
 ### 18.1 Global time authority and required semantics
 
 A coordinated checkpoint MAY use a shared Global Timestamp Service (GTS), also
-called a global time authority, to identify its logical boundary. Version FS
-requires the following semantics from that service and its adapter:
+called a global time authority, to provide a common version coordinate. Version
+FS requires the following semantics from that service and its time adapter:
 
 | Property | Required semantics |
 | --- | --- |
 | Global comparability | Participants compare coordinates in the same declared timestamp domain using one ordering contract. |
 | Monotonic ordering | Later version coordinates in an ordered history do not precede earlier ones, including after service handover or recovery. |
-| Common boundary | Each participant can bind captured state to the selected coordinate using its own snapshot and visibility contract. |
 
 `GlobalTimestamp` denotes the resulting abstract version coordinate. Its encoding,
 selection protocol, and treatment of uncertainty belong to the provider adapter;
 the architecture fixes no integer width or timestamp-allocation API. Values from
 different time authorities are not automatically comparable.
+
+The coordinator and participants establish the common checkpoint boundary using
+their snapshot and visibility contracts. GTS supplies coordinates and ordering;
+it does not establish the consistency of captured participant state.
 
 **Version FS depends on timestamp semantics, not on a particular timestamp provider.**
 
@@ -617,7 +620,7 @@ Selecting a historical version does not rewind the time authority.
                              |
                    GlobalTimestamp T
                              |
-                   AgentCheckpoint(T)
+           AgentCheckpoint(domain, history, T)
                    /         |         \
           Process @ T      DB @ T     Version FS @ T
           snapshot M      snapshot D   Generation G
@@ -625,7 +628,8 @@ Selecting a historical version does not rewind the time authority.
                                    FS / Git / Logs / Artifacts
 ```
 
-Conceptually, a checkpoint including all three participants binds:
+Within its timestamp domain and agent history, a checkpoint including all three
+participants conceptually binds:
 
 ```text
 Checkpoint {
@@ -636,11 +640,12 @@ Checkpoint {
 }
 ```
 
-The coordinator can expose T as the common version selector while resolving M,
-D, and G through that binding. Participants may also expose T as their logical
-snapshot version under the same contract. This is an optional integration
-capability; Generations can exist without a global timestamp. The structure
-above describes relationships rather than a wire format.
+T is the common version coordinate. Lookup MUST be scoped by timestamp domain
+and agent history, including forks, and resolves M, D, and G through that binding.
+An unscoped T is not a globally unique checkpoint identifier. Participants may
+expose T as their logical snapshot version under the same scoped contract. This
+is an optional integration capability; Generations can exist without a global
+timestamp. The structure above describes relationships rather than a wire format.
 
 ### 18.4 Participant state and ownership
 
@@ -707,10 +712,10 @@ memory image or an unprotected MVCC read timestamp alone is insufficient. A
 checkpoint without a runtime snapshot can restore declared data state but cannot
 claim to resume the process from that version.
 
-Opening a retained coordinated version T resolves its exact participant bindings.
+Opening a retained coordinated version resolves its scoped timestamp binding.
 Unavailable or expired participant state must be reported rather than silently
-substituting another version. Forking T derives an independent history from
-those states while preserving the original version's identity and protections.
+substituting another version. Forking that version derives an independent history
+from those states while preserving the original version's identity and protections.
 
 Participant snapshots remain valid on their own if global publication fails;
 they are not automatically a published coordinated checkpoint. A Version FS
@@ -733,7 +738,7 @@ request parameters, or a release checklist:
 | Read / write | Access a declared view or mutate working state. |
 | Append / read log | Durably extend a log or read its live/captured view. |
 | Pin / unpin | Add or release explicit retention interest. |
-| Open coordinated version | Resolve the declared process, database, and Version FS state bound to a GlobalTimestamp. |
+| Open coordinated version | Resolve participant state using its timestamp domain, agent history, and GlobalTimestamp. |
 
 Conflict detection, retry identity, cursor formats, and concrete API parameters
 are defined by implementation RFCs. Coordinated version access belongs to the
@@ -765,209 +770,111 @@ define the evidence that demonstrates these guarantees.
 
 ## 21. Performance and scalability
 
-### 21.1 Workload and growth dimensions
+### 21.1 Workload dimensions
 
-The architecture targets frequent checkpoints over large shared bases, many
-independent agent branches, ordered event ingestion, and reads from ephemeral
-workers. Performance must account for several independent dimensions:
+Version FS targets frequent checkpoints over large shared bases and many
+independent agent histories. Capacity and performance have several dimensions:
 
-| Dimension | Sources of pressure |
+| Dimension | Sources of growth |
 | --- | --- |
-| Data volume | Large files, artifacts, runtime images, and retained changed content. |
-| Metadata volume | Namespace entries, directory fanout, manifest nodes, and log indexes. |
-| Version population | Branches, retained Generations, pins, and coordinated checkpoints. |
+| Bytes | Files, artifacts, runtime images, and retained changed content. |
+| Metadata | Namespace entries, directory fanout, manifest nodes, and log indexes. |
+| Versions | Branches, retained Generations, pins, and coordinated checkpoints. |
 | Concurrency | Readers, writers, simultaneous checkpoints, and fork/restore bursts. |
-| Ingestion and churn | Log records, tiny writes, branch creation/deletion, and abandoned uploads. |
-| Placement | Cache residency, network distance, durability topology, and tenant isolation. |
+| Churn | Log ingestion, small writes, branch lifecycle, and abandoned preparations. |
 
-Supporting a large byte count does not establish scalability for millions of
-small entries or a high publication rate. Supporting many independent branches
-does not establish throughput for one heavily contended branch. The objectives
-below distinguish these cases; they are not measured capacity guarantees.
+Large data capacity, large metadata capacity, and high operation concurrency
+are distinct objectives. Scaling independent histories also differs from
+increasing throughput for one heavily contended history.
 
-### 21.2 Operation costs and amplification
+### 21.2 Architectural cost model
 
-Let `delta_data` be the new encoded content bytes at the chosen storage
-granularity, `delta_metadata` the immutable metadata rewritten for a capture,
-and `working_set` the metadata and content accessed by an execution. These can
-differ substantially from application write sizes.
+Let `delta_data` be new encoded content at the selected storage granularity,
+`delta_metadata` the immutable metadata rewritten for a capture, and
+`working_set` the metadata and content demanded by an execution.
 
-| Operation | Architectural objective | Remaining costs and limits |
-| --- | --- | --- |
-| Checkpoint | New storage follows `delta_data + delta_metadata` plus Generation/publication metadata. | Change discovery, coherent capture, encoding, and durability still require work. |
-| Fork | Create reference and retention state without copying or traversing the complete base. | Admission, authorization, and authoritative metadata updates remain. |
-| Rollback / promote | Change authoritative references without rewriting immutable history. | Contending updates and required atomic coordination still serialize. |
-| Open / read Generation | Resolve its roots and fetch metadata and content for the `working_set`. | Index depth, remote request count, storage granularity, and cache misses affect latency. |
-| Diff | Skip shared identical subgraphs and visit changed metadata and reported differences. | Worst case visits the complete compared namespace; content comparison can require data reads. |
-| Append / capture log | Persist new records and index changes; a checkpoint records an exact immutable view. | Ordering, durability, and index maintenance remain; capture should not recopy the historical prefix. |
-| Restore / export | Fetch the selected execution working set or export selection. | Full materialization reads all selected state; runtime restore follows its own capture format. |
-
-Structural sharing reduces new storage; it does not automatically make change
-discovery incremental. An adapter that walks a materialized directory may scan
-the entire namespace. Similarly, a small edit can rewrite a whole file if its
-representation has no range sharing. Implementations must expose these costs
-rather than equate application bytes changed with bytes scanned or uploaded.
-
-Checkpoint latency includes queueing, boundary capture, data preparation,
-required remote transfers, durability, and publication. Independent work may
-overlap, but dependent metadata reads and authoritative commits remain on the
-critical path. A long upload SHOULD NOT hold authority coordination that blocks
-unrelated publications; capture protection must still cover its full lifetime.
-The pause needed to capture a boundary is distinct from total checkpoint time.
-Allowing later writes to continue must preserve the captured boundary exactly.
-
-The system SHOULD limit metadata, read, write, and request amplification. In
-particular, updating a few entries in a large directory should rewrite affected
-index paths rather than every directory entry. Packing and batching can reduce
-request overhead while increasing bytes fetched or rewritten; implementations
-must make that tradeoff explicit.
-
-### 21.3 Read paths, metadata, and locality
-
-After obtaining an authorized, retained Generation handle, readers SHOULD fetch
-immutable objects and metadata without joining the branch publication ordering
-path for every read. Authorization and retention remain enforced. Resolving a
-current branch head is a separate authoritative operation; cached immutable
-content is not evidence that a mutable reference is current.
-
-Namespace and range indexes SHOULD permit selective traversal. Opening a large
-Generation should not require enumerating all files, logs, or artifacts. Cold
-startup depends on necessary metadata requests and demanded bytes, while a warm
-cache can serve verified shared state across many authorized descendants.
-Lookup depth SHOULD follow the selected namespace/index structure rather than
-the number of earlier checkpoints.
-
-Batching metadata reads, bounded prefetch, shared caches, and coordinating
-concurrent fetches of the same object can reduce remote requests. Prefetch must
-not require a complete download before execution can begin. Cache placement is
-a performance choice; published state remains recoverable without any particular
-worker or cache.
-
-[Tensorlake's scheduling architecture](https://www.tensorlake.ai/blog/multi-cloud-scheduling)
-is a reference for considering snapshot locality during runtime placement. For
-Version FS, such placement is an optional optimization under the runtime's
-compatibility and authorization constraints. Durability remains independent of
-that placement.
-
-### 21.4 Independent scaling of data and authority
-
-Immutable content access, bulk preparation, and authoritative updates SHOULD
-have independently scalable resource pools. Large artifacts and read traffic
-should not require streaming their payloads through a global metadata leader.
-Control-plane traffic primarily carries identities, references, authority,
-retention, and publication outcomes.
-
-| Component | Natural expansion scope | Coordination that remains |
-| --- | --- | --- |
-| Data plane | Distribute immutable objects, manifest reads, transfers, and cache capacity across workers and storage partitions. | Integrity, authorization, durable placement, and protected object lifetime. |
-| Control plane | Partition authority by workspace or narrower independent reference domains. | One atomic outcome for each publication and all reference/retention effects included in it. |
-| Ordered logs | Distribute independent log histories and their storage/read paths. | One declared order and atomic append boundaries within each history. |
-| Background work | Partition collection, indexing, repair, and physical reorganization. | Complete accounting for shared dependencies and concurrent protected operations. |
-
-Independent branches SHOULD be able to advance without a global commit
-lock. A hot branch or log remains an ordering domain even when other domains are
-distributed. Pipelining and batching can improve utilization, but adding workers
-does not remove that ordering requirement.
-
-An operation spanning authority partitions must preserve its declared atomicity;
-sharding cannot turn an atomic promotion or publication into partially visible
-updates. Authority migration and failover must preserve fencing, retry outcomes,
-and retention protection. The partition key and coordination protocol remain
-implementation choices.
-
-[GitHub's agent-scale Git architecture](https://github.blog/engineering/architecture-optimization/the-bridge-to-agent-scale-git-infrastructure/)
-provides a reference for narrowing write coordination to contending references
-and scaling immutable reads independently. The partitioning objectives above
-apply to Version FS under its own publication and retention contract.
-
-### 21.5 Logs, global time, and coordinated capture
-
-Following the [S2 append model](https://s2.dev/docs/concepts/appends), an
-implementation can amortize request and durability overhead through batching
-and pipelining while preserving its declared append order. Independent logs
-need no total record order across the whole Version FS deployment. Log capture
-should bind existing immutable ranges rather than serialize all event payloads
-through the Generation publisher.
-
-GTS is an optional coordination dependency for the versions in Section 18.
-Ordinary immutable reads, local working mutations, and uncoordinated Generations
-need not allocate a global timestamp. A deployment must account for the chosen
-provider's throughput, availability, and any uncertainty waits on coordinated
-checkpoint latency. Expanding service capacity must preserve the shared timestamp
-domain and its ordering guarantees through failover.
-
-Coordinated capture also includes runtime and database costs: quiescence, memory
-capture, database snapshot retention, and participant durability can dominate
-the Version FS work. Parallel participant preparation cannot eliminate the need
-for a common boundary or allow the checkpoint to finish before its slowest
-required participant is ready. GTS allocation throughput alone is not a measure
-of complete agent checkpoint throughput.
-
-### 21.6 Fork bursts, retention, and background work
-
-Fork shares a base graph, but each descendant adds reference state and can create
-new content. Simultaneous restores can concentrate metadata reads, downloads,
-and cache demand on the same base. Shared verified caches and fetch coordination
-can reduce that demand; admission control must bound the remaining burst.
-
-Capacity follows the union of retained state graphs plus protected in-flight
-work, physical storage overhead, and delayed reclamation. Cheap fork does not
-imply free divergent histories. Old pins, failed branches, retained log ranges,
-and process snapshot dependencies can keep substantial data live after current
-workspaces shrink.
-
-Collectors SHOULD reuse knowledge of shared subgraphs and distribute work so
-that frequent checkpoints do not require rescanning all retained history for
-each publication. Shared objects across partitions still require complete
-liveness accounting. Physical reorganization must preserve logical identities,
-integrity, and continued resolution of retained roots throughout relocation.
-A full reachability pass can still visit the complete retained graph; its work
-depends on root and object counts even when the latest checkpoint is small.
-
-Deletion and reclamation are separate events. Collection, repair, and
-reorganization need resource budgets alongside foreground traffic; otherwise
-their backlog can consume capacity or degrade reads. An implementation using
-blocking collection must make the blocking scope and availability cost explicit.
-Scaling objectives never relax the collection and publication invariants.
-
-### 21.7 Overload, fairness, and placement
-
-The system SHOULD bound pending uploads, checkpoint preparations, log batches,
-downloads, and background queues. A producer outrunning durable storage must
-encounter explicit backpressure or rejection before unbounded resource growth.
-A successful durability acknowledgement MUST NOT become weaker under overload.
-Unknown operation outcomes retain their recovery and protection obligations.
-
-Tenant and workspace limits SHOULD account for bytes, object and reference
-counts, request rates, concurrency, and protected unpublished state. Scheduling
-should prevent one workload's logs, fork burst, or collection backlog from
-exhausting resources needed by unrelated workloads. Capacity exhaustion must
-not trigger deletion of retained state or silent loss of accepted durable work.
-
-Compute can be placed near durable data and useful caches. Cross-region access
-adds transfer cost and latency; synchronous durability or authority coordination
-across regions adds those dependencies to completion. Replication topology,
-placement policy, and failure availability must be declared by the deployment.
-The architecture promises no uniform latency across arbitrary locations.
-
-### 21.8 Observable limits
-
-Implementations SHOULD expose the signals needed to distinguish the following:
-
-| Area | Relevant signals |
+| Operation | Architectural cost objective |
 | --- | --- |
-| Reads and startup | Cold/warm latency, metadata requests, bytes demanded/transferred, cache misses, and fetch contention. |
-| Checkpoints | Queue, capture, preparation, upload/durability, and publication time; bytes scanned/newly stored and metadata rewritten. |
-| Authority | Update rate, contention, rejected stale operations, partition load, and failover pauses. |
-| Logs and coordinated versions | Ingestion rate/lag, append latency, GTS latency, and runtime/database participant waits. |
-| Capacity and isolation | Live/protected bytes, objects, roots, queue depths, per-tenant consumption, and reclamation backlog. |
+| Checkpoint | New storage follows `delta_data + delta_metadata` plus Generation/publication metadata. |
+| Fork | Create references and retention state without copying or traversing the complete base. |
+| Rollback / promote | Move authoritative references without rewriting immutable history. |
+| Open / read Generation | Resolve roots and access the `working_set` through selective metadata traversal. |
+| Diff | Skip shared identical subgraphs and visit changed state and reported differences. |
+| Append / capture log | Store new records and index changes; capture binds existing immutable ranges. |
 
-Latency distributions and saturation behavior matter alongside aggregate
-throughput. Results must identify workload shape, cache state, concurrency,
-history/retention size, backend, and durability topology. Numerical service
-objectives, benchmark procedures, and release acceptance criteria belong in
-implementation proposals; this RFC makes no fixed latency, storage ratio, or
-capacity claim.
+Structural sharing does not automatically make change discovery incremental.
+A capture from a materialized directory can scan the entire namespace, and a small
+edit can rewrite a whole file when its representation has no range sharing.
+The cost model must distinguish application changes from bytes scanned,
+transferred, or newly stored, including metadata and request amplification.
+
+Checkpoint completion includes coherent capture, preparation, durability, and
+atomic publication. Capture pause and total completion time are distinct.
+Independent preparation should not serialize unrelated publications, while
+later writes must remain outside the captured boundary.
+
+In the worst case, diff visits the complete compared namespace and requires content
+reads. Full materialization or export reads all selected state. Structural
+sharing and lazy access do not remove those costs.
+
+### 21.3 Read and metadata scalability
+
+Opening a retained Generation SHOULD require only its roots and relevant
+metadata, without enumerating the complete namespace. Lookup depth SHOULD
+follow the selected namespace/index structure rather than the number of earlier
+checkpoints; reads must not replay a checkpoint chain.
+
+After obtaining an authorized, protected Generation handle, immutable data and
+metadata reads SHOULD proceed independently of branch reference serialization.
+Resolving a current mutable head remains an authoritative operation. Cached
+immutable content does not establish that a branch reference is current.
+
+Data access and bulk transfer capacity SHOULD scale independently of authority
+capacity. Large payloads should not be forced through one global metadata
+leader. Namespace and range access should remain selective as metadata grows,
+while preserving integrity, authorization, and retention.
+
+### 21.4 Coordination scalability
+
+Authority SHOULD scale across workspaces and independent reference domains.
+Independent branches SHOULD advance without a global commit lock. A hot branch
+or log remains an ordering domain; adding capacity elsewhere does not remove
+its serialization requirements.
+
+Operations spanning authority partitions MUST preserve their declared atomicity,
+including publication's reference and retention effects. Partitioning and
+authority migration must preserve fencing and authoritative retry outcomes.
+
+Independent logs require no global total record order. Each log history retains
+its declared order and atomic append boundaries. Generation capture SHOULD bind
+existing immutable ranges without recopying the historical payload through the
+Generation publisher.
+
+GTS is optional for the coordinated versions in Section 18. Ordinary immutable
+reads, local mutations, and uncoordinated Generations need not allocate a global
+timestamp. Coordinated checkpoint cost includes the chosen time provider and
+all required runtime, database, and Version FS participants. Preparation can
+proceed independently only within the common boundary contract, and completion
+still depends on every required participant becoming durable.
+
+### 21.5 Retention and overload principles
+
+Shared history should remain cheap to retain and fork. Divergent content,
+retained roots, and protected operations still consume capacity; current
+workspace size alone does not describe the retained state graph.
+
+Normal checkpoint publication SHOULD NOT require work proportional to all
+retained historical state. Garbage collection and background work MUST preserve
+retention, independent readability, and publication correctness as the number
+of Generations and shared dependencies grows.
+
+Implementations MUST provide bounded resource use and explicit overload
+behavior. Resource exhaustion or overload MUST NOT weaken durability, retention,
+isolation, or publication correctness. Protection required for an unknown
+operation outcome remains in force until that outcome is resolved.
+
+Numerical service objectives, benchmark procedures, and concrete resource
+management policies belong in implementation proposals.
 
 ## 22. Alternatives and architectural tradeoffs
 
