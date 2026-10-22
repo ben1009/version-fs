@@ -167,7 +167,7 @@ needs its own specification of participant boundaries, ordering, and retention.
 | Log position | A location within one ordered log history. |
 | TSO | A service allocating timestamps in a shared logical ordering domain. |
 | TSO version | A scoped logical version binding a TSO value to captured participant state. |
-| Runtime snapshot | Captured process memory and the execution context declared necessary for resume. |
+| Runtime snapshot | Captured process memory and execution context, possibly including its containing sandbox or VM. |
 
 Generation identity, object identity, log position, branch concurrency state,
 and optional TSO versions serve different purposes. A TSO version can select a
@@ -587,7 +587,7 @@ optional integration capability; Generations can exist without a TSO version.
 
 | Participant | Meaning of version T | Owner of capture and restore |
 | --- | --- | --- |
-| Process runtime | A consistent snapshot of process memory and required execution context at the boundary. | Runtime or process checkpoint adapter. |
+| Process runtime | A consistent snapshot of process memory and required execution context at the boundary. | Runtime, sandbox, or VM checkpoint adapter. |
 | Database | An engine-confirmed snapshot at the boundary, using a supported MVCC read version or a snapshot bound to T. | Database engine. |
 | Version FS | An exact immutable Generation at the boundary, including its declared log ranges and artifacts. | Version FS. |
 
@@ -603,7 +603,38 @@ follow Generation integrity and retention rules; the runtime still owns their
 meaning and restore procedure. The database continues to own its transactions,
 indexes, snapshots, and recovery. Sharing T does not require a shared engine.
 
-### 18.3 Consistency, durability, and retention
+### 18.3 Tensorlake as the process-memory reference
+
+[Tensorlake's Snapshot and Clone model](https://docs.tensorlake.ai/sandboxes/snapshots)
+provides the reference for process-memory semantics. It distinguishes filesystem
+snapshots, restored by cold boot, from memory snapshots that restore filesystem,
+memory, and running processes. A snapshot can outlive its source sandbox and be
+restored into new sandboxes. Its [lifecycle model](https://docs.tensorlake.ai/sandboxes/lifecycle)
+separately supports suspending and resuming the same sandbox.
+
+For Version FS integration, this motivates the following semantics:
+
+| Capability | Relationship to versioned state |
+| --- | --- |
+| Suspend / resume | Pause and continue one runtime identity; it need not publish a reusable coordinated version. |
+| Durable memory checkpoint | Bind a reusable runtime snapshot to the captured filesystem Generation and optional database snapshot at T. |
+| Restore / fork | Start independent runtime descendants from a retained version while preserving the source snapshot. |
+
+The runtime participant MAY capture the containing sandbox or VM rather than
+serialize each process separately. If its image also includes filesystem state,
+the adapter MUST bind that state to the selected Generation at T; two divergent
+filesystem representations cannot both be authoritative during restore.
+
+Tensorlake also describes [incremental memory and disk snapshots](https://www.tensorlake.ai/blog/multi-cloud-scheduling).
+This informs sharing of unchanged checkpoint data. Each retained coordinated
+version must protect the complete dependency closure needed by its runtime
+snapshot, including shared data and required base images. This preserves
+recoverability without prescribing a runtime's physical representation.
+
+These are Version FS design implications. The TSO binding, database coordination,
+and retention contract in this RFC are not claims about Tensorlake's APIs.
+
+### 18.4 Consistency, durability, and retention
 
 **A shared timestamp alone does not create a consistent snapshot.** The
 participants must establish the same application boundary, including causally
@@ -709,9 +740,14 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
 
 - [toy-kv-engine](https://github.com/ben1009/toy-kv-engine) informs the separate
   database snapshot and recovery boundary.
-- [Tensorlake](https://github.com/tensorlakeai/tensorlake) and its
-  [product overview](https://www.tensorlake.ai/) motivate agent workspaces,
-  snapshots, forks, and source-control interfaces.
+- [Tensorlake](https://github.com/tensorlakeai/tensorlake), its
+  [snapshot and clone guide](https://docs.tensorlake.ai/sandboxes/snapshots), and
+  [sandbox lifecycle](https://docs.tensorlake.ai/sandboxes/lifecycle) are the
+  process-memory references: reusable memory/filesystem snapshots, runtime
+  suspend/resume, and restoration into independent descendants. Its
+  [snapshot architecture](https://www.tensorlake.ai/blog/multi-cloud-scheduling)
+  informs incremental state capture and physical sharing. Section 18 defines
+  Version FS's own coordination and retention requirements around that model.
 - [LayerFS](https://github.com/Ephemeral-AI-Lab/layerfs) is a reference for writable
   workspaces over shared history; Version FS defines remote publication
   separately from physical sharing.
@@ -730,9 +766,6 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
 - [chDB's durable layer](https://clickhouse.com/blog/chdb-durable-layer-for-agent-memory)
   informs explicit remote durability boundaries while retaining database ownership
   of database state.
-- [CRIU's checkpoint/restore design](https://criu.org/Checkpoint/Restore) provides
-  a reference for process memory and execution-state capture; selecting a runtime
-  checkpoint mechanism is a separate integration decision.
 - [TiDB's TSO model](https://docs.pingcap.com/tidb/v7.1/tso/) and
   [historical snapshot reads](https://docs.pingcap.com/tidb/v7.5/read-historical-data/)
   provide references for timestamp-based database versions. This RFC defines its
