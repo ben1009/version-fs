@@ -574,7 +574,7 @@ FS requires the following semantics from that service and its time adapter:
 | Property | Required semantics |
 | --- | --- |
 | Global comparability | Participants compare coordinates in the same declared timestamp domain using one ordering contract. |
-| Monotonic ordering | Later version coordinates in an ordered history do not precede earlier ones, including after service handover or recovery. |
+| Strict history ordering | Finalized coordinated versions within one history MUST receive distinct, strictly increasing coordinates, including across service handover and recovery. |
 
 `GlobalTimestamp` denotes the resulting abstract version coordinate. Its encoding,
 selection protocol, and treatment of uncertainty belong to the provider adapter;
@@ -627,6 +627,10 @@ GlobalVersionKey {
     timestamp,
 }
 ```
+
+Strict history ordering makes this key unique for each finalized coordinated
+version. Different histories MAY use the same timestamp. Retrying the same
+finalized version preserves its existing key and immutable binding.
 
 ```text
                   Global Timestamp Service
