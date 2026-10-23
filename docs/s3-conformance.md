@@ -6,12 +6,13 @@ RustFS instance. In both cases, use a dedicated, disposable bucket named
 `versionfs-test-*`; the test rejects bucket names outside that pattern and
 prefixes outside `versionfs-conformance/`.
 
-The test writes one small object under a fresh workspace ID, verifies conditional
-create and duplicate reuse, reads and verifies the complete object, and lists its
-workspace-scoped inventory. The Version FS object API has no delete or overwrite
-operation, so each test run leaves its object behind. Use a dedicated bucket that
-can be discarded after conformance testing. Do not configure lifecycle expiration
-for production Version FS prefixes.
+The test writes two distinct small objects under a fresh workspace ID, verifies
+conditional create and duplicate reuse for one object, reads and verifies its
+complete bytes, then follows an inventory continuation cursor and confirms both
+objects appear exactly once. The Version FS object API has no delete or overwrite
+operation, so each test run leaves both objects behind. Use a dedicated bucket
+that can be discarded after conformance testing. Do not configure lifecycle
+expiration for production Version FS prefixes.
 
 ## Amazon S3 setup
 
