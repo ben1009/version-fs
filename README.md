@@ -24,10 +24,11 @@ Generation, branch, and checkpoint semantics apply across these views.
 
 RFC-001 defines the architecture and core semantics; RFC-002 proposes the first
 implementation and release criteria. Both are drafts. The implementation plan
-translates RFC-002 into ordered work packages and completion evidence. P0 has
-started with canonical format primitives, shared golden vectors, and an opt-in
-ublk/ext4 feasibility harness. Storage protocols, remote object adapters, service
-handlers, and user-facing commands are not implemented yet.
+translates RFC-002 into ordered work packages and completion evidence. P0's
+canonical formats, shared golden vectors, and opt-in ublk/ext4 feasibility harness
+are merged. P1 adds a workspace-scoped immutable S3 object layer and deterministic
+tests; its real-S3 test is opt-in and uses a dedicated conformance bucket. Higher
+storage protocols, the service daemon, and user-facing commands are still in progress.
 
 ## Development
 

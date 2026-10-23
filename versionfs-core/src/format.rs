@@ -21,7 +21,10 @@ pub const EXTENT_BYTES: u32 = 64 * 1024;
 
 const OBJECT_MAGIC: [u8; 4] = *b"VFSO";
 const METADATA_MAGIC: [u8; 4] = *b"VFSM";
-const ENVELOPE_HEADER_BYTES: usize = 16;
+/// Number of bytes in each canonical object and metadata envelope header.
+pub const ENVELOPE_HEADER_BYTES: usize = 16;
+/// Largest supported complete encoded object, including its canonical header.
+pub const MAX_ENCODED_OBJECT_BYTES: usize = ENVELOPE_HEADER_BYTES + MAX_OBJECT_PAYLOAD_BYTES;
 const OBJECT_REFERENCE_BYTES: usize = 42;
 const LOG_SEGMENT_FIXED_PAYLOAD_BYTES: usize = 40;
 
@@ -251,7 +254,7 @@ impl ObjectRef {
 
     fn validate(self) -> Result<(), FormatError> {
         let minimum_len = ENVELOPE_HEADER_BYTES as u64;
-        let maximum_len = (ENVELOPE_HEADER_BYTES + MAX_OBJECT_PAYLOAD_BYTES) as u64;
+        let maximum_len = MAX_ENCODED_OBJECT_BYTES as u64;
         if !(minimum_len..=maximum_len).contains(&self.encoded_len) {
             return Err(FormatError::ObjectReferenceMismatch);
         }
