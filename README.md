@@ -13,7 +13,9 @@ and a disposable cache. Transactional databases remain separate systems.
 
 ## Design
 
-- [RFC-001: Version FS — Versioned Storage for Files, Git, and Logs](rfcs/001-version-fs.md)
+- [RFC-001: Version FS Architecture](rfcs/001-version-fs.md)
+- [RFC-002: Version FS MVP](rfcs/002-version-fs-mvp.md)
 
-The project is at the design stage. RFC-001 is a draft proposal for v0; this
-repository does not yet contain an implementation.
+The project is at the design stage. RFC-001 defines the architecture and core
+semantics; RFC-002 proposes the first implementation and release criteria. Both
+are drafts. This repository does not yet contain an implementation.
