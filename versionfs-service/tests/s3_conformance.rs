@@ -32,12 +32,23 @@ async fn s3_conditional_create_verified_read_and_inventory() {
     let workspace = fresh_workspace_id();
     let encoded = encode_object(ObjectType::ArtifactBlob, b"Version FS S3 conformance")
         .expect("test payload fits the canonical object format");
+    let second_encoded = encode_object(ObjectType::ArtifactBlob, b"second Version FS S3 object")
+        .expect("test payload fits the canonical object format");
 
     let created = store
         .put(workspace, &encoded)
         .await
         .expect("S3 conditional create must succeed");
     assert_eq!(created.disposition, PutDisposition::Created);
+    let second_created = store
+        .put(workspace, &second_encoded)
+        .await
+        .expect("a second distinct S3 object must be created");
+    assert_eq!(second_created.disposition, PutDisposition::Created);
+    assert_ne!(
+        created.object_ref.object_id,
+        second_created.object_ref.object_id
+    );
 
     let reused = store
         .put(workspace, &encoded)
@@ -54,15 +65,39 @@ async fn s3_conditional_create_verified_read_and_inventory() {
         encoded
     );
 
-    let page = store
+    let first_page = store
         .inventory_page(workspace, None, 1)
         .await
-        .expect("S3 listing must return the workspace-scoped object");
-    assert!(page.entries.iter().any(|entry| {
-        entry.object_id == created.object_ref.object_id
-            && entry.object_type == created.object_ref.object_type
-            && entry.observed_encoded_len == created.object_ref.encoded_len
-    }));
+        .expect("first S3 inventory page must return one workspace-scoped object");
+    assert_eq!(first_page.entries.len(), 1);
+    let cursor = first_page
+        .next_cursor
+        .as_ref()
+        .expect("multiple matching keys must produce a continuation cursor");
+
+    let second_page = store
+        .inventory_page(workspace, Some(cursor), 1)
+        .await
+        .expect("S3 listing must continue from the returned cursor");
+    assert_eq!(second_page.entries.len(), 1);
+    assert!(second_page.next_cursor.is_none());
+
+    let listed = [first_page.entries[0], second_page.entries[0]];
+    assert_ne!(listed[0].object_id, listed[1].object_id);
+    for expected in [created.object_ref, second_created.object_ref] {
+        assert_eq!(
+            listed
+                .iter()
+                .filter(|entry| {
+                    entry.object_id == expected.object_id
+                        && entry.object_type == expected.object_type
+                        && entry.observed_encoded_len == expected.encoded_len
+                })
+                .count(),
+            1,
+            "every created object must appear exactly once across inventory pages"
+        );
+    }
 }
 
 fn conformance_store(bucket: String, prefix: String) -> S3ObjectStore {
