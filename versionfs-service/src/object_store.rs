@@ -178,6 +178,8 @@ pub struct S3ObjectStoreConfig {
     encryption: S3Encryption,
     workspace_transfer_limit: usize,
     service_transfer_limit: usize,
+    #[cfg(feature = "s3-emulator")]
+    local_emulator_endpoint: Option<String>,
 }
 
 impl S3ObjectStoreConfig {
@@ -189,6 +191,8 @@ impl S3ObjectStoreConfig {
             encryption: S3Encryption::SseS3,
             workspace_transfer_limit: DEFAULT_WORKSPACE_TRANSFER_LIMIT,
             service_transfer_limit: DEFAULT_SERVICE_TRANSFER_LIMIT,
+            #[cfg(feature = "s3-emulator")]
+            local_emulator_endpoint: None,
         }
     }
 
@@ -204,6 +208,18 @@ impl S3ObjectStoreConfig {
         self.service_transfer_limit = service_limit;
         self
     }
+
+    /// Enables the test-only S3 emulator endpoint.
+    ///
+    /// Available only with the `s3-emulator` feature. The endpoint is checked
+    /// by [`S3ObjectStore::connect`] and must be plain HTTP on `127.0.0.1`.
+    /// This local test path does not request server-side encryption; use the
+    /// Amazon S3 conformance path to validate encryption behavior.
+    #[cfg(feature = "s3-emulator")]
+    pub fn with_local_emulator_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.local_emulator_endpoint = Some(endpoint.into());
+        self
+    }
 }
 
 /// S3-backed implementation of the immutable object API.
@@ -215,10 +231,12 @@ pub struct S3ObjectStore {
 }
 
 impl S3ObjectStore {
-    /// Connects to S3 using the standard AWS credential chain and HTTPS.
+    /// Connects using the standard AWS credential chain and HTTPS.
     ///
     /// The adapter enables conditional create, configures encryption, and never
     /// exposes backend overwrite or delete methods through [`ObjectStore`].
+    /// With the `s3-emulator` feature, a test-only endpoint may instead use
+    /// plain HTTP if it is bound to `127.0.0.1`.
     pub fn connect(config: S3ObjectStoreConfig) -> Result<Self, ObjectStoreError> {
         let deployment_prefix = normalize_prefix(&config.deployment_prefix)?;
         if config.bucket.is_empty() {
@@ -231,14 +249,38 @@ impl S3ObjectStore {
             config.service_transfer_limit,
         )?;
 
+        #[cfg(feature = "s3-emulator")]
+        if let Some(endpoint) = config.local_emulator_endpoint.as_deref() {
+            validate_local_emulator_endpoint(endpoint)?;
+        }
+
+        #[cfg(feature = "s3-emulator")]
+        let backend_namespace = match config.local_emulator_endpoint.as_deref() {
+            Some(endpoint) => format!(
+                "s3-emulator://{}/{}/{}",
+                endpoint, config.bucket, deployment_prefix
+            ),
+            None => format!("s3://{}/{}", config.bucket, deployment_prefix),
+        };
+        #[cfg(not(feature = "s3-emulator"))]
         let backend_namespace = format!("s3://{}/{}", config.bucket, deployment_prefix);
+
         let mut builder = AmazonS3Builder::from_env()
             .with_bucket_name(config.bucket)
             .with_allow_http(false)
             .with_s3_express(false)
             .with_conditional_put(S3ConditionalPut::ETagMatch);
+        #[cfg(feature = "s3-emulator")]
+        if let Some(endpoint) = config.local_emulator_endpoint.as_deref() {
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        #[cfg(feature = "s3-emulator")]
+        let request_server_side_encryption = config.local_emulator_endpoint.is_none();
+        #[cfg(not(feature = "s3-emulator"))]
+        let request_server_side_encryption = true;
+
         builder = match config.encryption {
-            S3Encryption::SseS3 => builder.with_config(
+            S3Encryption::SseS3 if request_server_side_encryption => builder.with_config(
                 "aws_server_side_encryption"
                     .parse()
                     .map_err(|error: S3Error| {
@@ -246,9 +288,13 @@ impl S3ObjectStore {
                     })?,
                 "AES256",
             ),
-            S3Encryption::SseKms(key_id) if !key_id.trim().is_empty() => {
+            S3Encryption::SseS3 => builder,
+            S3Encryption::SseKms(key_id)
+                if !key_id.trim().is_empty() && request_server_side_encryption =>
+            {
                 builder.with_sse_kms_encryption(key_id)
             }
+            S3Encryption::SseKms(key_id) if !key_id.trim().is_empty() => builder,
             S3Encryption::SseKms(_) => {
                 return Err(ObjectStoreError::InvalidConfiguration(
                     "SSE-KMS key identifier must not be empty".to_owned(),
@@ -537,6 +583,21 @@ impl ObjectStore for S3ObjectStore {
             next_cursor,
         })
     }
+}
+
+#[cfg(feature = "s3-emulator")]
+fn validate_local_emulator_endpoint(endpoint: &str) -> Result<(), ObjectStoreError> {
+    let valid_port = endpoint
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|port| port.parse::<u16>().ok())
+        .is_some_and(|port| port != 0);
+    if !valid_port {
+        return Err(ObjectStoreError::InvalidConfiguration(
+            "S3 emulator endpoint must be exactly http://127.0.0.1:<port> with a nonzero port"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_prefix(prefix: &str) -> Result<String, ObjectStoreError> {
@@ -1210,6 +1271,26 @@ mod tests {
             normalize_prefix("/deployment/nested/").unwrap(),
             "deployment/nested"
         );
+    }
+
+    #[cfg(feature = "s3-emulator")]
+    #[test]
+    fn emulator_endpoint_is_restricted_to_loopback_http() {
+        assert!(validate_local_emulator_endpoint("http://127.0.0.1:9000").is_ok());
+        for endpoint in [
+            "http://localhost:9000",
+            "http://127.0.0.2:9000",
+            "https://127.0.0.1:9000",
+            "http://example.com:9000",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:9000/path",
+            "http://127.0.0.1:9000/",
+        ] {
+            assert!(
+                validate_local_emulator_endpoint(endpoint).is_err(),
+                "endpoint should be rejected: {endpoint}"
+            );
+        }
     }
 
     #[test]

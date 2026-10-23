@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+s3-emulator = []
+
 [dependencies]
 async-trait = "=0.1.89"
 futures-util = "=0.3.33"

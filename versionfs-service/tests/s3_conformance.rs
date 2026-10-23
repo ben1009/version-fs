@@ -13,9 +13,10 @@ use versionfs_service::object_store::{
 /// Run with `cargo test --locked -p versionfs-service --test s3_conformance
 /// -- --ignored --nocapture` after setting `VERSIONFS_S3_CONFORMANCE_BUCKET`,
 /// `VERSIONFS_S3_CONFORMANCE_PREFIX`, and the standard AWS credential variables.
+/// With `s3-emulator`, set `VERSIONFS_S3_EMULATOR_ENDPOINT` to use local RustFS.
 #[tokio::test]
-#[ignore = "requires a dedicated Version FS S3 conformance bucket"]
-async fn real_s3_conditional_create_verified_read_and_inventory() {
+#[ignore = "requires a dedicated S3-compatible Version FS conformance bucket"]
+async fn s3_conditional_create_verified_read_and_inventory() {
     let bucket = required_env("VERSIONFS_S3_CONFORMANCE_BUCKET");
     assert!(
         bucket.starts_with("versionfs-test-"),
@@ -27,8 +28,7 @@ async fn real_s3_conditional_create_verified_read_and_inventory() {
         "the conformance prefix must begin with versionfs-conformance/"
     );
 
-    let store = S3ObjectStore::connect(S3ObjectStoreConfig::new(bucket, prefix))
-        .expect("S3 configuration and AWS credential chain must be valid");
+    let store = conformance_store(bucket, prefix);
     let workspace = fresh_workspace_id();
     let encoded = encode_object(ObjectType::ArtifactBlob, b"Version FS S3 conformance")
         .expect("test payload fits the canonical object format");
@@ -63,6 +63,22 @@ async fn real_s3_conditional_create_verified_read_and_inventory() {
             && entry.object_type == created.object_ref.object_type
             && entry.observed_encoded_len == created.object_ref.encoded_len
     }));
+}
+
+fn conformance_store(bucket: String, prefix: String) -> S3ObjectStore {
+    let config = S3ObjectStoreConfig::new(bucket, prefix);
+    #[cfg(feature = "s3-emulator")]
+    let config = match env::var("VERSIONFS_S3_EMULATOR_ENDPOINT") {
+        Ok(endpoint) => config.with_local_emulator_endpoint(endpoint),
+        Err(_) => config,
+    };
+    #[cfg(not(feature = "s3-emulator"))]
+    assert!(
+        env::var_os("VERSIONFS_S3_EMULATOR_ENDPOINT").is_none(),
+        "VERSIONFS_S3_EMULATOR_ENDPOINT requires the s3-emulator feature"
+    );
+
+    S3ObjectStore::connect(config).expect("S3 configuration and credential chain must be valid")
 }
 
 fn required_env(name: &str) -> String {
