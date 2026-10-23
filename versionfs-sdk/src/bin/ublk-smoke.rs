@@ -39,8 +39,12 @@ mod linux {
                 .ok()
                 .and_then(|sectors| sectors.checked_mul(512));
 
-            let result = match (byte_offset, byte_length) {
-                (Some(offset), Some(length)) if length <= buffer.len() => {
+            let result = if operation == libublk::sys::UBLK_IO_OP_FLUSH {
+                eprintln!("event=flush");
+                0
+            } else {
+                match (byte_offset, byte_length) {
+                    (Some(offset), Some(length)) if length <= buffer.len() => {
                     let mut ram = match storage.lock() {
                         Ok(ram) => ram,
                         Err(_) => {
@@ -64,18 +68,24 @@ mod linux {
                                 );
                                 length as i32
                             }
-                            libublk::sys::UBLK_IO_OP_FLUSH => {
-                                eprintln!("event=flush");
-                                0
-                            }
                             _ => -libc::EOPNOTSUPP,
                         },
                         _ => -libc::EINVAL,
                     }
+                    }
+                    _ => -libc::EINVAL,
                 }
-                _ => -libc::EINVAL,
             };
 
+            if result < 0 {
+                eprintln!(
+                    "event=io_error op={operation} start_sector={} nr_sectors={} offset={byte_offset:?} length={byte_length:?} buffer_bytes={} op_flags={:#x} result={result}",
+                    request.start_sector,
+                    request.nr_sectors,
+                    buffer.len(),
+                    request.op_flags >> 8,
+                );
+            }
             complete(queue, tag, buffer, result);
         });
     }
@@ -115,11 +125,10 @@ mod linux {
                 .build()?,
         );
 
-        let signal_ctrl = Arc::clone(&ctrl);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown_rx = Mutex::new(shutdown_rx);
         ctrlc::set_handler(move || {
-            if let Err(error) = signal_ctrl.kill_dev() {
-                eprintln!("failed to stop ublk device after signal: {error}");
-            }
+            let _ = shutdown_tx.send(());
         })?;
 
         let queue_storage = Arc::clone(&storage);
@@ -131,9 +140,18 @@ mod linux {
                 Ok::<(), UblkError>(())
             },
             move |qid, device| serve_queue(qid, device, Arc::clone(&queue_storage)),
-            |device_ctrl| {
+            move |device_ctrl| {
                 println!("READY /dev/ublkb{}", device_ctrl.dev_info().dev_id);
                 let _ = std::io::stdout().flush();
+                let shutdown_received = shutdown_rx
+                    .lock()
+                    .ok()
+                    .is_some_and(|receiver| receiver.recv().is_ok());
+                if shutdown_received {
+                    if let Err(error) = device_ctrl.kill_dev() {
+                        eprintln!("failed to stop ublk device after signal: {error}");
+                    }
+                }
             },
         )?;
 

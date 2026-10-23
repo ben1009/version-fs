@@ -10,8 +10,8 @@
 This plan implements the block-volume MVP from RFC-002. It supersedes the earlier
 directory-scanning plan. RFC-001 owns system semantics; RFC-002 owns mechanisms,
 durability boundaries, and release criteria. P0 work is underway. Writing this
-plan or building a smoke harness does not establish ublk runtime, remote
-durability, or benchmark evidence.
+plan or building a smoke harness does not establish remote durability or
+benchmark evidence.
 
 ## 1. Release outcome
 
@@ -106,7 +106,7 @@ those tests across processes; it is not the first durability or fencing test.
   in P1; do not run it against a production bucket.
 - [x] Pin the Linux ublk userspace binding and add an ext4 tools/configuration
   plus a tiny READ/WRITE/FLUSH/FUA mount/freeze smoke harness.
-- [ ] On a qualified Linux host, verify effective capabilities/privileges,
+- [x] On a Linux host, verify effective capabilities/privileges,
   device teardown on server death, and unsupported-operation behavior. NBD may
   accelerate exploration but is not the ublk release qualification.
 - [x] Write the format note and golden vectors before durable writers: typed
@@ -116,11 +116,12 @@ those tests across processes; it is not the first durability or fencing test.
 - [x] Define typed identities/errors, injected time, named upload/commit/reply/
   device/freeze failure points, I/O/object counters, and bounded test fixtures.
 
-**Exit evidence:** CI builds the workspace; format vectors are stable; a qualified
-platform run shows ext4 freeze's own I/O completes without a close-before-freeze
-deadlock. The current development host has no `/dev/ublk-control` or loaded ublk
-driver, so that runtime evidence remains pending. No prototype result substitutes
-for remote-durability qualification.
+**Exit evidence:** CI builds the workspace; format vectors are stable; and the
+privileged RAM-backed ublk/ext4 smoke passed formatting, mount/read/write, FLUSH
+delivery, freeze/thaw, unsupported-discard handling, orderly teardown, and
+server-death teardown on Linux 6.12.71-1-lts. The installed ublk module was
+loaded for the run and unloaded afterward. This prototype does not qualify FUA
+durability, remote storage, or Generation publication.
 
 ### P1. Immutable objects and S3
 
