@@ -357,6 +357,11 @@ pub fn verify_generation<S: MapObjectStore>(
 /// references that are reachable only from a protected base proof are not
 /// retained. The caller must keep each supplied proof's root protected until
 /// this call has returned a terminal result.
+///
+/// Each proof indexes nodes visited by its verification, including reused
+/// subtree roots. Descendant indexes are not copied from protected proofs;
+/// cache misses read and validate the required objects normally. Enumerating
+/// the complete dependency closure is reserved for [`DependencyProof::objects`].
 pub fn verify_generation_with_reuse<S: MapObjectStore>(
     store: &S,
     descriptor_ref: ObjectRef,
@@ -379,6 +384,12 @@ pub fn verify_generation_with_reuse<S: MapObjectStore>(
             trusted_indexes.push(Arc::clone(&proof.index));
         }
     }
+    if let Some(proof) = protected_proofs
+        .iter()
+        .find(|proof| proof.descriptor == descriptor_ref)
+    {
+        return Ok((**proof).clone());
+    }
 
     let mut verifier = Verifier {
         store,
@@ -392,7 +403,13 @@ pub fn verify_generation_with_reuse<S: MapObjectStore>(
         _ => return Err(FormatError::ObjectReferenceMismatch.into()),
     };
 
-    let index = Arc::new(index_proof_dag(&descriptor_node));
+    let index = Arc::new(
+        verifier
+            .local
+            .into_iter()
+            .map(|(id, node)| (id, Arc::downgrade(&node)))
+            .collect(),
+    );
 
     Ok(DependencyProof {
         descriptor: descriptor_ref,
@@ -412,7 +429,7 @@ struct Verifier<'a, S> {
 }
 
 impl<S: MapObjectStore> Verifier<'_, S> {
-    fn reusable(&self, reference: ObjectRef) -> Result<Option<Arc<VerifiedNode>>, GraphError> {
+    fn reusable(&mut self, reference: ObjectRef) -> Result<Option<Arc<VerifiedNode>>, GraphError> {
         if reference.object_type == ObjectType::GenerationDescriptor {
             reference.validate()?;
         }
@@ -427,6 +444,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
                 if node.reference != reference {
                     return Err(FormatError::ObjectReferenceMismatch.into());
                 }
+                self.local.insert(reference.object_id, Arc::clone(&node));
                 return Ok(Some(node));
             }
         }
@@ -505,7 +523,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         }
         self.begin(reference)?;
         let root = VolumeRoot::decode(&self.object_bytes(reference)?)?;
-        let map = self.verify_map(root.extent_map_root, ObjectType::VolumeMapNode)?;
+        let map = self.verify_map(root.extent_map_root, ObjectType::VolumeMapNode, None)?;
         let summary = map_summary(&map)?;
         let extent_count = root.geometry.capacity_bytes / u64::from(root.geometry.extent_bytes);
         if matches!(summary.shape, MapShape::Volume { max_extent: Some(max) } if max >= extent_count)
@@ -529,7 +547,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         }
         self.begin(reference)?;
         let root = LogMapRoot::decode(&self.object_bytes(reference)?)?;
-        let map = self.verify_map(root.log_index_root, ObjectType::LogMapNode)?;
+        let map = self.verify_map(root.log_index_root, ObjectType::LogMapNode, None)?;
         let summary = map_summary(&map)?;
         if summary.entry_count != root.log_count {
             return Err(GraphError::InvalidGraph(
@@ -551,7 +569,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         }
         self.begin(reference)?;
         let root = ArtifactMapRoot::decode(&self.object_bytes(reference)?)?;
-        let map = self.verify_map(root.artifact_index_root, ObjectType::ArtifactMapNode)?;
+        let map = self.verify_map(root.artifact_index_root, ObjectType::ArtifactMapNode, None)?;
         let summary = map_summary(&map)?;
         if summary.entry_count != root.artifact_count {
             return Err(GraphError::InvalidGraph(
@@ -565,19 +583,31 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         &mut self,
         reference: ObjectRef,
         expected_type: ObjectType,
+        expected_level: Option<u16>,
     ) -> Result<Arc<VerifiedNode>, GraphError> {
         if reference.object_type != expected_type {
             return Err(FormatError::ObjectReferenceMismatch.into());
         }
         if let Some(node) = self.reusable(reference)? {
-            if matches!(&node.summary, VerifiedSummary::Map(map) if map.object_type == expected_type)
+            if let VerifiedSummary::Map(map) = &node.summary
+                && map.object_type == expected_type
             {
+                if expected_level.is_some_and(|level| level != map.level) {
+                    return Err(GraphError::InvalidGraph(
+                        "persistent map child level differs from its parent",
+                    ));
+                }
                 return Ok(node);
             }
             return Err(FormatError::ObjectReferenceMismatch.into());
         }
         self.begin(reference)?;
         let map_node = load_node(self.store, reference, expected_type)?;
+        if expected_level.is_some_and(|level| level != map_node.level()) {
+            return Err(GraphError::InvalidGraph(
+                "persistent map child level differs from its parent",
+            ));
+        }
         let (summary, children) = match map_node {
             MapNode::Leaf(entries) => {
                 let mut children = Vec::new();
@@ -597,7 +627,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
                 let mut summary = MapSummary::empty(expected_type, level)?;
                 let mut verified_children = Vec::with_capacity(children.len());
                 for (separator, child_ref) in children {
-                    let child = self.verify_map(child_ref, expected_type)?;
+                    let child = self.verify_map(child_ref, expected_type, Some(level - 1))?;
                     let child_summary = map_summary(&child)?;
                     if child_summary.level.checked_add(1) != Some(level)
                         || child_summary.max_key.as_deref() != Some(separator.as_slice())
@@ -715,7 +745,11 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     }
 
     fn verify_log(&mut self, log: LogMapEntry) -> Result<Arc<VerifiedNode>, GraphError> {
-        let index = self.verify_map(log.segment_index_root, ObjectType::LogSegmentIndexNode)?;
+        let index = self.verify_map(
+            log.segment_index_root,
+            ObjectType::LogSegmentIndexNode,
+            None,
+        )?;
         let summary = map_summary(&index)?;
         let MapShape::LogSegments {
             first_seq,
@@ -781,7 +815,8 @@ impl<S: MapObjectStore> Verifier<'_, S> {
             }
             children.push(blob);
         } else {
-            let index = self.verify_map(artifact.content_root, ObjectType::ArtifactIndexNode)?;
+            let index =
+                self.verify_map(artifact.content_root, ObjectType::ArtifactIndexNode, None)?;
             let summary = map_summary(&index)?;
             let MapShape::ArtifactChunks {
                 first_chunk,
@@ -850,20 +885,6 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     }
 }
 
-fn index_proof_dag(root: &Arc<VerifiedNode>) -> ProofIndex {
-    let mut index = HashMap::new();
-    let mut visited = HashSet::new();
-    let mut pending = vec![Arc::clone(root)];
-    while let Some(node) = pending.pop() {
-        if !visited.insert(node.reference.object_id) {
-            continue;
-        }
-        index.insert(node.reference.object_id, Arc::downgrade(&node));
-        pending.extend(node.children.iter().cloned());
-    }
-    index
-}
-
 fn map_summary(node: &VerifiedNode) -> Result<MapSummary, GraphError> {
     match &node.summary {
         VerifiedSummary::Map(summary) => Ok(summary.clone()),
@@ -926,7 +947,7 @@ mod tests {
     use crate::format::{
         ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot,
         CanonicalEncoder, CaptureMode, GenerationDescriptor, LogMapEntry, LogSegment, ObjectRef,
-        ObjectType, SegmentIndexEntry, VolumeGeometry, encode_object,
+        ObjectType, SegmentIndexEntry, VolumeGeometry, VolumeRoot, encode_object,
     };
     use crate::identity::{
         ArtifactId, GenerationId, LogId, ObjectId, ObjectStoreScopeId, VolumeBoundaryId,
@@ -1026,6 +1047,48 @@ mod tests {
         assert_eq!(proof.capture_mode(), CaptureMode::BlockCut);
         assert_eq!(proof.objects().len(), 7);
         assert!(!proof.objects().contains(&parent_ref));
+    }
+
+    #[test]
+    fn unchanged_generation_views_do_not_rebuild_the_full_proof_index() {
+        let mut store = MemoryStore::default();
+        let base_ref = empty_generation(&mut store, GenerationId::from_bytes([0x51; 16]), None);
+        let base = GenerationDescriptor::decode(store.0.get(&base_ref.object_id).unwrap()).unwrap();
+        let base_proof = verify_generation(&store, base_ref).unwrap();
+        let child_ref = store_object(
+            &mut store,
+            GenerationDescriptor {
+                generation_id: GenerationId::from_bytes([0x52; 16]),
+                parent_generation_id: Some(base.generation_id),
+                ..base
+            }
+            .encode()
+            .unwrap(),
+        );
+        let restricted = DenyObjectStore {
+            inner: &store,
+            denied: base_proof
+                .objects()
+                .iter()
+                .map(|object| object.object_id)
+                .collect(),
+        };
+
+        let child_proof =
+            verify_generation_with_reuse(&restricted, child_ref, &[&base_proof]).unwrap();
+        // Only the new descriptor and its three reused view roots enter the cache;
+        // unchanged descendants remain shared through the proof DAG.
+        assert_eq!(child_proof.index.len(), 4);
+        assert!(child_proof.index.len() < child_proof.objects().len());
+        let mut expected_objects = base_proof.objects().to_vec();
+        expected_objects.retain(|object| *object != base_ref);
+        expected_objects.push(child_ref);
+        expected_objects.sort_unstable_by_key(|object| object.object_id);
+        assert_eq!(child_proof.objects(), expected_objects);
+
+        let repeated =
+            verify_generation_with_reuse(&restricted, child_ref, &[&child_proof]).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&child_proof.index, &repeated.index));
     }
 
     #[test]
@@ -1232,6 +1295,49 @@ mod tests {
             verify_generation(&store, descriptor_ref),
             Err(GraphError::InvalidGraph(
                 "persistent map child key ranges overlap or are unordered"
+            ))
+        ));
+    }
+
+    #[test]
+    fn generation_verification_checks_child_level_before_descending() {
+        let mut store = MemoryStore::default();
+        let base_ref = empty_generation(&mut store, GenerationId::from_bytes([0x42; 16]), None);
+        let base = GenerationDescriptor::decode(store.0.get(&base_ref.object_id).unwrap()).unwrap();
+        let mut volume =
+            VolumeRoot::decode(store.0.get(&base.volume_root.object_id).unwrap()).unwrap();
+        let forbidden_descendant = volume.extent_map_root;
+        for _ in 0..2 {
+            let mut internal = CanonicalEncoder::new();
+            internal.u32_le(u32::MAX);
+            internal.u16_le(1);
+            internal.u32_le(1);
+            internal.bytes(&0_u64.to_be_bytes()).unwrap();
+            internal.object_ref(volume.extent_map_root);
+            volume.extent_map_root = store_object(
+                &mut store,
+                encode_object(ObjectType::VolumeMapNode, &internal.finish()).unwrap(),
+            );
+        }
+        let volume_root = store_object(&mut store, volume.encode().unwrap());
+        let descriptor_ref = store_object(
+            &mut store,
+            GenerationDescriptor {
+                volume_root,
+                ..base
+            }
+            .encode()
+            .unwrap(),
+        );
+        let restricted = DenyObjectStore {
+            inner: &store,
+            denied: HashSet::from([forbidden_descendant.object_id]),
+        };
+
+        assert!(matches!(
+            verify_generation(&restricted, descriptor_ref),
+            Err(GraphError::InvalidGraph(
+                "persistent map child level differs from its parent"
             ))
         ));
     }

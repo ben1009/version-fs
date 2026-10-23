@@ -207,18 +207,7 @@ impl PersistentBTree {
         let root = if edit.children.is_empty() {
             store_node(store, self.node_type, &Node::Leaf(Vec::new()))?
         } else if edit.children.len() > 1 {
-            let child_level = load_node(store, edit.children[0].1, self.node_type)?.level();
-            let level = child_level
-                .checked_add(1)
-                .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
-            store_node(
-                store,
-                self.node_type,
-                &Node::Internal {
-                    level,
-                    children: edit.children,
-                },
-            )?
+            build_root(store, self.node_type, edit.children)?
         } else {
             edit.children[0].1
         };
@@ -1255,6 +1244,52 @@ mod tests {
             tree.insert(&mut store, vec![b'b'; 40_000], Vec::new()),
             Err(PersistentMapError::RootTooLarge)
         ));
+    }
+
+    #[test]
+    fn deletion_rebuilds_multiple_root_levels_when_separators_grow() {
+        let mut store = MemoryStore::default();
+        let node_type = ObjectType::ArtifactMapNode;
+        let keys = [
+            vec![b'a'; 10_000],
+            vec![b'b'; 20_000],
+            vec![b'c'; 40_000],
+            vec![b'd'],
+            vec![b'e'; 26_000],
+            vec![b'f'; 6_000],
+        ];
+        let model: BTreeMap<_, _> = keys.iter().cloned().map(|key| (key, Vec::new())).collect();
+        let mut children = Vec::new();
+        for indexes in [&[0][..], &[1], &[2, 3], &[4], &[5]] {
+            let entries = indexes
+                .iter()
+                .map(|&index| (keys[index].clone(), Vec::new()))
+                .collect();
+            let node = Node::Leaf(entries);
+            let maximum = node.max_key().unwrap().to_vec();
+            let reference = store_node(&mut store, node_type, &node).unwrap();
+            children.push((maximum, reference));
+        }
+        let root = store_node(
+            &mut store,
+            node_type,
+            &Node::Internal { level: 1, children },
+        )
+        .unwrap();
+        let before = PersistentBTree::from_root(root).unwrap();
+        assert_model(&before, &store, &model);
+
+        let after = before.remove(&mut store, b"d").unwrap();
+        let mut remaining = model.clone();
+        remaining.remove(b"d".as_slice());
+        assert_model(&after, &store, &remaining);
+        assert_model(&before, &store, &model);
+        assert!(
+            store
+                .objects
+                .values()
+                .all(|bytes| bytes.len() <= MAX_PERSISTENT_NODE_BYTES)
+        );
     }
 
     #[test]
