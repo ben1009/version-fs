@@ -70,7 +70,7 @@ impl VolumeExtentMap {
         Ok(self
             .map
             .get(store, &extent_number.to_be_bytes())?
-            .map(|value| decode_ref(&value))
+            .map(|value| decode_extent_ref(&value))
             .transpose()?)
     }
 
@@ -82,13 +82,7 @@ impl VolumeExtentMap {
         extent: ObjectRef,
     ) -> Result<Self, ViewError> {
         self.check_extent_number(extent_number)?;
-        if extent.object_type != ObjectType::Extent
-            || extent.encoded_len
-                != (crate::format::ENVELOPE_HEADER_BYTES + crate::format::EXTENT_BYTES as usize)
-                    as u64
-        {
-            return Err(FormatError::ObjectReferenceMismatch.into());
-        }
+        let extent = validate_extent_ref(extent)?;
         let map = self.map.insert(
             store,
             extent_number.to_be_bytes().to_vec(),
@@ -124,15 +118,7 @@ impl VolumeExtentMap {
             .map(|(key, value)| {
                 let index = decode_u64_key(&key)?;
                 self.check_extent_number(index)?;
-                let extent = decode_ref(&value)?;
-                if extent.object_type != ObjectType::Extent
-                    || extent.encoded_len
-                        != (crate::format::ENVELOPE_HEADER_BYTES
-                            + crate::format::EXTENT_BYTES as usize)
-                            as u64
-                {
-                    return Err(FormatError::ObjectReferenceMismatch.into());
-                }
+                let extent = decode_extent_ref(&value)?;
                 Ok((index, extent))
             })
             .collect()
@@ -489,6 +475,21 @@ fn decode_ref(bytes: &[u8]) -> Result<ObjectRef, FormatError> {
     Ok(reference)
 }
 
+fn validate_extent_ref(reference: ObjectRef) -> Result<ObjectRef, FormatError> {
+    if reference.object_type != ObjectType::Extent
+        || reference.encoded_len
+            != crate::format::ENVELOPE_HEADER_BYTES as u64 + u64::from(crate::format::EXTENT_BYTES)
+    {
+        return Err(FormatError::ObjectReferenceMismatch);
+    }
+    reference.validate()?;
+    Ok(reference)
+}
+
+fn decode_extent_ref(bytes: &[u8]) -> Result<ObjectRef, FormatError> {
+    validate_extent_ref(decode_ref(bytes)?)
+}
+
 fn decode_u64_key(key: &[u8]) -> Result<u64, FormatError> {
     let bytes: [u8; 8] = key
         .try_into()
@@ -525,13 +526,15 @@ fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<V
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactChunkIndex, ArtifactMap, LogSegmentIndex, ViewError, VolumeExtentMap};
+    use super::{
+        ArtifactChunkIndex, ArtifactMap, LogSegmentIndex, ViewError, VolumeExtentMap, encode_ref,
+    };
     use crate::format::{
         ArtifactDescriptor, FormatError, MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType,
         VolumeGeometry, VolumeRoot,
     };
     use crate::identity::{ArtifactId, ObjectId, ObjectStoreScopeId};
-    use crate::persistent_map::MapObjectStore;
+    use crate::persistent_map::{MapObjectStore, PersistentBTree};
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -589,6 +592,58 @@ mod tests {
         assert!(VolumeExtentMap::from_root(volume_root).is_ok());
         assert!(LogSegmentIndex::from_root(log_index_root).is_ok());
         assert!(ArtifactChunkIndex::from_root(artifact_index_root).is_ok());
+    }
+
+    #[test]
+    fn volume_point_reads_reject_wrong_kind_and_size_extent_references() {
+        let valid = ObjectRef {
+            object_type: ObjectType::Extent,
+            object_id: ObjectId::from_bytes([1; 32]),
+            encoded_len: 16 + 65_536,
+        };
+        for invalid in [
+            ObjectRef {
+                object_type: ObjectType::ArtifactBlob,
+                ..valid
+            },
+            ObjectRef {
+                encoded_len: 16,
+                ..valid
+            },
+            ObjectRef {
+                encoded_len: valid.encoded_len + 1,
+                ..valid
+            },
+        ] {
+            let mut store = MemoryStore::default();
+            let tree = PersistentBTree::empty(ObjectType::VolumeMapNode, &mut store)
+                .unwrap()
+                .insert(
+                    &mut store,
+                    0_u64.to_be_bytes().to_vec(),
+                    encode_ref(invalid).unwrap(),
+                )
+                .unwrap()
+                .insert(
+                    &mut store,
+                    2_u64.to_be_bytes().to_vec(),
+                    encode_ref(valid).unwrap(),
+                )
+                .unwrap();
+            let volume = VolumeExtentMap::from_root(VolumeRoot {
+                geometry: VolumeGeometry::new(4 * 65_536).unwrap(),
+                extent_map_root: tree.root(),
+            })
+            .unwrap();
+
+            assert!(matches!(
+                volume.extent(&store, 0),
+                Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+            ));
+            assert!(volume.entries(&store).is_err());
+            assert_eq!(volume.extent(&store, 1).unwrap(), None);
+            assert_eq!(volume.extent(&store, 2).unwrap(), Some(valid));
+        }
     }
 
     #[test]

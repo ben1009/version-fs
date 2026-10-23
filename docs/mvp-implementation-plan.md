@@ -187,8 +187,10 @@ an interface mapping only.
   proofs. Parent IDs are lineage, not required content edges.
 
 **Exit evidence:** map behavior matches a simple model through splits/deletions;
-no-change roots are shared, one-key updates replace only a root-to-leaf path,
-and fixtures resolve with ancestor descriptor reads denied.
+no-change roots are shared, ordinary short-key updates replace only a root-to-leaf
+path, and long separators may additionally require adjacent sibling repartition.
+Each repartition window combines two bounded nodes; its partition choice minimizes
+parent separator bytes. Fixtures resolve with ancestor descriptor reads denied.
 
 ### P4. ublk adapter and local data path
 

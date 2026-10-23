@@ -6,11 +6,14 @@ use crate::format::{
 };
 use crate::identity::{ObjectId, ObjectStoreScopeId};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use thiserror::Error;
 
 const INTERNAL_NODE_MARKER: u32 = u32::MAX;
 const OBJECT_REFERENCE_BYTES: usize = 42;
 const MAX_PERSISTENT_TREE_LEVEL: u16 = 64;
+
+type NodeChildren = Vec<(Vec<u8>, ObjectRef)>;
 
 /// Minimal immutable-object access required by the persistent map algorithms.
 ///
@@ -303,6 +306,20 @@ struct NodeExpectation {
 }
 
 impl Node {
+    fn entry_count(&self) -> usize {
+        match self {
+            Self::Leaf(entries) => entries.len(),
+            Self::Internal { children, .. } => children.len(),
+        }
+    }
+
+    fn entry_key(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Leaf(entries) => &entries[index].0,
+            Self::Internal { children, .. } => &children[index].0,
+        }
+    }
+
     pub(crate) fn level(&self) -> u16 {
         match self {
             Self::Leaf(_) => 0,
@@ -526,7 +543,15 @@ fn write_or_split<S: MapObjectStore>(
             .map(|max_key| vec![(max_key.to_vec(), reference)])
             .unwrap_or_default());
     }
-    split_node(node_type, node)?
+    store_parts(store, node_type, split_node(node_type, &node)?)
+}
+
+fn store_parts<S: MapObjectStore>(
+    store: &mut S,
+    node_type: ObjectType,
+    parts: Vec<Node>,
+) -> Result<NodeChildren, PersistentMapError> {
+    parts
         .into_iter()
         .map(|part| {
             let maximum = part.max_key().expect("split nodes are non-empty").to_vec();
@@ -536,8 +561,8 @@ fn write_or_split<S: MapObjectStore>(
         .collect()
 }
 
-fn split_node(node_type: ObjectType, node: Node) -> Result<Vec<Node>, PersistentMapError> {
-    let (entry_count, base_size) = match &node {
+fn split_node(node_type: ObjectType, node: &Node) -> Result<Vec<Node>, PersistentMapError> {
+    let (entry_count, base_size) = match node {
         Node::Leaf(entries) => (entries.len(), 4 + crate::format::ENVELOPE_HEADER_BYTES),
         Node::Internal { children, .. } => {
             (children.len(), 10 + crate::format::ENVELOPE_HEADER_BYTES)
@@ -547,7 +572,7 @@ fn split_node(node_type: ObjectType, node: Node) -> Result<Vec<Node>, Persistent
     let mut range_start = 0;
     let mut current_size = base_size;
     for index in 0..entry_count {
-        let item_size = node_entry_size(&node, index)?;
+        let item_size = node_entry_size(node, index)?;
         let next_size = current_size
             .checked_add(item_size)
             .ok_or(FormatError::InvalidPersistentNode("node size overflow"))?;
@@ -582,7 +607,7 @@ fn split_node(node_type: ObjectType, node: Node) -> Result<Vec<Node>, Persistent
     })?;
     Ok(ranges
         .into_iter()
-        .map(|(start, end)| slice_node(&node, start, end))
+        .map(|(start, end)| slice_node(node, start, end))
         .collect())
 }
 
@@ -619,6 +644,9 @@ fn build_root<S: MapObjectStore>(
 ) -> Result<ObjectRef, PersistentMapError> {
     let mut child_level = load_node(store, children[0].1, node_type)?.level();
     loop {
+        if children.len() == 1 {
+            return Ok(children[0].1);
+        }
         let level = child_level
             .checked_add(1)
             .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
@@ -626,16 +654,163 @@ fn build_root<S: MapObjectStore>(
             return Err(FormatError::InvalidPersistentNode("tree height overflow").into());
         }
         let previous_count = children.len();
-        let parents = write_or_split(store, node_type, Node::Internal { level, children })?;
-        if parents.len() == 1 {
-            return Ok(parents[0].1);
+        let node = Node::Internal { level, children };
+        if encoded_len(node_type, &node)? <= MAX_PERSISTENT_NODE_BYTES {
+            return store_node(store, node_type, &node);
         }
-        if parents.len() >= previous_count {
-            return Err(PersistentMapError::RootTooLarge);
-        }
+        let parts = match split_node(node_type, &node) {
+            Ok(parts) if parts.len() < previous_count => parts,
+            Ok(_) | Err(PersistentMapError::EntryTooLarge) => {
+                let Node::Internal {
+                    children: original, ..
+                } = node
+                else {
+                    unreachable!("root candidate is internal");
+                };
+                // Long maxima can prevent any reduction in fanout. Repair only
+                // adjacent sibling boundaries, keeping their encoded nodes bounded.
+                children = repartition_children(store, node_type, child_level, &original)?
+                    .ok_or(PersistentMapError::RootTooLarge)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let parents = store_parts(store, node_type, parts)?;
         child_level = level;
         children = parents;
     }
+}
+
+fn repartition_children<S: MapObjectStore>(
+    store: &mut S,
+    node_type: ObjectType,
+    child_level: u16,
+    children: &[(Vec<u8>, ObjectRef)],
+) -> Result<Option<NodeChildren>, PersistentMapError> {
+    for index in 0..children.len().saturating_sub(1) {
+        let pair = &children[index..index + 2];
+        let left = load_node(store, pair[0].1, node_type)?;
+        let right = load_node(store, pair[1].1, node_type)?;
+        if left.level() != child_level
+            || right.level() != child_level
+            || left.max_key() != Some(pair[0].0.as_slice())
+            || right.max_key() != Some(pair[1].0.as_slice())
+        {
+            return Err(FormatError::InvalidPersistentNode(
+                "sibling level or maximum differs from parent",
+            )
+            .into());
+        }
+        let original_cost = separator_size(&pair[0].0) + separator_size(&pair[1].0);
+        let mut combined = join_siblings(left, right)?;
+        loop {
+            let parts = partition_for_separators(&combined)?;
+            let replacement_cost: usize = parts
+                .iter()
+                .map(|part| separator_size(part.max_key().expect("non-empty partition")))
+                .sum();
+            if replacement_cost < original_cost {
+                let replacements = store_parts(store, node_type, parts)?;
+                let mut updated = children.to_vec();
+                updated.splice(index..index + 2, replacements);
+                return Ok(Some(updated));
+            }
+            let Node::Internal {
+                level,
+                children: descendants,
+            } = &mut combined
+            else {
+                break;
+            };
+            let Some(repaired) = repartition_children(store, node_type, *level - 1, descendants)?
+            else {
+                break;
+            };
+            *descendants = repaired;
+        }
+    }
+    Ok(None)
+}
+
+fn join_siblings(left: Node, right: Node) -> Result<Node, FormatError> {
+    let joined = match (left, right) {
+        (Node::Leaf(mut left), Node::Leaf(right)) => {
+            left.extend(right);
+            Node::Leaf(left)
+        }
+        (
+            Node::Internal {
+                level,
+                mut children,
+            },
+            Node::Internal {
+                children: right, ..
+            },
+        ) => {
+            children.extend(right);
+            Node::Internal { level, children }
+        }
+        _ => {
+            return Err(FormatError::InvalidPersistentNode(
+                "sibling node kinds differ",
+            ));
+        }
+    };
+    ensure_strict_keys((0..joined.entry_count()).map(|index| joined.entry_key(index)))?;
+    Ok(joined)
+}
+
+fn separator_size(key: &[u8]) -> usize {
+    4 + OBJECT_REFERENCE_BYTES + key.len()
+}
+
+/// Partitions at most two siblings, minimizing the bytes their maxima need in
+/// the parent. A sliding minimum over feasible prefix boundaries makes this
+/// linear in the number of entries, even when values are empty.
+fn partition_for_separators(node: &Node) -> Result<Vec<Node>, PersistentMapError> {
+    let entry_count = node.entry_count();
+    let base_size =
+        crate::format::ENVELOPE_HEADER_BYTES + if matches!(node, Node::Leaf(_)) { 4 } else { 10 };
+    let capacity = MAX_PERSISTENT_NODE_BYTES - base_size;
+    let mut prefix = Vec::with_capacity(entry_count + 1);
+    prefix.push(0_usize);
+    for index in 0..entry_count {
+        let size = node_entry_size(node, index)?;
+        if size > capacity {
+            return Err(PersistentMapError::EntryTooLarge);
+        }
+        prefix.push(prefix[index] + size);
+    }
+    let mut costs = vec![0_usize; entry_count + 1];
+    let mut starts = vec![0_usize; entry_count + 1];
+    let mut candidates = VecDeque::from([0]);
+    for end in 1..=entry_count {
+        while candidates
+            .front()
+            .is_some_and(|&start| prefix[end] - prefix[start] > capacity)
+        {
+            candidates.pop_front();
+        }
+        let start = *candidates.front().expect("each individual entry fits");
+        costs[end] = costs[start] + separator_size(node.entry_key(end - 1));
+        starts[end] = start;
+        while candidates
+            .back()
+            .is_some_and(|&previous| costs[previous] >= costs[end])
+        {
+            candidates.pop_back();
+        }
+        candidates.push_back(end);
+    }
+    let mut parts = Vec::new();
+    let mut end = entry_count;
+    while end > 0 {
+        let start = starts[end];
+        parts.push(slice_node(node, start, end));
+        end = start;
+    }
+    parts.reverse();
+    Ok(parts)
 }
 
 fn child_index(children: &[(Vec<u8>, ObjectRef)], key: &[u8]) -> Option<usize> {
@@ -1048,7 +1223,7 @@ mod tests {
     use super::{
         INTERNAL_NODE_MARKER, MAX_PERSISTENT_TREE_LEVEL, MapChange, MapObjectStore, Node,
         ObjectStoreScopeId, PersistentBTree, PersistentMapError, decode_node, encode_node,
-        load_node, store_node,
+        load_node, partition_for_separators, store_node,
     };
     use crate::format::{
         CanonicalEncoder, MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, decode_object,
@@ -1244,6 +1419,94 @@ mod tests {
             tree.insert(&mut store, vec![b'b'; 40_000], Vec::new()),
             Err(PersistentMapError::RootTooLarge)
         ));
+    }
+
+    #[test]
+    fn insertion_repartitions_existing_nodes_to_fit_long_separators() {
+        let entries = [
+            (b"a".to_vec(), vec![1; 10_000]),
+            (vec![b'b'; 40_000], Vec::new()),
+            (b"c".to_vec(), vec![3; 20_000]),
+            (vec![b'd'; 40_000], Vec::new()),
+        ];
+        let mut store = MemoryStore::default();
+        let mut tree = PersistentBTree::empty(ObjectType::ArtifactMapNode, &mut store).unwrap();
+        let mut model = BTreeMap::new();
+        for (key, value) in &entries[..3] {
+            tree = tree.insert(&mut store, key.clone(), value.clone()).unwrap();
+            model.insert(key.clone(), value.clone());
+        }
+        let before = tree;
+        let before_model = model.clone();
+        let (key, value) = &entries[3];
+        tree = tree.insert(&mut store, key.clone(), value.clone()).unwrap();
+        model.insert(key.clone(), value.clone());
+
+        assert_model(&tree, &store, &model);
+        assert_model(&before, &store, &before_model);
+        assert!(
+            store
+                .objects
+                .values()
+                .all(|bytes| bytes.len() <= MAX_PERSISTENT_NODE_BYTES)
+        );
+    }
+
+    #[test]
+    fn separator_partition_matches_exhaustive_bounded_layouts() {
+        for sample in 0..32_usize {
+            let entries: Vec<_> = (0..8)
+                .map(|index| {
+                    let key_len = [1, 200, 10_000, 40_000][(sample >> (index % 4 * 2)) & 3];
+                    let value_len = [0, 10_000, 20_000][(sample + index * 5) % 3];
+                    (vec![index as u8 + 1; key_len], vec![0; value_len])
+                })
+                .collect();
+            let mut best = usize::MAX;
+            for mask in 0..1 << (entries.len() - 1) {
+                let mut start = 0;
+                let mut cost = 0;
+                for end in 1..=entries.len() {
+                    if end != entries.len() && mask & (1 << (end - 1)) == 0 {
+                        continue;
+                    }
+                    let encoded_size = 20
+                        + entries[start..end]
+                            .iter()
+                            .map(|(key, value)| 8 + key.len() + value.len())
+                            .sum::<usize>();
+                    if encoded_size > MAX_PERSISTENT_NODE_BYTES {
+                        cost = usize::MAX;
+                        break;
+                    }
+                    cost += 46 + entries[end - 1].0.len();
+                    start = end;
+                }
+                best = best.min(cost);
+            }
+            let parts = partition_for_separators(&Node::Leaf(entries.clone())).unwrap();
+            let actual_cost: usize = parts
+                .iter()
+                .map(|part| 46 + part.max_key().unwrap().len())
+                .sum();
+            assert_eq!(actual_cost, best, "sample {sample}");
+            for part in &parts {
+                assert!(
+                    encode_node(ObjectType::ArtifactMapNode, part)
+                        .unwrap()
+                        .len()
+                        <= MAX_PERSISTENT_NODE_BYTES
+                );
+            }
+            let actual_entries: Vec<_> = parts
+                .into_iter()
+                .flat_map(|part| match part {
+                    Node::Leaf(entries) => entries,
+                    Node::Internal { .. } => unreachable!("partition preserves node kind"),
+                })
+                .collect();
+            assert_eq!(actual_entries, entries);
+        }
     }
 
     #[test]
