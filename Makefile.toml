@@ -54,6 +54,12 @@ install_crate = { crate_name = "cargo-sort", version = "2.1.4", binary = "cargo"
 command = "cargo"
 args = ["sort", "--workspace", "--check", "--check-format"]
 
+[tasks.check-package]
+category = "Checks"
+description = "Validate workspace package file lists"
+command = "cargo"
+args = ["package", "--locked", "--workspace", "--list"]
+
 [tasks.check-clippy]
 category = "Checks"
 description = "Run Clippy with default and all features"
@@ -135,6 +141,7 @@ description = "Run all local checks"
 dependencies = [
     "check-fmt",
     "check-dep-sort",
+    "check-package",
     "check-clippy",
     "check-machete",
     "test",
