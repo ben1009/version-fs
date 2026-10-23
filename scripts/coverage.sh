@@ -19,7 +19,7 @@ with open(sys.argv[1]) as inventory:
 has_tests = any(
     not case["ignored"]
     for suite in suites.values()
-    for case in suite["testcases"].values()
+    for case in suite["test_cases"].values()
 )
 print("true" if has_tests else "false")
 PY
