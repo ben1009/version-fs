@@ -117,8 +117,9 @@ those tests across processes; it is not the first durability or fencing test.
   device/freeze failure points, I/O/object counters, and bounded test fixtures.
 
 **Exit evidence:** CI builds the workspace; format vectors are stable; and the
-privileged RAM-backed ublk/ext4 smoke passed formatting, mount/read/write, FLUSH
-delivery, freeze/thaw, unsupported-discard handling, orderly teardown, and
+privileged RAM-backed ublk/ext4 smoke passed formatting, file readback after
+unmount/remount, fresh sync-phase FLUSH delivery, freeze/thaw,
+unsupported-discard handling, orderly teardown, and
 server-death teardown on Linux 6.12.71-1-lts. The installed ublk module was
 loaded for the run and unloaded afterward. This prototype does not qualify FUA
 durability, remote storage, or Generation publication.

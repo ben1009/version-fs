@@ -61,9 +61,14 @@ not download or execute an unpinned bootstrap script.
 
 The ublk smoke requires Linux with `CONFIG_BLK_DEV_UBLK`, `/dev/ublk-control`,
 effective `CAP_SYS_ADMIN` (or equivalent device permissions), mount namespaces,
-`mkfs.ext4`, `mount`, `fsfreeze`, and `blkdiscard`. The harness runs the ublk server in a
+`mkfs.ext4`, `mount`, `umount`, `mountpoint`, `fsfreeze`, and `blkdiscard`. The harness runs the ublk server in a
 separate mount namespace from the ext4 consumer to avoid teardown/unmount
-self-deadlock. Set `VERSIONFS_SMOKE_KEEP=1` to retain the request log. This
+self-deadlock. It requires a new FLUSH during sync and verifies file contents
+after unmount/remount. Set `VERSIONFS_SMOKE_KEEP=1` to retain the request log. If
+cleanup cannot confirm an unmount, it exits with an error and preserves the
+mount, server, and logs for recovery; the diagnostic reports their paths and PID.
+Unfreeze/unmount that temporary filesystem before stopping its server and
+removing the work directory. This
 volatile RAM device verifies request plumbing, ext4 flush progress, freeze
 progress, and kernel device teardown only; `libublk` advertises a volatile cache,
 so the kernel may emulate FUA as WRITE followed by FLUSH. The harness does not
