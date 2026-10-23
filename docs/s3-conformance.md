@@ -1,10 +1,10 @@
 # S3 Object Store Conformance
 
-The Version FS S3 conformance test is opt-in. Ordinary development and CI do
-not contact AWS or an emulator. It can target either Amazon S3 or a local
-RustFS instance. In both cases, use a dedicated, disposable bucket named
-`versionfs-test-*`; the test rejects bucket names outside that pattern and
-prefixes outside `versionfs-conformance/`.
+The Version FS S3 conformance test is ignored by default in local test suites.
+GitHub Actions runs it in a dedicated job against a disposable RustFS instance.
+Amazon S3 runs require explicit setup and credentials. In both cases, use a
+dedicated, disposable bucket named `versionfs-test-*`; the test rejects bucket
+names outside that pattern and prefixes outside `versionfs-conformance/`.
 
 The test writes two distinct small objects under a fresh workspace ID, verifies
 conditional create and duplicate reuse for one object, reads and verifies its
@@ -123,5 +123,5 @@ docker volume rm rustfs-data
 ```
 
 Keep the endpoint bound to loopback and use throwaway credentials. The test
-leaves its object in the bucket, so remove the disposable RustFS volume after
+leaves two objects in the bucket, so remove the disposable RustFS volume after
 the run.
