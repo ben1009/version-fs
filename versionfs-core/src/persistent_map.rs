@@ -4,18 +4,25 @@ use crate::format::{
     CanonicalDecoder, CanonicalEncoder, FormatError, MAX_PERSISTENT_NODE_BYTES, ObjectRef,
     ObjectType, encode_object, encode_ordered_entries,
 };
-use crate::identity::ObjectId;
+use crate::identity::{ObjectId, ObjectStoreScopeId};
 use std::cmp::Ordering;
 use thiserror::Error;
 
 const INTERNAL_NODE_MARKER: u32 = u32::MAX;
 const OBJECT_REFERENCE_BYTES: usize = 42;
+const MAX_PERSISTENT_TREE_LEVEL: u16 = 64;
 
 /// Minimal immutable-object access required by the persistent map algorithms.
 ///
 /// Implementations must treat an object ID as immutable. The map verifies every
 /// retrieved value against the complete typed reference before decoding it.
 pub trait MapObjectStore {
+    /// Returns the stable identity of the immutable-object namespace.
+    ///
+    /// Verification proofs are reusable only within the same namespace. Stores
+    /// that share a content-addressed namespace must return the same identity.
+    fn proof_scope(&self) -> ObjectStoreScopeId;
+
     /// Reads an object by content identity.
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String>;
 
@@ -299,7 +306,7 @@ impl PersistentBTree {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum Node {
+pub(crate) enum Node {
     Leaf(Vec<(Vec<u8>, Vec<u8>)>),
     Internal {
         level: u16,
@@ -315,14 +322,14 @@ struct NodeExpectation {
 }
 
 impl Node {
-    fn level(&self) -> u16 {
+    pub(crate) fn level(&self) -> u16 {
         match self {
             Self::Leaf(_) => 0,
             Self::Internal { level, .. } => *level,
         }
     }
 
-    fn max_key(&self) -> Option<&[u8]> {
+    pub(crate) fn max_key(&self) -> Option<&[u8]> {
         match self {
             Self::Leaf(entries) => entries.last().map(|entry| entry.0.as_slice()),
             Self::Internal { children, .. } => children.last().map(|entry| entry.0.as_slice()),
@@ -350,7 +357,7 @@ fn validate_node_type(node_type: ObjectType) -> Result<(), PersistentMapError> {
     }
 }
 
-fn load_node<S: MapObjectStore>(
+pub(crate) fn load_node<S: MapObjectStore>(
     store: &S,
     reference: ObjectRef,
     expected_type: ObjectType,
@@ -392,9 +399,9 @@ fn encode_node(node_type: ObjectType, node: &Node) -> Result<Vec<u8>, FormatErro
             encode_ordered_entries(&refs)?
         }
         Node::Internal { level, children } => {
-            if *level == 0 || children.is_empty() {
+            if *level == 0 || *level > MAX_PERSISTENT_TREE_LEVEL || children.is_empty() {
                 return Err(FormatError::InvalidPersistentNode(
-                    "internal nodes require a positive level and at least one child",
+                    "internal nodes require a bounded positive level and at least one child",
                 ));
             }
             ensure_strict_keys(children.iter().map(|entry| entry.0.as_slice()))?;
@@ -443,9 +450,9 @@ fn decode_node(payload: &[u8], node_type: ObjectType) -> Result<Node, FormatErro
     let level = decoder.u16_le()?;
     let count = usize::try_from(decoder.u32_le()?)
         .map_err(|_| FormatError::InvalidPersistentNode("child count overflow"))?;
-    if level == 0 || count == 0 {
+    if level == 0 || level > MAX_PERSISTENT_TREE_LEVEL || count == 0 {
         return Err(FormatError::InvalidPersistentNode(
-            "internal nodes require a positive level and at least one child",
+            "internal nodes require a bounded positive level and at least one child",
         ));
     }
     let min_child_bytes = 4_usize + OBJECT_REFERENCE_BYTES;
@@ -826,6 +833,8 @@ fn collect_subtree<S: MapObjectStore>(
         Node::Leaf(leaf) => entries.extend(leaf),
         Node::Internal { level, children } => {
             for (maximum, child) in children {
+                let previous_max = entries.last().map(|(key, _)| key.clone());
+                let child_entry_start = entries.len();
                 collect_subtree(
                     store,
                     child,
@@ -835,6 +844,15 @@ fn collect_subtree<S: MapObjectStore>(
                     entries,
                     nodes,
                 )?;
+                if let (Some(previous_max), Some((child_min, _))) =
+                    (previous_max, entries.get(child_entry_start))
+                    && child_min <= &previous_max
+                {
+                    return Err(FormatError::InvalidPersistentNode(
+                        "adjacent child key ranges overlap or are unordered",
+                    )
+                    .into());
+                }
             }
         }
     }
@@ -995,11 +1013,13 @@ fn merge_diff(
 #[cfg(test)]
 mod tests {
     use super::{
-        MapChange, MapObjectStore, Node, PersistentBTree, PersistentMapError, encode_node,
-        load_node,
+        INTERNAL_NODE_MARKER, MAX_PERSISTENT_TREE_LEVEL, MapChange, MapObjectStore, Node,
+        ObjectStoreScopeId, PersistentBTree, PersistentMapError, decode_node, encode_node,
+        load_node, store_node,
     };
     use crate::format::{
-        MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, decode_object, object_id,
+        CanonicalEncoder, MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, decode_object,
+        encode_object, object_id,
     };
     use crate::identity::ObjectId;
     use std::collections::{BTreeMap, HashMap};
@@ -1011,6 +1031,10 @@ mod tests {
     }
 
     impl MapObjectStore for MemoryStore {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            ObjectStoreScopeId::from_bytes([0xA5; 16])
+        }
+
         fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
             Ok(self.objects.get(&id).cloned())
         }
@@ -1170,5 +1194,69 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn complete_map_walk_rejects_overlapping_child_key_ranges() {
+        let mut store = MemoryStore::default();
+        let node_type = ObjectType::ArtifactIndexNode;
+        let left = store_node(
+            &mut store,
+            node_type,
+            &Node::Leaf(vec![(key(1), vec![1]), (key(5), vec![5])]),
+        )
+        .unwrap();
+        let right = store_node(
+            &mut store,
+            node_type,
+            &Node::Leaf(vec![(key(3), vec![3]), (key(10), vec![10])]),
+        )
+        .unwrap();
+        let root = store_node(
+            &mut store,
+            node_type,
+            &Node::Internal {
+                level: 1,
+                children: vec![(key(5), left), (key(10), right)],
+            },
+        )
+        .unwrap();
+
+        let tree = PersistentBTree::from_root(root).unwrap();
+        assert!(matches!(
+            tree.entries(&store),
+            Err(PersistentMapError::Format(
+                crate::format::FormatError::InvalidPersistentNode(
+                    "adjacent child key ranges overlap or are unordered"
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_excessive_persistent_tree_height() {
+        let node_type = ObjectType::ArtifactIndexNode;
+        let child = |byte| ObjectRef {
+            object_type: node_type,
+            object_id: ObjectId::from_bytes([byte; 32]),
+            encoded_len: 20,
+        };
+        let mut encoder = CanonicalEncoder::new();
+        encoder.u32_le(INTERNAL_NODE_MARKER);
+        encoder.u16_le(MAX_PERSISTENT_TREE_LEVEL + 1);
+        encoder.u32_le(2);
+        encoder.bytes(&key(1)).unwrap();
+        encoder.object_ref(child(1));
+        encoder.bytes(&key(2)).unwrap();
+        encoder.object_ref(child(2));
+        let bytes = encode_object(node_type, &encoder.finish()).unwrap();
+        let payload = decode_object(&bytes).unwrap().payload;
+
+        assert!(matches!(
+            decode_node(payload, node_type),
+            Err(crate::format::FormatError::InvalidPersistentNode(
+                "internal nodes require a bounded positive level and at least one child"
+            ))
+        ));
     }
 }
