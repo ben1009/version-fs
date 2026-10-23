@@ -105,7 +105,7 @@ those tests across processes; it is not the first durability or fencing test.
 - [ ] Establish the opt-in real-S3 conformance lane with the object-store adapter
   in P1; do not run it against a production bucket.
 - [x] Pin the Linux ublk userspace binding and add an ext4 tools/configuration
-  plus a tiny READ/WRITE/FLUSH/FUA mount/freeze smoke harness.
+  plus a tiny READ/WRITE/FLUSH mount/freeze smoke harness.
 - [x] On a Linux host, verify effective capabilities/privileges,
   device teardown on server death, and unsupported-operation behavior. NBD may
   accelerate exploration but is not the ublk release qualification.
