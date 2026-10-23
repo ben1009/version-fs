@@ -105,10 +105,11 @@ implementing it and operating a replicated metadata service are not MVP gates.
 The implementation uses Rust for the core library, service, SDK, and CLI.
 The domain protocol depends on `ObjectStore` and `MetadataAuthority` interfaces.
 One deployment initially owns one metadata namespace and an S3 prefix. Independent
-branches can prepare concurrently; transactional conflicts serialize mutations
-of the same branch without a Version FS global commit lock. Bulk transfer is
-separate from authority execution. Scaling the API tier and partitioning
-authority are later work.
+branches can prepare concurrently; bulk transfer is separate from authority
+execution. The single-owner MVP adapter may serialize the short metadata commit
+region with an authority-level gate, but does not hold it during preparation or
+object transfer. The domain protocol does not require one Version FS lock across
+preparation. Scaling the API tier and partitioning authority are later work.
 
 ### 3.1 MVP metadata backend
 
@@ -318,17 +319,33 @@ metadata reads and buffered mutations, and MAY read the authority owner's
 monotonic lease clock. The clock is a trusted local input, not an external side
 effect. Lease-dependent preconditions MUST use a fresh clock reading on every
 transaction attempt, including retries; a value captured before `transact` or
-by an earlier attempt MUST NOT authorize a new mutation. In addition, after
-closure evaluation and conflict validation, `transact` MUST revalidate each
-lease-dependent precondition at its serialization/commit decision using the
-authority clock. The lease check and commit decision form one logical
-linearization point: if the lease is expired there, the complete transaction is
-rejected; a later durability acknowledgement does not invalidate a transaction
-that linearized while the lease was valid. The closure performs no S3 I/O,
-command execution, local file mutation, or allocation of a new logical operation
-ID on retry. Unknown commit outcomes cannot be retried as fresh operations.
+by an earlier attempt MUST NOT authorize a new mutation. At its serialization/
+commit decision, `transact` MUST revalidate each lease-dependent precondition
+using a fresh authority-clock reading. The lease check and commit decision form
+one logical linearization point: if the lease is expired there, the complete
+transaction is rejected; a later durability acknowledgement does not invalidate
+a transaction that linearized while the lease was valid. The closure performs
+no S3 I/O, command execution, local file mutation, or allocation of a new
+logical operation ID on retry. Unknown commit outcomes cannot be retried as
+fresh operations.
 Deleting a metadata key is unrelated to physical object deletion; v0 still
 issues no S3 DELETE.
+
+For the single-owner MVP, the adapter MAY implement this commit-time validation
+with an authority-level mutation commit gate; no `MetadataTxn` precommit hook is
+required. Every mutating transaction MUST acquire the same gate before its
+transaction body begins and retain it through backend commit resolution. Inside
+the gated attempt, after reading lease metadata and preparing the buffered write
+set, the domain closure takes a fresh clock reading and performs the final lease
+checks. This check is the logical serialization point; the adapter submits the
+backend commit immediately afterward and prevents another authoritative mutation
+from passing its serialization point in between. A definite conflict retries
+the complete transaction body and lease check under the gate. If the backend
+outcome is unknown, the gate MUST remain closed to new mutations until operation
+record reconciliation establishes whether the commit happened. Object uploads
+and other preparation remain outside the gate. A multi-owner authority MUST use
+an equivalent shared or backend-native serialization mechanism; a process-local
+mutex alone is insufficient.
 
 Mutating transactions use point keys. Prefix scans are for read-only snapshots,
 listing, and reports; their results cannot act as transactional absence or
