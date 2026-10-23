@@ -2,13 +2,17 @@
 
 The tooling baseline comes from
 [`toy-kv-engine` at `8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe`](https://github.com/ben1009/toy-kv-engine/tree/8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe).
+The MVP Metadata Authority adapter pins this same engine revision as a Git
+dependency so local and CI qualification use the reviewed transaction, WAL, and
+snapshot APIs.
 This repository contains four Rust packages matching the
 [MVP implementation plan](mvp-implementation-plan.md#2-initial-code-organization).
 P0 added canonical-format primitives, bounded shared fixtures, and an opt-in
 RAM-backed ublk/ext4 feasibility harness. P1 adds the workspace-scoped S3 object
 adapter and deterministic conformance tests. The real-S3 test is explicitly
-ignored and requires a dedicated test bucket; the metadata authority, higher
-storage protocols, service daemon, and user-facing commands remain unimplemented.
+ignored and requires a dedicated test bucket. P2 adds the toy-kv Metadata
+Authority adapter and its conformance tests; higher storage protocols, the
+service daemon, and user-facing commands remain unimplemented.
 Tooling checks do not qualify any MVP durability gate.
 
 ## Setup and tools

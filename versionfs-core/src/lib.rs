@@ -3,6 +3,7 @@
 pub mod fault;
 pub mod format;
 pub mod identity;
+pub mod metadata;
 pub mod metrics;
 pub mod time;
 

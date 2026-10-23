@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0 merged; P1 object layer implemented, real-S3 run pending |
+| Status | P0 merged; P1 object layer implemented, real-S3 run pending; P2 locally qualified |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -149,21 +149,31 @@ or overwrite method, and the real-S3 role must have no object-delete permission.
 
 ### P2. MetadataAuthority and toy-kv
 
-- [ ] Pin/review the engine revision and verify WAL, durable commit/reopen, errors,
+- [x] Pin/review the engine revision and verify WAL, durable commit/reopen, errors,
   fresh reads, point transactions, and snapshot paging through one common contract.
-- [ ] Implement the single-owner authority commit gate around final transaction
+- [x] Implement the single-owner authority commit gate around final transaction
   evaluation/commit resolution. Final lease validation defines the logical
-  serialization point; conflict retries reevaluate time and metadata. Unknown
-  commit outcomes hold new mutations out until authoritative reconciliation.
-- [ ] Qualify atomic multi-key writes, absent/stale point conflicts, read-your-writes,
+  serialization point. A definite no-commit conflict may rerun the complete
+  transaction body with fresh metadata and clock reads; unknown commit outcomes
+  hold new mutations out until authoritative reconciliation.
+- [x] Qualify atomic multi-key writes, absent/stale point conflicts, read-your-writes,
   read-after-commit, process-crash recovery, snapshot loss, and consistent paged scans.
-- [ ] Document the compatible PostgreSQL mapping without implementing it or adding
+- [x] Document the compatible PostgreSQL mapping without implementing it or adding
   Version FS lease hooks to the general-purpose KV transaction API.
 
-**Exit evidence:** conformance passes on preserved storage; expiry before the
-final decision rejects every write, while durability acknowledgement delayed
-after a valid decision remains committed. Resolve a missing backend guarantee
-before progressing to P5.
+**Exit evidence:** conformance passes against toy-kv-engine revision
+`8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe`. WAL-enabled, serializable point
+transactions survive abrupt writer-process exit and reopen. Paged scans retain
+one snapshot boundary; a live snapshot prevents close/reopen recovery from
+silently changing that boundary. The authority gate serializes the full
+single-owner mutation path, and injected lease-clock tests reject an expired
+decision while preserving a commit whose reply is delayed past expiry. Unknown
+commit outcomes block later writes until the operation result key resolves to
+committed or not committed. A durable pending-operation record is recovered
+before an authority opened after process exit admits mutations; crash tests
+cover both a committed transaction with a lost reply and a transaction known
+not to have committed, including reconciliation and retry. PostgreSQL remains
+an interface mapping only.
 
 ### P3. Persistent volume roots and native indexes
 

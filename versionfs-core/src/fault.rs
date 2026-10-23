@@ -15,6 +15,8 @@ pub enum FailurePoint {
     AuthorityBeforeCommit,
     /// After an authority commit but before the caller receives the reply.
     AuthorityAfterCommitBeforeReply,
+    /// A metadata backend reports an unknown commit before applying the write.
+    AuthorityCommitOutcomeUnknownWithoutCommit,
     /// Before a block request is executed by the device adapter.
     DeviceBeforeExecute,
     /// After device state changes but before request completion.
