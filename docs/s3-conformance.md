@@ -66,6 +66,8 @@ and accepts only `http://127.0.0.1:<port>`. The normal S3 adapter remains
 HTTPS-only. The local emulator path omits SSE request headers because RustFS
 SSE-S3 requires KMS configuration; this lane does not qualify encryption.
 Amazon S3 conformance continues to exercise the production encryption request.
+GitHub Actions runs the same ignored conformance test in a separate job against
+the pinned RustFS image. The local instructions below use the same test setup.
 
 The following uses Docker and AWS CLI (`aws`), with the
 [RustFS 1.0.3 release](https://github.com/rustfs/rustfs/releases/tag/1.0.3).
@@ -78,7 +80,7 @@ set -euo pipefail
 docker volume create rustfs-data
 docker run -d \
   --name rustfs \
-  -p 9000:9000 \
+  -p 127.0.0.1:9000:9000 \
   -v rustfs-data:/data \
   -e RUSTFS_ACCESS_KEY=versionfs-local-access \
   -e RUSTFS_SECRET_KEY=versionfs-local-secret-change-me \

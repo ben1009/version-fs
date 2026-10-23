@@ -45,6 +45,67 @@ jobs:
         if: matrix.suite == 'unit'
         run: cargo test --locked --workspace --all-features --doc
 
+  rustfs-s3-conformance:
+    name: RustFS S3 conformance
+    runs-on: ubuntu-latest
+    env:
+      AWS_ACCESS_KEY_ID: versionfs-local-access
+      AWS_SECRET_ACCESS_KEY: versionfs-local-secret-change-me
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      VERSIONFS_S3_EMULATOR_ENDPOINT: http://127.0.0.1:9000
+      VERSIONFS_S3_CONFORMANCE_BUCKET: versionfs-test-local
+      VERSIONFS_S3_CONFORMANCE_PREFIX: versionfs-conformance/ci
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Start RustFS
+        run: |
+          docker run -d --name rustfs \
+            -p 127.0.0.1:9000:9000 \
+            -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" \
+            -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
+            -e RUSTFS_ADDRESS=:9000 \
+            rustfs/rustfs:1.0.3@sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b \
+            /data
+      - name: Install AWS CLI
+        run: |
+          python3 -m venv "$RUNNER_TEMP/awscli"
+          "$RUNNER_TEMP/awscli/bin/pip" install 'awscli==1.46.2'
+          echo "$RUNNER_TEMP/awscli/bin" >> "$GITHUB_PATH"
+      - name: Wait for RustFS and create test bucket
+        run: |
+          ready=false
+          for attempt in $(seq 1 30); do
+            if aws --endpoint-url "$VERSIONFS_S3_EMULATOR_ENDPOINT" \
+              --region "$AWS_REGION" s3api list-buckets >/dev/null 2>&1; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            docker logs rustfs
+            exit 1
+          fi
+          aws --endpoint-url "$VERSIONFS_S3_EMULATOR_ENDPOINT" \
+            --region "$AWS_REGION" s3api create-bucket \
+            --bucket "$VERSIONFS_S3_CONFORMANCE_BUCKET"
+      - name: Run S3 conformance test
+        run: |
+          cargo test --locked -p versionfs-service \
+            --features s3-emulator --test s3_conformance -- \
+            --ignored --nocapture
+      - name: Remove RustFS container
+        if: always()
+        run: docker rm -f rustfs || true
+
   coverage:
     runs-on: ubuntu-latest
     env:
