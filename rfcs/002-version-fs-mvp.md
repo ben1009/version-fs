@@ -20,7 +20,7 @@ implements the Generation semantics and invariants of RFC-001 using:
 - One active writer per branch.
 - A native SDK and CLI, with managed local directory materialization.
 - Native ordered logs using S2 as the semantic reference.
-- Explicit retention and a conservative, blocking mark-and-sweep collector.
+- Explicit retention, pins, reader protection, and mark-only reachability reports.
 
 A successful demonstration is:
 
@@ -60,15 +60,17 @@ or achieved performance.
 | Git | Capture and restore a self-contained repository directory, including `.git`. |
 | Recovery | Fresh-worker reads and materialization; interrupted operations resolved from durable authority. |
 | Retention | Recent-Generation retention, explicit pins, protected workspace bases and readers. |
-| GC | Exclusive collection barrier, complete reachability traversal, grace period, conservative interruption behavior. |
+| GC report | Snapshot retained/protected roots, traverse reachability, and report observed unreachable objects without deleting bytes. |
 | Tooling | SDK and CLI for the workflow in Section 1; structural namespace diff. |
 
 ### 2.2 Deferred capabilities
 
 The MVP does not implement FUSE, virtio-fs, a Git server or smart protocol,
-semantic merge, concurrent writers on one branch, online GC, cross-region
-writable branches, compression, content-defined chunking, automatic autosave,
-or a remote mutation WAL for local file writes.
+semantic merge, concurrent writers on one branch, physical object deletion,
+online reclamation, cross-region writable branches, compression, content-defined
+chunking, automatic autosave, or a remote mutation WAL for local file writes.
+The v0 object store only grows. Safe reclamation and deletion fencing belong
+in a follow-up RFC, tentatively RFC-003: Safe Object Reclamation.
 
 Process-memory snapshots, application database snapshots, GTS adapters, and
 coordinated global checkpoints remain the extension in RFC-001 Section 18.
@@ -76,9 +78,9 @@ The MVP neither labels a Generation with a fabricated global timestamp nor
 claims a timestamp alone makes file and database state consistent. Its branch
 IDs are not a substitute for coordinated `history_id` identities.
 
-Automatic metadata failover, restoration from an older metadata backup, and
-automatic collector handover are outside the initial service. Their safety
-requirements are described where they affect normal operation.
+Automatic metadata failover and restoration from an older metadata backup are
+outside the initial service. Their safety requirements are described where they
+affect normal operation.
 
 ## 3. Components and deployment
 
@@ -120,14 +122,16 @@ ordinary worker-recovery path.
 S3 is accessed through an object-store interface, but real AWS S3 is the release
 backend. An emulator or another S3-compatible service is a development backend
 until its behavior passes the same conformance checks. AWS documents strong
-consistency for object PUT, GET, DELETE, and listing in its
+consistency for object PUT, GET, and listing in its
 [consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel).
 This does not create a transaction spanning S3 and PostgreSQL.
 
 The deployment initially has one trusted operator and workspace-scoped client
-credentials. Clients cannot directly overwrite or delete stored objects. Only
-the collector has delete permission. Cross-tenant deduplication and an identity
-provider integration are deferred; workspace authorization is still enforced.
+credentials. Clients cannot directly overwrite or delete stored objects. No v0
+component, including the report worker, has S3 object-delete permission, and
+lifecycle expiration is disabled for the Version FS data prefix. Cross-tenant
+deduplication and an identity provider integration are deferred; workspace
+authorization is still enforced.
 
 ## 4. Immutable formats
 
@@ -234,12 +238,12 @@ publication result. Uploading the descriptor creates no visible Generation.
 
 | Record | Required state |
 | --- | --- |
-| Workspace | Stable ID, access scope, retention policy, collection mode and epoch. |
+| Workspace | Stable ID, access scope, and retention policy. |
 | Branch | Stable ID, unique live name, head Generation, revision, writer epoch/lease, stream epoch, live log-map root. |
 | Generation | Descriptor reference, publication operation, retention deadline, lifecycle state. |
 | Operation | ID, request fingerprint, phase, allocated identities, prepared dependencies, terminal result. |
 | Protection | Pins, reader leases, workspace bases, and preparation roots. |
-| GC epoch | Barrier state, captured roots, candidate and deletion progress. |
+| GC report | Report ID, root snapshot/time, inventory window, completeness, and candidate summary/pages. |
 
 These are logical records; the SQL schema may normalize them. Branch IDs,
 workspace IDs, and stream epochs are never reused. Deleting and recreating a
@@ -248,14 +252,15 @@ its state revision, including durable changes to its live log map. Lease-only
 renewal does not change this revision. Writer ownership changes advance the
 writer epoch. Comparing only head Generation IDs is insufficient for CAS.
 
-Normal transactions acquire a shared lock on the workspace admission record,
-check its collection mode, and lock affected branch/operation records. Shared
-admission locks permit independent branches to proceed concurrently. The
-collector takes an exclusive admission lock to change modes. PostgreSQL's
-[row locking](https://www.postgresql.org/docs/current/explicit-locking.html)
-provides the mechanism; lock ordering is workspace, branch IDs in sorted order,
-then operation/protection records. No SQL transaction remains open across S3
-I/O. Deadlock or serialization retries preserve the same operation ID.
+Normal transactions lock affected branch records in sorted ID order, then their
+operation/protection records, using PostgreSQL's
+[row locking](https://www.postgresql.org/docs/current/explicit-locking.html).
+Retention eligibility and protection acquisition are checked atomically;
+transactions spanning retention records use serializable isolation and retry
+serialization failures with the same operation ID. Independent branches need
+no exclusive workspace admission lock. A GC report snapshots metadata without
+pausing writers or reader acquisition. No SQL transaction remains open across
+S3 I/O.
 
 ### 5.2 Idempotent mutations
 
@@ -282,6 +287,13 @@ Terminal results and request fingerprints remain for the workspace's lifetime.
 Compact records may replace large preparation details, but IDs never become
 executable again. Results include the created branch ID, writer grant,
 Generation, append range, pin, or resulting revision as applicable.
+
+This is a monotonically growing metadata class: every append and other
+authoritative mutation keeps an idempotency record even after its log range is
+trimmed or its Generation expires. v0 provides replay-safe idempotency for the
+workspace lifetime at this storage cost. Bounded deduplication windows and
+safe result expiry are deferred; metadata capacity must be provisioned and
+exhaustion handled explicitly.
 
 `get_operation(id)` reads authoritative state. A timeout means unknown outcome.
 Even `NotFound` does not prove the original request cannot arrive later: retry
@@ -340,7 +352,9 @@ identity are outside the declared view.
 Symlink targets are stored as text, not imported dependencies. The materializer
 uses directory-relative operations without following existing links and writes
 into a fresh staging directory. It never writes through a captured symlink.
-An external symlink target remains external after restore.
+An external symlink target remains external after restore. Managed commands
+can follow it to host paths permitted by their operating-system credentials;
+the no-follow capture/materialization rules do not confine command execution.
 
 ### 6.2 Capture boundary
 
@@ -349,6 +363,13 @@ Generation and a writer grant. Its files are mutable overlay state even when
 they were originally materialized from immutable objects.
 Local control records and caches live outside the captured directory so grants,
 pending-operation state, and cached objects do not become workspace contents.
+
+The managed runner coordinates execution and checkpoint boundaries. It is not
+a security sandbox. Managed commands are trusted with the worker filesystem
+under their operating-system credentials. Accesses through external symlinks
+or absolute host paths, and other external effects, are outside captured
+Version FS state. The gate does not provide process or filesystem containment;
+a sandboxed runner is a future adapter.
 
 The managed runner admits write commands and SDK file mutations through one
 workspace gate. A checkpoint closes that gate, waits for admitted commands and
@@ -376,7 +397,54 @@ This boundary is not an application database snapshot. A live database directory
 requires that database's export or quiescence protocol before capture. Process
 memory, open connections, and external side effects are not captured.
 
-### 6.3 Change discovery and materialization
+### 6.3 Initial directory import
+
+`import_directory` attaches an existing worker-local directory as a managed
+workspace; it does not publish its contents. Its SDK inputs are:
+
+```text
+import_directory {
+    operation_id,
+    branch_id,
+    expected_revision,
+    grant,
+    source_directory,
+    quiescence_ack,
+}
+    -> ManagedWorkspaceHandle { local_handle_id, branch_id, base_generation,
+                                base_protection_id }
+```
+
+`source_directory` is resolved by the worker SDK, not opened as a path on the
+remote service. The caller holds it quiescent through setup and agrees to route
+subsequent writers through the managed gate. The SDK verifies the directory
+binding, records the operation and worker/directory identity outside that
+directory, and obtains a protected base under the current branch revision and
+grant. It atomically installs the local control record before returning a
+usable handle. A matching retry reconciles the recorded protection/result and
+returns the same local handle; it cannot substitute a different worker/directory
+identity under the old operation ID. Replay does not renew an expired base
+protection. A lost binding or expired protection requires a new import operation.
+
+The imported directory supplies the complete local filesystem view. Relative
+to a nonempty base, absent files are deletions at the next checkpoint. Import
+does not reset live logs or the named-artifact view. Its result acknowledges
+the local binding and base protection, not remote durability of file bytes:
+
+```text
+create_workspace -> empty G0
+acquire_writer
+import_directory("/repo", quiescence_ack) -> managed local workspace
+checkpoint(managed local workspace)      -> durable G1
+```
+
+Capture validates the supported state before publication. Host loss before
+checkpoint may lose all imported file changes. Alternatively, `materialize`
+exports a protected Generation to a fresh directory; `import_directory` binds
+that directory to a branch before managed writes. The CLI may compose these
+calls.
+
+### 6.4 Change discovery and materialization
 
 The first scanner enumerates all entries and hashes all regular-file content.
 It compares the result with the protected base and updates only differing
@@ -390,7 +458,7 @@ explicit export: it enumerates and fetches the entire namespace. A local
 directory does not acquire lazy paging merely because the SDK supports lazy
 reads. FUSE and sparse writable materialization are deferred.
 
-### 6.4 Git and artifacts
+### 6.5 Git and artifacts
 
 The MVP's Git authority is captured repository files. A quiesced, self-contained
 `.git` directory is captured with the worktree and restored byte-for-byte under
@@ -524,9 +592,9 @@ The service owns the trusted object builder. It hashes and validates bytes,
 checks workspace ownership and encoding, and records durable upload results.
 A client assertion that it uploaded a root is not sufficient.
 
-Preparation registers and protects its base Generation, captured live log root,
-and staged objects before they can be exposed to collection. A new manifest
-node is accepted only if every child is either:
+Preparation registers its base Generation, captured live log root, and staged
+objects as protected dependencies. A new manifest node is accepted only if
+every child is either:
 
 - A verified durable object built in the same protected preparation.
 - A shared subtree reachable from an already validated, protected base or log
@@ -537,8 +605,9 @@ reachability. Reusing otherwise unprotected content requires a complete verified
 read or upload during preparation. Validation proceeds bottom-up over new
 nodes; it need not traverse every unchanged protected subtree on each checkpoint.
 The prepared root and its validation dependencies are recorded durably before
-the final transaction. GC admission rules preserve those proofs until commit
-or a definite abort.
+the final transaction. Immutable keys and the no-deletion backend preserve
+verified bytes; preparation protections track the dependencies until commit
+or a definite abort. No collection admission barrier is needed in v0.
 
 ### 8.2 Capture sequence
 
@@ -557,18 +626,19 @@ or a definite abort.
 
 Preparation has a renewable ten-minute inactivity deadline. Renewals cannot
 revive an aborted operation or a fenced writer. A deadline permits the authority
-to record an abort; it is not permission for a collector to guess the outcome
-of an unreachable metadata transaction.
+to record an abort; it is not permission to guess the outcome of an unreachable
+metadata transaction or release unresolved operation protection.
 
 ### 8.3 Publication transaction
 
-The final transaction locks admission, branch, and operation records in the
-order defined in Section 5.1 and checks its exact preconditions, current grant,
+The final transaction locks branch and operation records in the order defined
+in Section 5.1 and checks its exact preconditions, current grant,
 sealed root proof, and preparation state. It then atomically:
 
 1. Creates the published Generation catalog entry and descriptor binding.
 2. Establishes its initial retention deadline.
-3. For attached publication, moves the branch head and advances its revision.
+3. For attached publication, moves the branch head, advances its revision, and
+   moves the managed workspace's base protection to the new Generation.
 4. Records the immutable operation result and closes preparation protection.
 
 For detached publication, step 3 is absent. The same captured state becomes
@@ -628,7 +698,7 @@ outcome atomically. Historical Generations, pins, and readers retain their own
 protection. A new branch with the same name gets a different ID. Retrying the
 old delete operation cannot delete that new branch.
 
-## 10. Retention and collection
+## 10. Retention and reachability reports
 
 ### 10.1 Roots and protection
 
@@ -637,7 +707,7 @@ Branch heads and explicit pins can retain it longer. Detached Generations have
 the same initial protection and may be pinned without branch adoption.
 Automatic hourly/daily selection and branch expiration are deferred.
 
-GC roots include:
+Retained and protected roots include:
 
 - Descriptors and complete graphs of retained Generations and branch heads.
 - Current live log-map roots, including appends not yet in a Generation.
@@ -647,90 +717,71 @@ GC roots include:
 
 A parent Generation ID is lineage, not a strong edge to its descriptor. Required
 Git files, log attachments, segment indexes, and named artifacts are strong
-edges. GC preserves each retained descriptor as well as its content graph.
+edges. Reachability marking includes each retained descriptor as well as its
+complete content graph.
 
 Opening a Generation transactionally verifies publication and current retention
 and creates a five-minute renewable read protection. A mutable workspace also
-protects its selected base and renews that protection. Acquisition is coordinated
-with GC admission; it cannot resurrect state already declared collectible.
+protects its selected base and renews that protection. Eligibility and protection
+acquisition are checked in one metadata transaction; physically present bytes
+alone cannot make an expired Generation eligible again.
 Renewal does not change the protected root. Remote object reads have a
 30-second deadline and are admitted only when the handle remains valid through
 that deadline. The service drops results arriving after an abort or expiry.
 Long exports renew their handles; an expired handle must be opened anew.
 
-Releasing the last pin or deleting a branch does not immediately delete bytes.
+Releasing the last pin, deleting a branch, or trimming a log changes logical
+retention and visibility; none of these operations deletes object bytes in v0.
 An expired Generation cannot be reopened merely because its objects happen to
 remain on S3. Operation-result records are not permanent content-retention roots;
 they continue to report the original outcome after independent retention ends.
 
-### 10.2 Blocking collector
+### 10.2 Mark-only report
 
-The initial collector is manual or scheduled per workspace and uses a durable
-barrier:
+`collect()` is an operator reporting operation. It calculates reachability and
+reports observed unreachable objects; it never issues an object DELETE or
+changes a Generation's publication or retention state.
 
-```text
-RUNNING -> DRAINING -> COLLECTING -> RUNNING
-                         |
-                  RECOVERY_REQUIRED
-```
+1. In a PostgreSQL repeatable-read snapshot transaction, persist the report's
+   root set, snapshot time, and known preparation dependencies. End it before S3
+   I/O. Keep this snapshot on retries of the same report operation.
+2. Traverse durable roots and typed edges with a visited set that can spill to
+   disk. Include protected staged keys; surface incomplete preparations and
+   unknown outcomes as uncertainty. Missing, corrupt, or unsupported required
+   durable metadata makes the report incomplete, not evidence of unreachability.
+3. List the data prefix and compare observed objects with the marked set. Persist
+   the inventory window, counts/bytes, uncertainty, and candidate pages within
+   a configured report-storage budget. Report details have a configured expiry
+   policy; terminal identifiers and summaries retain the operation-result
+   contract. Reading expired details returns `ReportExpired`, not a new report.
+4. Return the report ID and completeness status. An interrupted or over-budget
+   report can resume or fail without changing workspace availability or bytes.
 
-1. Change admission to `DRAINING`. Block new preparations, reference changes,
-   pins, and new reader/workspace protections. Already registered preparations
-   may finish under their original authority; required writer/protection
-   renewals remain available. Otherwise record definite aborts.
-   An unavailable metadata authority or an unresolved commit outcome prevents
-   the collector from proceeding.
-2. When no active preparation remains, persist `COLLECTING` and snapshot the
-   complete authoritative root set. Existing protected readers may continue;
-   renewals of unchanged roots are allowed. Roots in this snapshot remain
-   protected for the whole collection even if a lease expires during it.
-3. Traverse the roots and typed object edges, using a visited set that can spill
-   to disk. Abort deletion on missing, corrupt, or unsupported reachable
-   metadata. Inventory object keys; listing is not a publication catalog.
-4. Mark unretained Generation catalog entries as expired/collected. Select
-   unreachable objects older than a one-hour orphan grace period. Recheck their
-   eligibility while admission remains closed and persist deletion candidates.
-5. Issue bounded deletions, persist results, and reopen admission only after
-   every issued deletion has completed and the deletion executor is quiescent.
+Checkpoint publication, appends, branch changes, and reader acquisition continue
+during reporting. The root snapshot has one metadata boundary; object inventory
+is observed over a window and may omit concurrent uploads. Candidates mean
+unreachable from the captured roots, not safe to delete now. A later publication
+may already reference a candidate. Reports do not create retention roots, and
+old reports are never deletion authorizations.
 
-Root removal can wait until the barrier ends. Local directory edits can
-continue, but checkpoint, new remote reads requiring protection, and durable
-log appends wait or receive an explicit maintenance response. Existing
-immutable reads use the roots already protected. Collection does not run in
-the checkpoint transaction or on every checkpoint.
+The MVP has no collection mode, writer-draining barrier, delete executor, or
+unknown-DELETE recovery state. Late PUTs from aborted preparations and bytes
+unreferenced after trim or expiry stay on S3. Their storage cost is accepted.
 
-Candidate age is an additional filter, not the proof of safety. The barrier
-prevents new references to old candidates while deletion is possible. After it
-opens, a publisher cannot reuse an old existence check for unprotected content;
-it verifies or uploads that content again.
+### 10.3 Future reclamation boundary
 
-### 10.3 Interrupted deletion
+Physical reclamation requires a separate RFC covering publication/reuse races,
+in-progress operations, protected readers, storage-instance identity, deletion
+fencing, and uncertain remote outcomes. Enabling deletion is not an operator
+switch on a v0 candidate report.
 
-The barrier never expires automatically. An interrupted collector leaves
-admission closed. Recovery must stop the old executor and settle every issued
-delete before reopening. A lease check cannot retract a DELETE already sent
-to S3, and a timed-out delete is not known to have stopped.
-
-If any delete outcome remains indeterminate, the workspace remains in
-`RECOVERY_REQUIRED`; it does not resume writes on a timer. v0 provides no
-automatic collector handover. This can cause a prolonged write outage and is
-an explicit MVP availability limitation. A replacement must not infer safety
-merely from a successful GET, absence of a heartbeat, or another collector's
-new epoch.
-
-This restriction matters because object keys are content-addressed and can be
-reused. A delayed old DELETE could remove newly reused content after a premature
-reopen. A future collector can remove this limitation using storage-instance
-identities or another storage-enforced deletion-fencing protocol; that change
-requires its own correctness argument.
-
-Late PUTs from definitively aborted preparations may leave garbage. They cannot
-publish because their operation is terminal; a later collection can reclaim
-them. S3 lifecycle rules must not independently expire Version FS objects.
-The release deployment uses an unversioned dedicated data prefix; enabling
-bucket versioning requires version-aware reclamation, because a simple DELETE
-in a versioned bucket creates a marker rather than reclaiming the version's
-bytes, as documented by [S3 DeleteObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html).
+One possible future mechanism is version-specific S3 reclamation: a DELETE with
+a specific `versionId` addresses that stored version; an ordinary DELETE in a
+versioned bucket creates a delete marker. See
+[S3 object-version deletion](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html).
+Using that mechanism safely also requires binding graph references and reuse
+to the intended physical versions. This RFC chooses no deletion protocol and
+does not require bucket versioning for the MVP.
 
 ## 11. Reads, cache, and recovery
 
@@ -764,20 +815,20 @@ operation ID. Restart first reconciles that operation. It cannot clear local
 work based only on the branch's current head. A different head or epoch requires
 explicit salvage or rematerialization, not automatic deletion of local changes.
 
-The service restarts from PostgreSQL, retaining barriers and terminal operation
-results. Active preparations can resume while their authority remains valid or
-be durably aborted. It never reconstructs publication by listing uploaded
+The service restarts from PostgreSQL, retaining protections and terminal
+operation results. Active preparations can resume while their authority remains
+valid or be durably aborted. It never reconstructs publication by listing uploaded
 Generation descriptors. If PostgreSQL is unavailable, authoritative mutations
 fail closed; a cached branch head is not a replacement authority.
 
 ### 11.3 Metadata recovery boundary
 
 The operator must preserve durable metadata and its configured replication
-contract. Restoring an older database backup while keeping a later, collected
-object namespace can resurrect references to deleted content. The MVP runbook
-therefore keeps both writes and GC disabled after such a restore until an
-offline reconciliation verifies every state it will expose. It cannot silently
-serve the old catalog as current authority.
+contract. Keeping all object bytes does not make an old metadata backup current:
+it can omit acknowledged head movements, writer epochs, and operation outcomes.
+The MVP runbook keeps the service offline after such a restore until a separate
+recovery procedure reconciles authority and fences obsolete writers. It cannot
+silently serve the old catalog as current authority.
 
 An older backup is not an automatic failover target. Recovery of acknowledged
 data after loss of all durable metadata copies needs a coordinated backup and
@@ -793,11 +844,12 @@ workspace ID is known; other operations use the workspace scope.
 
 | Request | Required arguments / result |
 | --- | --- |
-| `create_workspace` | Operation ID; returns workspace ID and initial main branch/Generation. |
+| `create_workspace` | Operation ID; returns workspace ID and initial main branch/empty Generation. |
 | `create_branch` | Operation ID, name, retained base Generation; returns new branch ID/revision. |
 | `get_branch` | Branch ID or live name; returns stable ID, revision, head, stream epoch, and writer epoch. |
 | `acquire_writer` | Operation ID, branch ID, expected writer epoch, owner, explicit handover policy; returns recorded grant/expiry. |
 | `renew_writer` / `release_writer` | Operation ID and exact grant; renewal returns its recorded new expiry. |
+| `import_directory` | Operation ID, branch ID/revision, grant, worker-local source directory, explicit quiescence acknowledgement; returns the managed local handle and protected base (Section 6.3). |
 | `checkpoint` | Operation ID, branch ID/revision, grant, managed capture, attached/detached mode; returns Generation and optional new branch revision. |
 | `move_head` | Operation ID, branch ID/revision, grant, retained target, discard policy; returns new revision/epoch. |
 | `promote` | Operation ID, source ID/revision, destination ID/revision/grant, discard policy; returns selected Generation and destination revision/epoch. |
@@ -805,7 +857,7 @@ workspace ID is known; other operations use the workspace scope.
 | `open_generation` | Operation ID and retained Generation ID; returns protected immutable handle and expiry. |
 | `renew_handle` / `close_handle` | Operation ID and handle ID; rights are not renewed by replaying a prior operation. |
 | `read_at` / `list_at` / `stat_at` | Handle and path, plus byte range or listing cursor where applicable. |
-| `materialize` | Handle and fresh destination; returns a completed local workspace/export. |
+| `materialize` | Protected Generation handle and fresh destination; returns a complete local export, bound for writes separately by `import_directory`. |
 | `diff` | Two protected handles; streams added, removed, and changed entries. |
 | `create_log` / `delete_log` | Operation ID, branch ID/revision, grant, log name/identity; changes the live log map. |
 | `append` | Exact stream, grant, `match_seq_num`, append ID, records and explicit attachments; returns receipt. |
@@ -816,7 +868,8 @@ workspace ID is known; other operations use the workspace scope.
 | `set_artifact` / `remove_artifact` | Managed local overlay operation; takes effect in a Generation at checkpoint. |
 | `pin_generation` / `unpin` | Operation ID and retained Generation or exact pin ID; returns pin/result. |
 | `get_operation` / `abort_operation` | Original operation ID; query or make its outcome terminal. |
-| `collect` | Operator operation ID and workspace; returns GC epoch/progress, respecting the durable barrier. |
+| `collect` | Operator operation ID and workspace; returns mark-only report ID, root snapshot/inventory window, completeness, counts/bytes, and candidate pages. No physical deletion. |
+| `get_gc_report` | Report ID and optional page cursor; returns the recorded summary/candidate page or `ReportExpired` for expired details. |
 
 Local file mutations and artifact staging use the managed gate. They are not
 remote durable mutations; retrying an interrupted local command requires the
@@ -825,13 +878,13 @@ execution or external actions.
 
 Errors distinguish `Conflict`, `Fenced`, `LeaseExpired`, `OperationMismatch`,
 `InProgress`, `GenerationExpired`, `StreamReplaced`, `CursorExpired`,
-`IntegrityError`, `UnsupportedState`, `Busy`, and `Maintenance`. A transport
+`IntegrityError`, `UnsupportedState`, `ReportExpired`, and `Busy`. A transport
 timeout does not become a definite rejection. A conditional failure returns
 the relevant current identity/revision when authorized.
 
 The CLI exposes workspace creation, import/materialize, managed command
 execution, checkpoint, branch/fork, rollback, promote, log append/read/tail,
-artifact staging, pin/unpin, diff, operation status, and operator GC status.
+artifact staging, pin/unpin, diff, operation status, and mark-only GC reports.
 Machine-readable output includes stable identities and operation IDs. There
 are no fake mount or Git-server commands before those adapters exist.
 
@@ -844,17 +897,18 @@ are no fake mount or Git-server commands before those adapters exist.
 | Descriptor uploaded, transaction not committed | Descriptor is invisible preparation data; old head remains authoritative. |
 | Commit succeeds, reply is lost | `get_operation` returns the original committed result, even if the branch later moved. |
 | Acquire/create reply is lost | Return the original writer grant or branch ID; allocate no replacement on replay. |
-| Writer replaced during upload | Final commit rejects the old epoch. Local work is preserved; staged garbage is collectible after abort. |
+| Import setup is interrupted or its reply is lost | Reconcile the recorded base protection and local binding under the same ID; do not claim imported file bytes are remotely durable. |
+| Writer replaced during upload | Final commit rejects the old epoch. Local work is preserved; aborted staged bytes remain stored and can appear in a later report. |
 | Append commits, receipt is lost | Replay returns its exact original range without another append. |
 | Append races checkpoint gate | Its entire batch is captured before the cut, or it waits for the next interval. |
 | Trim or reset races a live cursor | Explicit expired/replaced error; retained Generation reads remain unchanged. |
-| Reader open races collection | Admission/protection commits before the snapshot or is blocked; no unprotected successful open. |
-| GC crashes or a delete times out | Barrier remains closed; no new publisher can reuse the affected key until deletion is settled. |
+| Roots change during a GC report | The report describes its captured root boundary and inventory window; normal reader/writer operations continue. |
+| GC report crashes or exhausts its budget | Resume or fail the report; never delete bytes, change retention, or place the workspace in a recovery mode. |
 | Metadata authority is unavailable | No new authoritative outcome is claimed; unknown preparations are not guessed away. |
 | Cache is lost or corrupt | Re-fetch and verify from S3; published state remains intact. |
 | Required S3 object is missing/corrupt | Report an integrity failure; do not publish or restore partial replacement state. |
 | Local host is lost before checkpoint | Uncheckpointed file and named-artifact changes may be lost. Durable accepted log appends survive under their live roots. |
-| Old metadata backup is restored | Disable writes/GC and reconcile before serving its purported published state. |
+| Old metadata backup is restored | Keep the service offline and reconcile authority before serving its purported published state. |
 
 Local file write completion acknowledges local mutation only. Log append
 completion acknowledges the durable log range only. Checkpoint completion
@@ -866,7 +920,7 @@ must remain distinguishable in both SDK results and user documentation.
 ### 14.1 Expected costs
 
 Let `N` be namespace entries, `B` total regular-file bytes, `S` log segments,
-`V` retained Generations, and `R` the distinct graph reachable during collection.
+`V` retained Generations, and `R` the distinct graph reachable in a report.
 
 | Operation | MVP cost and limitation |
 | --- | --- |
@@ -878,10 +932,11 @@ Let `N` be namespace entries, `B` total regular-file bytes, `S` log segments,
 | Log append | New batch/attachments, `O(log S)` segment-index path changes, log-map path changes, and one metadata commit. |
 | Log checkpoint | Bind the existing log-map root; no historical segment-payload transfer. |
 | Diff | Shared-subtree skipping, with complete namespace traversal possible in the worst case. |
-| GC | Root enumeration, `O(R)` distinct-node marking, object inventory, and candidate deletion while admission is blocked. |
+| GC report | Root snapshot, `O(R)` distinct-node marking, object inventory, and report storage; no publication pause or physical reclamation. |
 
 Small-file object count, fixed-chunk suffix rewrites, full scans, per-batch S3
-latency, the primary metadata database, and blocking GC are expected v0 limits.
+latency, the primary metadata database, unreclaimed object bytes, and lifetime
+operation-result growth are expected v0 limits.
 This release proves correctness and sharing; it does not claim production
 throughput for millions of concurrent agents.
 
@@ -892,15 +947,21 @@ a service-wide cap of 32. The service queue holds at most 64 admitted requests;
 per-branch SDK mutation admission is one active request. These are configurable
 initial limits. Tree traversal and scanning stream results instead of retaining
 the complete namespace or file in RAM. Cache and temporary-disk budgets are
-explicit deployment settings; GC's visited set spills within its disk budget.
+explicit deployment settings; report marking spills within its disk budget.
 
 Before admission, exhaustion returns `Busy` or an explicit capacity error.
 After admission, the operation must reach a recoverable state or a recorded
 abort. It cannot drop an accepted append, evict dirty working bytes, release an
 unresolved operation's roots, bypass a checksum, or acknowledge a weaker
 durability mode. A full metadata store cannot be worked around by forgetting
-idempotency results. Collection that cannot finish within its resource budget
-stops safely under its barrier.
+idempotency results. A report that cannot finish within its resource budget
+returns an incomplete/failed outcome without blocking workspace mutations.
+
+These bounds cover working resources and admission, not a bounded lifetime
+storage footprint. Both unreclaimed S3 bytes and permanent PostgreSQL operation
+records can grow with cumulative mutations. Trimming logs or expiring
+Generations does not remove either class in v0. Capacity limits may reject new
+work; they cannot erase deduplication history or enable deletion to make room.
 
 ### 14.3 Benchmark report
 
@@ -918,11 +979,13 @@ format version, retention settings, cache size, and raw sample counts.
 | Fan-out | 1, 10, and 100 branches sharing one base; fork, independently checkpoint, and drop candidates. |
 | Logs | 100,000 1 KiB records; batches of 1, 100, and 1,000 records; capture, fork, and trim. |
 | Cold recovery | Empty cache versus warm cache; one-file native read versus full materialization. |
-| Collection | Shared and divergent retained roots, abandoned preparations, and interruption before/after deletes. |
+| Reachability report | Shared/divergent retained roots, abandoned preparations, concurrent publication, and interrupted reports. |
+| Lifetime metadata | Operation-result rows/bytes after repeated appends, trims, and Generation expiry; verify records remain replay-safe. |
 
 Measure capture pause and total completion separately; bytes scanned, hashed,
 uploaded, downloaded, and newly stored; data and manifest object counts;
-metadata commits; peak RAM/disk; and GC's write-unavailability interval.
+metadata commits and retained operation rows/bytes; peak RAM/disk; and report
+duration/resource use alongside ongoing checkpoint and append latency.
 Report latency distributions with sample counts and achieved append/checkpoint
 throughput. Single-stream and independent-branch throughput are separate.
 Always include errors and saturation, rather than omitting failed requests.
@@ -935,25 +998,29 @@ latency SLO. A later performance proposal can set budgets from those results.
 
 | Phase | Deliverables | Exit evidence |
 | --- | --- | --- |
-| 1. Immutable state | Canonical encoding, object-store adapter, verified cache, persistent maps/chunks, descriptor reader, import/export, structural diff. | One complete fixture resolves on an empty worker with no ancestor descriptors; unchanged nodes/chunks are physically shared. |
-| 2. Authority and writes | PostgreSQL schema, durable operation outcomes, writer grants, managed capture, attached/detached publication, branch lifecycle, native log append/read/trim, artifact edges. | The end-to-end candidate workflow works; lost replies and stale writers have one recoverable authoritative outcome. |
-| 3. Retention and recovery | Pins/read protections, blocking GC, restart reconciliation, operator runbooks, real-backend fault campaigns, benchmark report. | Collection cannot invalidate retained state; a fresh worker restores every retained fixture after worker loss. |
+| 1. Immutable state | Canonical encoding, object-store adapter, verified cache, persistent maps/chunks, descriptor reader, directory scanner/export, structural diff. | One complete fixture resolves on an empty worker without ancestor reads; unchanged nodes/chunks are physically shared. |
+| 2. Authority and writes | PostgreSQL schema, durable operation outcomes, writer grants, initial-import binding, managed capture, attached/detached publication, branch lifecycle, native log append/read/trim, artifact edges. | The import-to-checkpoint and candidate workflows work; lost replies and stale writers have one recoverable authoritative outcome. |
+| 3. Retention and recovery | Pins/read protections, mark-only reports, restart reconciliation, operator runbooks, real-backend fault campaigns, benchmark report. | Reports classify the captured graph without mutating it or pausing writers; a fresh worker restores every retained fixture after worker loss. |
 
-GC deletion remains disabled until protection, publication fencing, and
-interruption behavior are demonstrated together. Development backends can
-accelerate iteration, but cannot replace real-backend release evidence.
+Physical deletion stays outside v0 regardless of these phases' completion.
+Development backends can accelerate iteration, but cannot replace real-backend
+release evidence.
 
 ## 16. Acceptance criteria
 
 ### 16.1 Functional and structural gates
 
-1. Import supported files, empty directories, symlinks, named artifacts, logs,
-   and a self-contained Git repository. Capture rejects unsupported state.
+1. Execute `create_workspace -> acquire_writer -> import_directory -> checkpoint`
+   with supported files, empty directories, symlinks, and a self-contained Git
+   repository; stage artifacts and append logs before checkpoint. Capture
+   rejects unsupported state. Import replay returns the original local binding
+   and never substitutes for durable file capture.
 2. Create attached and detached Generations. Neither descriptor upload nor
    failed CAS makes a Generation visible; detached success moves no branch.
 3. Restore each retained Generation on another worker with an empty cache.
-   Remove unretained ancestor descriptors and verify descendant reads still
-   resolve entirely from their own roots.
+   Make ancestor descriptors unavailable in the read fixture and verify
+   descendant reads still resolve entirely from their own roots. This check
+   requires no physical S3 deletion by the MVP.
 4. Verify a no-change capture reuses its state roots. A small aligned large-file
    overwrite stores only intersecting chunks and changed tree paths. Measure
    the full scan separately. A fork copies no payload or complete namespace.
@@ -968,6 +1035,14 @@ accelerate iteration, but cannot replace real-backend release evidence.
    Generation remains pinned. Attached artifact bytes survive with those logs.
 8. Enforce workspace authorization for reads, cache use, object reuse, and
    mutations. A known digest does not grant access.
+9. Verify reports mark every retained/protected closure, account for uncertain
+   preparations, and state their root snapshot and inventory window. Concurrent
+   publication and an interrupted report do not block new mutations. No report,
+   trim, expiry, or branch deletion issues an S3 object DELETE; deletion
+   permissions and lifecycle expiration remain disabled.
+10. Verify capture/materialization do not follow restored external symlinks.
+    Document that trusted runner commands can access their host targets and
+    that those bytes and effects are outside the captured state.
 
 ### 16.2 Failure-injection gates
 
@@ -977,6 +1052,9 @@ cases include:
 
 - Creation and writer acquisition committing before their replies are lost;
   replay returns the original identities and never grants a second epoch.
+- Import setup interrupted after base protection is established but before
+  local control installation; a retry reconciles the same binding or requires
+  a new import if its worker/directory is lost.
 - Publication/append committing before a lost reply, followed by later branch
   movement, reset, or name reuse; outcome recovery still returns the original
   result. An abort tombstone wins against a delayed request or returns the
@@ -986,10 +1064,10 @@ cases include:
 - Appends racing the capture gate; no batch is split or assigned to the wrong
   checkpoint interval. Local mutation admission stays closed until capture has
   a definite outcome.
-- Reader acquisition, pin changes, object reuse, publication, and GC racing;
-  no live graph is deleted. A stale existence result cannot justify reuse.
-- Collector interruption and delayed/unknown deletion outcomes; the barrier
-  persists, and no automatic timeout or new collector epoch reopens admission.
+- Reader acquisition, pin changes, and publication racing a mark-only report;
+  root snapshots and uncertainty are explicit, and current operations proceed.
+- Report interruption, missing reachable metadata, or exhausted report storage;
+  incomplete results never become deletion authorizations or a workspace outage.
 - Missing/corrupt chunks, indexes, and descriptors; no partial successful
   restore or fallback to older contents.
 - Exhausted buffers/disk, unavailable S3, and unavailable metadata authority;
@@ -1003,18 +1081,19 @@ should cover boundaries that are difficult to trigger reliably on real services.
 
 | RFC-001 invariants | MVP evidence |
 | --- | --- |
-| I1-I3: immutable, complete, independent state | Encoding/graph validation, independent restore, ancestor removal, sharing and diff fixtures. |
+| I1-I3: immutable, complete, independent state | Encoding/graph validation, independent restore with ancestor reads denied, sharing and diff fixtures. |
 | I4-I5, I8: durability and atomic publication | Real-backend upload/commit failures, detached publication, CAS, lost-reply recovery. |
-| I6, I14: retention and log safety | Pin/read/GC races, complete closure marking, trim with retained historical reads. |
+| I6, I14: retention and log safety | Atomic retention/protection, closure marking and report races, trim with retained historical reads, and no physical deletion. |
 | I7, I11: authority and retry | Handover/expiry, ABA fixtures, identified create/acquire/append/publication retries and abort tombstones. |
 | I9: disposable workers | Destroy all worker state after publication and recover on a fresh worker. |
-| I12-I13: authorization and durable ordered append | Workspace isolation, atomic batches, conditional tails, receipts and attachment retention. |
+| I12-I13: authorization and durable ordered append | Workspace authorization/data scoping, atomic batches, conditional tails, receipts and attachment retention; no runner sandbox claim. |
 | I10, I15: explicit participant/global boundaries | No runtime/DB/global-checkpoint support is claimed; no synthetic timestamp-based consistency assertion. |
 
 The MVP is complete when all required capabilities and gates have evidence,
 the real-backend benchmark report is published, and operator instructions cover
-backup assumptions, unknown outcomes, safe collection, and an interrupted GC
-barrier. Unsupported adapters or future integrations are not release blockers.
+backup assumptions, unknown outcomes, trusted runner/import behavior, mark-only
+report limits, and storage/metadata capacity growth. Physical reclamation and
+other deferred integrations are not release blockers.
 
 ## 17. Selected tradeoffs
 
@@ -1027,12 +1106,14 @@ barrier. Unsupported adapters or future integrations are not release blockers.
 | Full quiesced scan | A clear coherent boundary; checkpoint pauses and scan work can follow total workspace size. |
 | Captured Git repository files | Normal local Git tooling works without a server adapter; no native Git protocol or object-format translation. |
 | One sealed segment per batch | Append durability and checkpoint capture are simple; tiny batches amplify S3 objects and requests. |
-| Blocking GC without automatic handover | Smaller concurrent deletion surface; collection and uncertain delete recovery reduce write availability. |
+| Mark-only GC reports | Validate reachability without a deletion protocol or collection pause; unreferenced object bytes remain stored and storage grows. |
+| Workspace-lifetime operation results | Preserve mutation IDs for replay-safe idempotency; every append and other mutation adds permanent metadata even after trim/expiry. High-rate, long-lived workloads need more PostgreSQL capacity; bounded deduplication is deferred. |
+| Trusted managed runner | Coordinate capture without building a sandbox; commands retain host-filesystem access under their OS credentials, including through external symlinks. |
 
 Future changes can replace these mechanisms while preserving RFC-001's
-semantics. Online GC, a multiplexed log WAL, tracked change discovery, or runtime
-and GTS integration require additional proposals rather than hidden extensions
-to v0's guarantees.
+semantics. Safe physical reclamation, a multiplexed log WAL, tracked change
+discovery, or runtime and GTS integration require additional proposals rather
+than hidden extensions to v0's guarantees.
 
 ## 18. References
 
@@ -1047,8 +1128,9 @@ and release gates above are proposals of this RFC, not vendor guarantees.
   ordered records, atomic batches, acknowledged ranges, and conditional tails.
 - [Amazon S3 consistency](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
   and [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
-  inform the immutable object adapter. [DeleteObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html)
-  distinguishes deletion from versioned-bucket delete markers.
+  inform the immutable object adapter.
+- [S3 object-version deletion](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html)
+  informs only the future reclamation boundary; v0 issues no physical DELETE.
 - [PostgreSQL WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html)
   and [explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html)
   inform durable metadata acknowledgement and transaction-level coordination.
