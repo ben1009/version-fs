@@ -2,10 +2,12 @@
 
 The tooling baseline comes from
 [`toy-kv-engine` at `8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe`](https://github.com/ben1009/toy-kv-engine/tree/8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe).
-This repository currently contains four library skeletons matching the
+This repository contains four Rust packages matching the
 [MVP implementation plan](mvp-implementation-plan.md#2-initial-code-organization).
-They establish build boundaries; no storage implementation or executable command
-is provided yet. Tooling checks do not qualify any MVP storage or durability gate.
+P0 adds canonical-format primitives, bounded shared fixtures, and an opt-in
+RAM-backed ublk/ext4 feasibility harness. The storage protocols, remote object
+adapter, service daemon, and user-facing commands are not implemented yet.
+Tooling checks do not qualify any MVP storage or durability gate.
 
 ## Setup and tools
 
@@ -14,6 +16,10 @@ the rustfmt, Clippy, LLVM tools, and Rust source components. CI reads this file
 through `.github/actions/setup-rust`, so ordinary jobs share the local toolchain.
 Linux is the reference environment for the planned ublk integration and the
 sanitizer jobs.
+
+The P0 ublk binding is pinned to the published `libublk` `0.4.8` crate. Upstream
+`0.5.0` is not yet published in the registry. Its optional feature is excluded
+from normal SDK users: `ublk-smoke` is only a disposable platform prototype.
 
 `./dev` runs from the repository root even when invoked from another directory.
 It installs cargo-make if missing, then forwards arguments to cargo-make. Individual
@@ -50,6 +56,20 @@ not download or execute an unpinned bootstrap script.
 | `./dev test-cov` | Generate HTML coverage under `target/llvm-cov/html` when runnable tests exist. |
 | `./dev test-asan` | Run AddressSanitizer tests on Linux x86-64. |
 | `./dev test-lsan` | Run LeakSanitizer tests with the shared suppression file. |
+| `cargo build -p versionfs-sdk --features ublk-smoke --bin versionfs-ublk-smoke` | Build the opt-in ublk RAM target. |
+| `sudo ./scripts/ublk-ext4-smoke.sh` | Format/mount ext4, exercise file I/O and flush/freeze, check unsupported discard, and verify orderly and abrupt-server teardown. |
+
+The ublk smoke requires Linux with `CONFIG_BLK_DEV_UBLK`, `/dev/ublk-control`,
+effective `CAP_SYS_ADMIN` (or equivalent device permissions), mount namespaces,
+`mkfs.ext4`, `mount`, `fsfreeze`, and `blkdiscard`. The harness runs the ublk server in a
+separate mount namespace from the ext4 consumer to avoid teardown/unmount
+self-deadlock. Set `VERSIONFS_SMOKE_KEEP=1` to retain the request log. This
+volatile RAM device verifies request plumbing, ext4 flush progress, freeze
+progress, and kernel device teardown only; `libublk` advertises a volatile cache,
+so the kernel may emulate FUA as WRITE followed by FLUSH. The harness does not
+qualify FUA durability, S3 durability, Generation publication, or recovery of
+durable state after server death. Run it only on a disposable privileged Linux
+host.
 
 Checks do not rewrite Rust sources or manifests. Formatting and dependency fixes
 have separate commands; spelling failures propagate as failed checks. Build and
@@ -113,3 +133,8 @@ GitHub repository features to be available.
   that this repository has not selected.
 - Ignore rules cover Rust output, profiles, and local settings; engine database
   directories and duplicate ignore entries are omitted.
+
+The real-S3 conformance lane is introduced with the S3 adapter in P1. It will use
+a dedicated test bucket/prefix and explicit credentials; ordinary CI and local
+checks never contact AWS. Do not point future conformance runs at a production
+bucket.

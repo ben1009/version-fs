@@ -2,15 +2,16 @@
 
 | Field | Value |
 | --- | --- |
-| Status | Proposed; implementation has not started |
+| Status | In progress; P0 implementation is under review |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
 
 This plan implements the block-volume MVP from RFC-002. It supersedes the earlier
 directory-scanning plan. RFC-001 owns system semantics; RFC-002 owns mechanisms,
-durability boundaries, and release criteria. All implementation tasks remain
-unchecked. Writing this plan does not establish runtime or benchmark evidence.
+durability boundaries, and release criteria. P0 work is underway. Writing this
+plan or building a smoke harness does not establish ublk runtime, remote
+durability, or benchmark evidence.
 
 ## 1. Release outcome
 
@@ -99,22 +100,27 @@ those tests across processes; it is not the first durability or fencing test.
 
 ### P0. Repository and platform foundation
 
-- [ ] Establish reproducible Rust workspace/toolchain/dependency lock, Linux CI,
-  formatting/lint/package checks, shared fixtures, and opt-in real-S3 integration.
-- [ ] Pin a Linux/ublk userspace binding and ext4 tools/configuration for a tiny
-  READ/WRITE/FLUSH/FUA mount/freeze prototype. Verify capabilities/privileges,
+- [x] Establish reproducible Rust workspace/toolchain/dependency lock, Linux CI,
+  formatting/lint/package checks, and bounded shared golden fixtures.
+- [ ] Establish the opt-in real-S3 conformance lane with the object-store adapter
+  in P1; do not run it against a production bucket.
+- [x] Pin the Linux ublk userspace binding and add an ext4 tools/configuration
+  plus a tiny READ/WRITE/FLUSH/FUA mount/freeze smoke harness.
+- [ ] On a qualified Linux host, verify effective capabilities/privileges,
   device teardown on server death, and unsupported-operation behavior. NBD may
   accelerate exploration but is not the ublk release qualification.
-- [ ] Write the format note and golden vectors before durable writers: typed
+- [x] Write the format note and golden vectors before durable writers: typed
   length-delimited encoding, zeros, extent/sector geometry, ordered keys, complete
   roots, all three capture modes, log segments, artifact chunks, and metadata
   schema versions.
-- [ ] Define typed identities/errors, injected time, named upload/commit/reply/
+- [x] Define typed identities/errors, injected time, named upload/commit/reply/
   device/freeze failure points, I/O/object counters, and bounded test fixtures.
 
-**Exit evidence:** CI builds the skeleton; format vectors are stable; the platform
-can service ext4 freeze's own I/O without a close-before-freeze deadlock. No
-prototype result substitutes for remote-durability qualification.
+**Exit evidence:** CI builds the workspace; format vectors are stable; a qualified
+platform run shows ext4 freeze's own I/O completes without a close-before-freeze
+deadlock. The current development host has no `/dev/ublk-control` or loaded ublk
+driver, so that runtime evidence remains pending. No prototype result substitutes
+for remote-durability qualification.
 
 ### P1. Immutable objects and S3
 

@@ -22,11 +22,12 @@ Generation, branch, and checkpoint semantics apply across these views.
 - [RFC-002: Version FS MVP](rfcs/002-version-fs-mvp.md)
 - [MVP Implementation Plan](docs/mvp-implementation-plan.md)
 
-The project is at the design stage. RFC-001 defines the architecture and core
-semantics; RFC-002 proposes the first implementation and release criteria. Both
-are drafts. The implementation plan translates RFC-002 into ordered work packages
-and completion evidence. The Rust workspace and development tooling are in place;
-storage protocols, services, and device integration are not implemented yet.
+RFC-001 defines the architecture and core semantics; RFC-002 proposes the first
+implementation and release criteria. Both are drafts. The implementation plan
+translates RFC-002 into ordered work packages and completion evidence. P0 has
+started with canonical format primitives, shared golden vectors, and an opt-in
+ublk/ext4 feasibility harness. Storage protocols, remote object adapters, service
+handlers, and user-facing commands are not implemented yet.
 
 ## Development
 

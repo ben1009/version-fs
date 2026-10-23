@@ -1,3 +1,10 @@
 //! Version FS formats, persistent maps, and backend-neutral protocols.
-//!
-//! Workspace foundation only; storage protocols are not implemented yet.
+
+pub mod fault;
+pub mod format;
+pub mod identity;
+pub mod metrics;
+pub mod time;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;

@@ -9,5 +9,12 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+test-support = []
+
+[dependencies]
+sha2 = "=0.10.9"
+
 [lints]
 workspace = true
