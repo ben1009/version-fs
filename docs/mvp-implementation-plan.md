@@ -221,13 +221,22 @@ ignoring flags or returning success after local I/O cannot pass.
 
 ### P7. Checkpoint consistency and branch lifecycle
 
+P7 establishes volume-backed Generation publication and the common-cut framework.
+Until P8, `logs_root` and `artifacts_root` reference canonical empty root objects
+using P3's formats and normal durability/graph validation, not placeholder digests.
+The descriptor and capture protocol already include native-view slots; P8 supplies
+their mutation protocols and connects them to this same coordinator.
+
 - [ ] Implement raw `block_cut` and reference `filesystem_frozen`/clean-unmount
   boundaries, recording only the mode actually established.
-- [ ] Acquire the capture token against pre-drain revision/root preconditions.
+- [ ] Drain producers, then read authoritative revision/live roots together and
+  acquire the capture token against those exact preconditions. Keep the worker's
+  original writer grant, attachment identity, and fencing epochs; never adopt a new owner.
   A definite conflict restarts capture with a new operation ID and a fresh drain;
   never refresh roots and reuse the old cut. Reconcile unknown acquisition first.
 - [ ] Keep block service alive during freeze; drain permitted child barriers, then
-  stop block mutation admission and seal volume/log/artifact roots plus final revision.
+  stop block mutation admission and seal the volume root, canonical empty native
+  roots, and final revision through the common-cut framework.
 - [ ] Publish attached/detached Generations with retention/outcome/capture-token
   changes atomically. Reconcile/sync the local result before thaw/reopening.
 - [ ] Implement metadata-only fork, conditional adoption/rollback/promotion/delete,
@@ -237,8 +246,10 @@ ignoring flags or returning success after local I/O cannot pass.
   volume. An aborted capture does not undo a previously acknowledged child flush.
 
 **Exit evidence:** failed freeze/CAS/descriptor upload never publishes a false
-checkpoint. An external mutation between drain and token CAS forces a fresh
-capture/drain, not a revision-only retry. Frozen and raw-cut recovery have distinct
+checkpoint. Drain-time volume barriers are included without an artificial retry;
+an external mutation between the post-drain root read and token CAS forces a fresh
+capture/drain, not a revision-only retry. Ownership changes fence the original
+worker even before the root read. Frozen and raw-cut recovery have distinct
 tests. Fork does not walk volume extents; journal replay uses a writable fork;
 name reuse and old-device commits cannot affect the new branch state.
 
@@ -251,12 +262,15 @@ name reuse and old-device commits cannot affect the new branch state.
 - [ ] Implement batch-boundary trim, protected historical reads, polling tails,
   explicit replaced/expired cursors, and independent append after fork/reset.
 - [ ] Implement gated named-artifact staging with blob/4 MiB chunk representation.
-  Bind native log/artifact roots to the volume capture without parsing ext4 or
-  recopying historical segment payloads.
+  Connect native admission/drain/seal hooks to P7's common-cut coordinator and
+  replace its empty native roots with captured log/artifact roots. Do not introduce
+  a second checkpoint-coordination protocol, parse ext4, or recopy historical segments.
 
 **Exit evidence:** native views can be read without mounting the filesystem;
 append races fall wholly on one side of capture; retained log ranges/attachments
-survive live trim. Native artifact identity is explicit, not inferred from a path.
+survive live trim. Appends completing during drain are included in the post-drain
+root read without an artificial retry. Native artifact identity is explicit,
+not inferred from a path.
 
 ### P9. SDK, service, and CLI lifecycle
 

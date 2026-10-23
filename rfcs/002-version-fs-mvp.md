@@ -665,10 +665,13 @@ and side effects are not captured.
 ### 6.5 Coordinating the common Generation boundary
 
 The trusted worker coordinator gates application commands, native log mutations,
-and named-artifact staging. It records the expected branch revision/live roots
-before draining admitted producers, then registers the checkpoint's branch
-capture token/preparation against those exact preconditions. An acquisition
-conflict invalidates the drained boundary: the coordinator MUST restart
+and named-artifact staging. After draining admitted producers, it reads the
+expected branch revision/live roots together from the authority, then registers
+the checkpoint's branch capture token/preparation against those exact preconditions.
+Completed drain-time appends and volume barriers are included in that tuple.
+The worker's original writer grant, attachment identity, and fencing epochs remain
+bound throughout; reading current roots must not adopt a replacement owner's identity.
+An acquisition conflict invalidates the drained boundary: the coordinator MUST restart
 Section 8.2 Step 1; it MUST NOT refresh the revision/roots and continue the same
 capture. Other head/live-view mutations are rejected as Busy while the token
 is held. The checkpoint's own device-drain flushes are permitted as identified
@@ -844,13 +847,16 @@ in v0. The parent Generation ID is not a required content edge.
 ### 8.2 Capture sequence and preparation lifetime
 
 1. Record the checkpoint ID/freeze intent outside the volume, close application/
-   log/artifact admission, record the expected branch revision/live roots, and
-   drain active producers. Register the branch capture token and protected
-   preparation under those exact branch/attachment/grant preconditions. A definite
-   acquisition conflict ends this attempt: restart Step 1 with a new checkpoint
-   operation ID, fresh preconditions, and a fresh drain; never silently rebase the
-   old drained cut. An unknown acquisition outcome must first be reconciled with
-   the original operation ID before deciding whether to proceed or restart.
+   log/artifact admission, and drain active producers. Then read the expected
+   branch revision/live roots together from the authority. Register the branch
+   capture token and protected preparation under those exact revision/root
+   preconditions and the worker's original attachment/grant/fencing identities.
+   A change of ownership fences this attempt; it must not refresh to a new owner.
+   A definite acquisition conflict ends this attempt: restart Step 1 with a new
+   checkpoint operation ID, a fresh drain, and a new post-drain revision/root read;
+   never silently rebase the old drained cut. An unknown acquisition outcome must
+   first be reconciled with the original operation ID before deciding whether to
+   proceed or restart.
 2. Establish the requested Section 6 boundary. Keep the device serving freeze's
    I/O; permit only the capture's identified drain-flush children. Each child
    advances the live root/revision normally and records its own durable outcome.
@@ -1146,7 +1152,7 @@ explicitly if the adapter cannot support them.
 | FLUSH/FUA fails or its reply is lost | Return no false successful I/O; reconcile the exact barrier ID. Keep dependent writes blocked or fail explicitly. |
 | Barrier commits before worker loss | Its live root survives independently of worker disk; a lost kernel reply does not undo the commit. |
 | Preflush fails | Do not execute/acknowledge its dependent data write as though the barrier succeeded. |
-| External mutation commits after drain but before capture-token acquisition | Reject acquisition on the old revision; restart capture and drain with a new operation ID, never refresh roots and reuse the old cut. |
+| External mutation commits after the post-drain root read but before capture-token acquisition | Reject acquisition on the old revision; restart capture and drain with a new operation ID, never refresh roots and reuse the old cut. |
 | Extent upload succeeds, metadata commit fails | Old live root remains authoritative; new objects are unreachable preparation data. |
 | Descriptor uploaded, publication not committed | No Generation is visible. |
 | Barrier/publication reply is lost after commit | Recover the original operation result even if live roots/head later moved. |
@@ -1325,11 +1331,16 @@ termination. Check API/kernel outcomes and persisted graph state, not only CLI e
   local-baseline update, and thaw; reconcile exact operation/freeze intent.
 - Freeze failure and raw writers outside the declared protocol: no false frozen
   checkpoint. Test clean-unmount and raw-cut recovery separately.
-- Commit an external append or volume barrier after producer drain but before
-  capture-token CAS. Acquisition must conflict; no stale-cut Generation may be
-  published. A new attempt must reselect preconditions and drain again, rather
-  than merely refreshing the revision/roots. Resolve lost acquisition replies
-  with the original ID before starting another attempt.
+- Complete an admitted append or fsync/FUA barrier during producer drain. The
+  post-drain read must include its revision/live roots, without forcing an
+  acquisition conflict merely because the producer completed while draining.
+  Handover before that read still fences the worker's original grant/attachment;
+  the coordinator must not adopt the new owner's identity.
+- Commit an external append or volume barrier after the post-drain root read
+  but before capture-token CAS. Acquisition must conflict; no stale-cut Generation
+  may be published. A new attempt must drain again and then read fresh preconditions,
+  rather than merely refreshing the revision/roots. Resolve lost acquisition
+  replies with the original ID before starting another attempt.
 - Stale writer/device after handover, reset, deletion, or authority restart: cannot
   replace a live root, publish, append, trim, or resume a mounted device on another root.
 - Lease valid in an earlier transaction attempt but expired on retry/final decision:
