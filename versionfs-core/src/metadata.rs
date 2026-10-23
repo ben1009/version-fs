@@ -48,9 +48,6 @@ pub enum MetadataError {
         /// Stable ID of the unresolved mutation that owns the gate.
         operation_id: Vec<u8>,
     },
-    /// No unresolved operation matches the requested reconciliation identity.
-    #[error("no matching unknown operation is awaiting reconciliation")]
-    NoUnknownOutcome,
     /// The metadata backend returned an error.
     #[error("metadata backend error: {0}")]
     Backend(String),
@@ -147,13 +144,18 @@ pub trait MetadataAuthority: Send + Sync {
     /// The body may be rerun after a definite conflict. Any other body error
     /// means no commit was attempted. An [`MetadataError::UnknownOutcome`]
     /// blocks later mutations until the exact operation has been reconciled.
+    /// Implementations must preserve this gate across owner restart: recovery
+    /// must resolve any durable in-flight operation marker before admitting
+    /// new mutations, and the operation result must remain queryable afterward.
     fn transact<R, F>(&self, operation: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
     where
         F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>;
 
     /// Resolve a prior unknown commit by reopening/recovering the authority as
-    /// needed and reading its stable operation result key. The result is
-    /// committed bytes when present, otherwise the operation did not commit.
+    /// needed and reading its stable operation result key. This may be called
+    /// after an authority restart even when no in-memory gate remains. The
+    /// result is committed bytes when present, otherwise the operation did not
+    /// commit.
     fn reconcile_unknown(
         &self,
         operation: MutationIdentity<'_>,

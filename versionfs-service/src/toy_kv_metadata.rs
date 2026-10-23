@@ -29,6 +29,8 @@ use versionfs_core::{
 };
 
 const ENCODED_VALUE_PREFIX: u8 = 0;
+const DOMAIN_KEYSPACE_PREFIX: u8 = 1;
+const PENDING_OPERATION_KEY: &[u8] = b"\0versionfs/metadata/pending-operation";
 static NEXT_SNAPSHOT_SCOPE: AtomicU64 = AtomicU64::new(1);
 
 /// Single-owner Metadata Authority backed by a WAL-enabled toy-kv engine.
@@ -51,6 +53,12 @@ struct UnresolvedMutation {
     operation_id: Vec<u8>,
     outcome_key: Vec<u8>,
     requires_reopen: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingMutation {
+    operation_id: Vec<u8>,
+    outcome_key: Vec<u8>,
 }
 
 /// A pinned toy-kv snapshot used for all pages in one scan.
@@ -100,6 +108,7 @@ impl ToyKvMetadataAuthority {
             ..LsmStorageOptions::default()
         };
         let engine = KvEngine::open(&path, options.clone()).map_err(backend_error)?;
+        resolve_pending_on_open(&engine)?;
         Ok(Self {
             path,
             options,
@@ -147,6 +156,23 @@ impl ToyKvMetadataAuthority {
         Ok(())
     }
 
+    fn mark_unresolved(
+        gate: &mut MutationGate,
+        operation: MutationIdentity<'_>,
+        cause: impl Into<String>,
+        requires_reopen: bool,
+    ) -> MetadataError {
+        gate.unresolved = Some(UnresolvedMutation {
+            operation_id: operation.operation_id.to_vec(),
+            outcome_key: operation.outcome_key.to_vec(),
+            requires_reopen,
+        });
+        MetadataError::UnknownOutcome {
+            operation_id: operation.operation_id.to_vec(),
+            cause: cause.into(),
+        }
+    }
+
     fn check_unresolved(gate: &MutationGate) -> Result<(), MetadataError> {
         if let Some(unresolved) = &gate.unresolved {
             return Err(MetadataError::ReconciliationRequired {
@@ -169,6 +195,211 @@ impl ToyKvMetadataAuthority {
     }
 }
 
+fn encode_domain_key(key: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(key.len() + 1);
+    encoded.push(DOMAIN_KEYSPACE_PREFIX);
+    encoded.extend_from_slice(key);
+    encoded
+}
+
+fn read_domain_value(engine: &KvEngine, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+    engine
+        .get(&encode_domain_key(key))
+        .map_err(backend_error)?
+        .map(|value| decode_value(value.as_ref()))
+        .transpose()
+}
+
+fn read_pending_marker(engine: &KvEngine) -> Result<Option<PendingMutation>, MetadataError> {
+    engine
+        .get(PENDING_OPERATION_KEY)
+        .map_err(backend_error)?
+        .map(|value| decode_value(value.as_ref()).and_then(|bytes| decode_pending(&bytes)))
+        .transpose()
+}
+
+fn write_pending_marker(engine: &KvEngine, pending: &PendingMutation) -> Result<(), MetadataError> {
+    let transaction = engine.new_txn().map_err(backend_error)?;
+    let encoded = encode_value(&encode_pending(pending)?);
+    transaction
+        .put(PENDING_OPERATION_KEY, &encoded)
+        .map_err(backend_error)?;
+    transaction.commit().map_err(backend_error)
+}
+
+fn clear_pending_marker(
+    engine: &KvEngine,
+    expected: &PendingMutation,
+) -> Result<(), MetadataError> {
+    let transaction = engine.new_txn().map_err(backend_error)?;
+    let current = transaction
+        .get(PENDING_OPERATION_KEY)
+        .map_err(backend_error)?
+        .map(|value| decode_value(value.as_ref()).and_then(|bytes| decode_pending(&bytes)))
+        .transpose()?;
+    match current {
+        None => return Ok(()),
+        Some(current) if current == *expected => {}
+        Some(_) => {
+            return Err(MetadataError::Backend(
+                "pending operation changed under the authority gate".into(),
+            ));
+        }
+    }
+    transaction
+        .delete(PENDING_OPERATION_KEY)
+        .map_err(backend_error)?;
+    transaction.commit().map_err(backend_error)
+}
+
+/// WAL recovery makes the prior mutation's outcome authoritative before this
+/// authority admits traffic after a process restart. The reservation is kept
+/// until this check has read the operation result and durably removed it.
+fn resolve_pending_on_open(engine: &KvEngine) -> Result<(), MetadataError> {
+    let Some(pending) = read_pending_marker(engine)? else {
+        return Ok(());
+    };
+    // WAL recovery has completed. Presence means the mutation committed;
+    // absence means it did not. Keep any result record for caller reconciliation.
+    let _outcome = read_domain_value(engine, &pending.outcome_key)?;
+    clear_pending_marker(engine, &pending)
+}
+
+fn encode_pending(pending: &PendingMutation) -> Result<Vec<u8>, MetadataError> {
+    let operation_id_len = u32::try_from(pending.operation_id.len())
+        .map_err(|_| MetadataError::InvalidRequest("operation ID is too large"))?;
+    let outcome_key_len = u32::try_from(pending.outcome_key.len())
+        .map_err(|_| MetadataError::InvalidRequest("outcome key is too large"))?;
+    let mut encoded =
+        Vec::with_capacity(1 + 4 + pending.operation_id.len() + 4 + pending.outcome_key.len());
+    encoded.push(1);
+    encoded.extend_from_slice(&operation_id_len.to_be_bytes());
+    encoded.extend_from_slice(&pending.operation_id);
+    encoded.extend_from_slice(&outcome_key_len.to_be_bytes());
+    encoded.extend_from_slice(&pending.outcome_key);
+    Ok(encoded)
+}
+
+fn decode_pending(encoded: &[u8]) -> Result<PendingMutation, MetadataError> {
+    if encoded.first() != Some(&1) {
+        return Err(MetadataError::Backend(
+            "pending operation has an unknown encoding".into(),
+        ));
+    }
+    let mut offset = 1;
+    let operation_id = take_pending_field(encoded, &mut offset)?;
+    let outcome_key = take_pending_field(encoded, &mut offset)?;
+    if offset != encoded.len() || operation_id.is_empty() || outcome_key.is_empty() {
+        return Err(MetadataError::Backend(
+            "pending operation record is malformed".into(),
+        ));
+    }
+    Ok(PendingMutation {
+        operation_id: operation_id.to_vec(),
+        outcome_key: outcome_key.to_vec(),
+    })
+}
+
+fn take_pending_field<'a>(
+    encoded: &'a [u8],
+    offset: &mut usize,
+) -> Result<&'a [u8], MetadataError> {
+    let length_end = offset
+        .checked_add(4)
+        .ok_or_else(|| MetadataError::Backend("pending operation length overflow".into()))?;
+    let length_bytes = encoded
+        .get(*offset..length_end)
+        .ok_or_else(|| MetadataError::Backend("pending operation record is truncated".into()))?;
+    let length = u32::from_be_bytes(
+        length_bytes
+            .try_into()
+            .map_err(|_| MetadataError::Backend("pending operation length is malformed".into()))?,
+    ) as usize;
+    *offset = length_end;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| MetadataError::Backend("pending operation length overflow".into()))?;
+    let field = encoded
+        .get(*offset..end)
+        .ok_or_else(|| MetadataError::Backend("pending operation record is truncated".into()))?;
+    *offset = end;
+    Ok(field)
+}
+
+enum TransactionAttemptError {
+    Definite(MetadataError),
+    Unknown {
+        cause: String,
+        requires_reopen: bool,
+    },
+}
+
+impl From<MetadataError> for TransactionAttemptError {
+    fn from(error: MetadataError) -> Self {
+        Self::Definite(error)
+    }
+}
+
+fn execute_transaction<R, F>(
+    engine: &KvEngine,
+    clock: &dyn Clock,
+    failures: &dyn FailureInjector,
+    operation: MutationIdentity<'_>,
+    body: &mut F,
+) -> Result<R, TransactionAttemptError>
+where
+    F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+{
+    let transaction = engine
+        .new_txn()
+        .map_err(backend_error)
+        .map_err(TransactionAttemptError::Definite)?;
+    let mut metadata_txn = ToyKvTransaction {
+        transaction: &transaction,
+        clock,
+        outcome_key: operation.outcome_key,
+        outcome_written: false,
+    };
+    if metadata_txn.get(operation.outcome_key)?.is_some() {
+        return Err(TransactionAttemptError::Definite(MetadataError::Conflict));
+    }
+    let result = body(&mut metadata_txn)?;
+    if !metadata_txn.outcome_written {
+        return Err(TransactionAttemptError::Definite(
+            MetadataError::InvalidRequest("mutation did not write its terminal outcome record"),
+        ));
+    }
+
+    failures
+        .check(FailurePoint::AuthorityBeforeCommit)
+        .map_err(|error| {
+            TransactionAttemptError::Definite(MetadataError::Rejected(error.to_string()))
+        })?;
+
+    if let Err(error) = failures.check(FailurePoint::AuthorityCommitOutcomeUnknownWithoutCommit) {
+        return Err(TransactionAttemptError::Unknown {
+            cause: error.to_string(),
+            requires_reopen: true,
+        });
+    }
+
+    if let Err(error) = transaction.commit() {
+        return Err(TransactionAttemptError::Unknown {
+            cause: error.to_string(),
+            requires_reopen: true,
+        });
+    }
+
+    if let Err(error) = failures.check(FailurePoint::AuthorityAfterCommitBeforeReply) {
+        return Err(TransactionAttemptError::Unknown {
+            cause: error.to_string(),
+            requires_reopen: false,
+        });
+    }
+
+    Ok(result)
+}
+
 impl MetadataAuthority for ToyKvMetadataAuthority {
     type Snapshot = ToyKvSnapshot;
 
@@ -176,11 +407,7 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
         let gate = self.read_gate()?;
         Self::check_unresolved(&gate)?;
         let engine = self.engine_read()?;
-        engine
-            .get(key)
-            .map_err(backend_error)?
-            .map(|value| decode_value(value.as_ref()))
-            .transpose()
+        read_domain_value(&engine, key)
     }
 
     fn transact<R, F>(
@@ -198,70 +425,48 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
         let engine_guard = self.engine_read()?;
         let engine = Arc::clone(&engine_guard);
         drop(engine_guard);
-        let transaction = engine.new_txn().map_err(backend_error)?;
-        let mut metadata_txn = ToyKvTransaction {
-            transaction: &transaction,
-            clock: self.clock.as_ref(),
-            outcome_key: operation.outcome_key,
-            outcome_written: false,
+        let pending = PendingMutation {
+            operation_id: operation.operation_id.to_vec(),
+            outcome_key: operation.outcome_key.to_vec(),
         };
-        if metadata_txn.get(operation.outcome_key)?.is_some() {
-            return Err(MetadataError::Conflict);
-        }
-        let result = body(&mut metadata_txn)?;
-        if !metadata_txn.outcome_written {
-            return Err(MetadataError::InvalidRequest(
-                "mutation did not write its terminal outcome record",
+        if let Err(error) = write_pending_marker(&engine, &pending) {
+            return Err(Self::mark_unresolved(
+                &mut gate,
+                operation,
+                error.to_string(),
+                true,
             ));
         }
 
-        self.failures
-            .check(FailurePoint::AuthorityBeforeCommit)
-            .map_err(|error| MetadataError::Rejected(error.to_string()))?;
-
-        if let Err(error) = self
-            .failures
-            .check(FailurePoint::AuthorityCommitOutcomeUnknownWithoutCommit)
-        {
-            gate.unresolved = Some(UnresolvedMutation {
-                operation_id: operation.operation_id.to_vec(),
-                outcome_key: operation.outcome_key.to_vec(),
-                requires_reopen: true,
-            });
-            return Err(MetadataError::UnknownOutcome {
-                operation_id: operation.operation_id.to_vec(),
-                cause: error.to_string(),
-            });
+        match execute_transaction(
+            &engine,
+            self.clock.as_ref(),
+            self.failures.as_ref(),
+            operation,
+            &mut body,
+        ) {
+            Ok(result) => Ok(result),
+            Err(TransactionAttemptError::Unknown {
+                cause,
+                requires_reopen,
+            }) => Err(Self::mark_unresolved(
+                &mut gate,
+                operation,
+                cause,
+                requires_reopen,
+            )),
+            Err(TransactionAttemptError::Definite(error)) => {
+                if let Err(clear_error) = clear_pending_marker(&engine, &pending) {
+                    return Err(Self::mark_unresolved(
+                        &mut gate,
+                        operation,
+                        format!("{error}; pending-operation cleanup failed: {clear_error}"),
+                        true,
+                    ));
+                }
+                Err(error)
+            }
         }
-
-        if let Err(error) = transaction.commit() {
-            gate.unresolved = Some(UnresolvedMutation {
-                operation_id: operation.operation_id.to_vec(),
-                outcome_key: operation.outcome_key.to_vec(),
-                requires_reopen: true,
-            });
-            return Err(MetadataError::UnknownOutcome {
-                operation_id: operation.operation_id.to_vec(),
-                cause: error.to_string(),
-            });
-        }
-
-        if let Err(error) = self
-            .failures
-            .check(FailurePoint::AuthorityAfterCommitBeforeReply)
-        {
-            gate.unresolved = Some(UnresolvedMutation {
-                operation_id: operation.operation_id.to_vec(),
-                outcome_key: operation.outcome_key.to_vec(),
-                requires_reopen: false,
-            });
-            return Err(MetadataError::UnknownOutcome {
-                operation_id: operation.operation_id.to_vec(),
-                cause: error.to_string(),
-            });
-        }
-
-        Ok(result)
     }
 
     fn reconcile_unknown(
@@ -270,28 +475,69 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
     ) -> Result<ReconciledOutcome, MetadataError> {
         Self::validate_operation(operation)?;
         let mut gate = self.write_gate()?;
-        let Some(unresolved) = gate.unresolved.as_ref() else {
-            return Err(MetadataError::NoUnknownOutcome);
-        };
-        if unresolved.operation_id != operation.operation_id
-            || unresolved.outcome_key != operation.outcome_key
-        {
-            return Err(MetadataError::ReconciliationRequired {
-                operation_id: unresolved.operation_id.clone(),
-            });
+        let unresolved = gate.unresolved.as_ref().map(|pending| {
+            (
+                pending.operation_id.clone(),
+                pending.outcome_key.clone(),
+                pending.requires_reopen,
+            )
+        });
+        if let Some((operation_id, outcome_key, _)) = &unresolved {
+            if operation_id != operation.operation_id || outcome_key != operation.outcome_key {
+                return Err(MetadataError::ReconciliationRequired {
+                    operation_id: operation_id.clone(),
+                });
+            }
         }
-
-        if unresolved.requires_reopen {
+        if unresolved
+            .as_ref()
+            .is_some_and(|(_, _, requires_reopen)| *requires_reopen)
+        {
             self.recover_engine()?;
         }
 
         let engine = self.engine_read()?;
-        let outcome = engine
-            .get(operation.outcome_key)
-            .map_err(backend_error)?
-            .map(|value| decode_value(value.as_ref()))
-            .transpose()?;
-        gate.unresolved = None;
+        let outcome = read_domain_value(&engine, operation.outcome_key)?;
+        if let Some((operation_id, outcome_key, _)) = unresolved {
+            let queried = PendingMutation {
+                operation_id,
+                outcome_key,
+            };
+            if let Some(pending) = read_pending_marker(&engine)? {
+                if pending == queried {
+                    if let Err(error) = clear_pending_marker(&engine, &pending) {
+                        gate.unresolved = Some(UnresolvedMutation {
+                            operation_id: queried.operation_id.clone(),
+                            outcome_key: queried.outcome_key.clone(),
+                            requires_reopen: true,
+                        });
+                        return Err(MetadataError::UnknownOutcome {
+                            operation_id: queried.operation_id,
+                            cause: error.to_string(),
+                        });
+                    }
+                } else if outcome.is_none()
+                    && read_domain_value(&engine, &pending.outcome_key)?.is_some()
+                {
+                    if let Err(error) = clear_pending_marker(&engine, &pending) {
+                        gate.unresolved = Some(UnresolvedMutation {
+                            operation_id: queried.operation_id.clone(),
+                            outcome_key: queried.outcome_key.clone(),
+                            requires_reopen: true,
+                        });
+                        return Err(MetadataError::UnknownOutcome {
+                            operation_id: queried.operation_id,
+                            cause: error.to_string(),
+                        });
+                    }
+                } else {
+                    return Err(MetadataError::Backend(
+                        "pending operation does not match its durable outcome".into(),
+                    ));
+                }
+            }
+            gate.unresolved = None;
+        }
         Ok(match outcome {
             Some(value) => ReconciledOutcome::Committed(value),
             None => ReconciledOutcome::NotCommitted,
@@ -334,11 +580,12 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
             ));
         }
 
-        let upper = prefix_successor(prefix);
-        let lower_bound = match cursor {
-            Some(cursor) => std::ops::Bound::Excluded(cursor.last_key()),
-            None if prefix.is_empty() => std::ops::Bound::Unbounded,
-            None => std::ops::Bound::Included(prefix),
+        let encoded_prefix = encode_domain_key(prefix);
+        let encoded_cursor = cursor.map(|cursor| encode_domain_key(cursor.last_key()));
+        let upper = prefix_successor(&encoded_prefix);
+        let lower_bound = match encoded_cursor.as_deref() {
+            Some(key) => std::ops::Bound::Excluded(key),
+            None => std::ops::Bound::Included(encoded_prefix.as_slice()),
         };
         let upper_bound = upper
             .as_deref()
@@ -355,7 +602,13 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
                 has_more = true;
                 break;
             }
-            let key = scan.key().to_vec();
+            let encoded_key = scan.key();
+            let key = encoded_key
+                .strip_prefix(&[DOMAIN_KEYSPACE_PREFIX])
+                .ok_or_else(|| {
+                    MetadataError::Backend("snapshot scan escaped the domain keyspace".into())
+                })?
+                .to_vec();
             let value = decode_value(scan.value())?;
             entries.push((key, value));
             scan.next().map_err(backend_error)?;
@@ -384,8 +637,9 @@ struct ToyKvTransaction<'a> {
 
 impl MetadataTxn for ToyKvTransaction<'_> {
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+        let encoded_key = encode_domain_key(key);
         self.transaction
-            .get(key)
+            .get(&encoded_key)
             .map_err(backend_error)?
             .map(|value| decode_value(value.as_ref()))
             .transpose()
@@ -400,8 +654,11 @@ impl MetadataTxn for ToyKvTransaction<'_> {
             }
             self.outcome_written = true;
         }
+        let encoded_key = encode_domain_key(key);
         let encoded = encode_value(value);
-        self.transaction.put(key, &encoded).map_err(backend_error)
+        self.transaction
+            .put(&encoded_key, &encoded)
+            .map_err(backend_error)
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<(), MetadataError> {
@@ -410,7 +667,9 @@ impl MetadataTxn for ToyKvTransaction<'_> {
                 "terminal outcome records are immutable",
             ));
         }
-        self.transaction.delete(key).map_err(backend_error)
+        self.transaction
+            .delete(&encode_domain_key(key))
+            .map_err(backend_error)
     }
 
     fn now(&self) -> versionfs_core::time::MonotonicTime {

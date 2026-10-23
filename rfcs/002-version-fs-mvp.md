@@ -380,7 +380,7 @@ commit and allows the caller to retry the same logical operation.
 | Fresh authoritative reads | New gets, transactions, and snapshot acquisition observe commits completed before they begin. An explicitly held snapshot retains its earlier boundary. Stale caches/replicas are not authoritative reads. |
 | Durable commit and recovery | Success waits for the selected backend's durable commit boundary. Reopening its preserved storage recovers every acknowledged complete transaction. Memory-only visibility is insufficient. |
 | Consistent prefix scans | Every page uses one read-only snapshot, with bytewise ordered keys and an explicit cursor/end. Losing that snapshot is an error, never a silent switch to current state. |
-| Explicit outcomes | A conflict/rejection is known not to commit. A timeout or error after possible commit is an unknown outcome, resolved through the operation record before another logical mutation. |
+| Explicit outcomes | A conflict/rejection is known not to commit. A timeout or error after possible commit is an unknown outcome, resolved through the operation record before another logical mutation. The gate survives authority restart: recovery resolves any durable in-flight operation marker before the authority admits mutations, and the stable result remains available for caller reconciliation. |
 
 `transact` may rerun its closure on a definite conflict. The closure performs
 metadata reads and buffered mutations, and MAY read the authority owner's
@@ -431,6 +431,14 @@ record encoding and domain transaction code. Adapter-specific engine types,
 commit timestamps, SQL connections, and native errors stay behind the interface.
 The implementation pins a reviewed toy-kv revision and must pass the authority
 conformance gates; source inspection alone is not that evidence.
+
+The toy-kv adapter persists the current operation identity and outcome key in a
+separate pending-operation record before attempting the domain transaction. On
+open, toy-kv first recovers its WAL; the adapter then reads the recorded outcome
+key and durably clears the marker before exposing the authority. If recovery,
+outcome lookup, or marker cleanup fails, opening fails closed. This preserves
+the mutation gate across process crashes without requiring a backend-specific
+precommit hook.
 
 ### 5.2 Authoritative records
 

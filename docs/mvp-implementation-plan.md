@@ -169,7 +169,11 @@ silently changing that boundary. The authority gate serializes the full
 single-owner mutation path, and injected lease-clock tests reject an expired
 decision while preserving a commit whose reply is delayed past expiry. Unknown
 commit outcomes block later writes until the operation result key resolves to
-committed or not committed. PostgreSQL remains an interface mapping only.
+committed or not committed. A durable pending-operation record is recovered
+before an authority opened after process exit admits mutations; crash tests
+cover both a committed transaction with a lost reply and a transaction known
+not to have committed, including reconciliation and retry. PostgreSQL remains
+an interface mapping only.
 
 ### P3. Persistent volume roots and native indexes
 

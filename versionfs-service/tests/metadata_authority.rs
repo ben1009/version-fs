@@ -399,6 +399,110 @@ fn metadata_wal_recovers_after_the_writer_process_exits() {
 }
 
 #[test]
+fn metadata_unknown_outcome_child_exits_after_uncertain_result() {
+    const CHILD_PATH: &str = "VERSIONFS_METADATA_UNKNOWN_CHILD_PATH";
+    const CHILD_MODE: &str = "VERSIONFS_METADATA_UNKNOWN_CHILD_MODE";
+    let (Ok(path), Ok(mode)) = (env::var(CHILD_PATH), env::var(CHILD_MODE)) else {
+        return;
+    };
+    let failures = Arc::new(OneShotFailures::default());
+    let operation_id = match mode.as_str() {
+        "committed" => {
+            failures.arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+            b"restart-committed".as_slice()
+        }
+        "not-committed" => {
+            failures.arm(FailurePoint::AuthorityCommitOutcomeUnknownWithoutCommit);
+            b"restart-not-committed".as_slice()
+        }
+        _ => panic!("unknown child test mode"),
+    };
+    let outcome_key = [b"outcome/".as_slice(), operation_id].concat();
+    let authority = ToyKvMetadataAuthority::open_with(
+        PathBuf::from(path),
+        Arc::new(TestClock::default()),
+        failures,
+    )
+    .expect("open child authority");
+    let result = authority.transact(operation(operation_id, &outcome_key), |txn| {
+        txn.put(b"restart/state", operation_id)?;
+        txn.put(&outcome_key, b"terminal-result")?;
+        Ok(())
+    });
+    assert!(matches!(result, Err(MetadataError::UnknownOutcome { .. })));
+    std::process::exit(87);
+}
+
+#[test]
+fn restart_reconciles_persisted_unknown_outcomes_before_serving_mutations() {
+    const CHILD_PATH: &str = "VERSIONFS_METADATA_UNKNOWN_CHILD_PATH";
+    const CHILD_MODE: &str = "VERSIONFS_METADATA_UNKNOWN_CHILD_MODE";
+
+    fn crash_child(path: &std::path::Path, mode: &str) {
+        let status = Command::new(env::current_exe().expect("test executable path"))
+            .arg("--exact")
+            .arg("metadata_unknown_outcome_child_exits_after_uncertain_result")
+            .arg("--nocapture")
+            .env(CHILD_PATH, path)
+            .env(CHILD_MODE, mode)
+            .status()
+            .expect("launch unknown-outcome child");
+        assert_eq!(status.code(), Some(87));
+    }
+
+    let committed_dir = TestDir::new();
+    crash_child(committed_dir.path(), "committed");
+    let committed = authority(committed_dir.path());
+    assert_eq!(
+        committed
+            .reconcile_unknown(operation(
+                b"restart-committed",
+                b"outcome/restart-committed",
+            ))
+            .expect("query recovered committed result"),
+        ReconciledOutcome::Committed(b"terminal-result".to_vec())
+    );
+    assert_eq!(
+        committed.get(b"restart/state").expect("committed state"),
+        Some(b"restart-committed".to_vec())
+    );
+    committed
+        .transact(
+            operation(b"after-restart-commit", b"outcome/after-restart-commit"),
+            |txn| {
+                txn.put(b"restart/next", b"allowed-after-recovery")?;
+                txn.put(b"outcome/after-restart-commit", b"next-result")?;
+                Ok(())
+            },
+        )
+        .expect("startup reconciliation completes before writes are admitted");
+
+    let aborted_dir = TestDir::new();
+    crash_child(aborted_dir.path(), "not-committed");
+    let aborted = authority(aborted_dir.path());
+    assert_eq!(
+        aborted
+            .reconcile_unknown(operation(
+                b"restart-not-committed",
+                b"outcome/restart-not-committed",
+            ))
+            .expect("query recovered absent result"),
+        ReconciledOutcome::NotCommitted
+    );
+    assert_eq!(aborted.get(b"restart/state").expect("aborted state"), None);
+    aborted
+        .transact(
+            operation(b"restart-not-committed", b"outcome/restart-not-committed"),
+            |txn| {
+                txn.put(b"restart/state", b"retry-after-recovery")?;
+                txn.put(b"outcome/restart-not-committed", b"retry-result")?;
+                Ok(())
+            },
+        )
+        .expect("retry after startup established the prior operation did not commit");
+}
+
+#[test]
 fn before_commit_failure_is_definitely_not_committed() {
     let dir = TestDir::new();
     let failures = Arc::new(OneShotFailures::default());

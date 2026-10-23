@@ -10,8 +10,9 @@ This repository contains four Rust packages matching the
 P0 added canonical-format primitives, bounded shared fixtures, and an opt-in
 RAM-backed ublk/ext4 feasibility harness. P1 adds the workspace-scoped S3 object
 adapter and deterministic conformance tests. The real-S3 test is explicitly
-ignored and requires a dedicated test bucket; the metadata authority, higher
-storage protocols, service daemon, and user-facing commands remain unimplemented.
+ignored and requires a dedicated test bucket. P2 adds the toy-kv Metadata
+Authority adapter and its conformance tests; higher storage protocols, the
+service daemon, and user-facing commands remain unimplemented.
 Tooling checks do not qualify any MVP durability gate.
 
 ## Setup and tools
