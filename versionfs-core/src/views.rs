@@ -525,9 +525,12 @@ fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<V
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactChunkIndex, LogSegmentIndex, ViewError, VolumeExtentMap};
-    use crate::format::{FormatError, VolumeGeometry, VolumeRoot};
-    use crate::identity::{ObjectId, ObjectStoreScopeId};
+    use super::{ArtifactChunkIndex, ArtifactMap, LogSegmentIndex, ViewError, VolumeExtentMap};
+    use crate::format::{
+        ArtifactDescriptor, FormatError, MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType,
+        VolumeGeometry, VolumeRoot,
+    };
+    use crate::identity::{ArtifactId, ObjectId, ObjectStoreScopeId};
     use crate::persistent_map::MapObjectStore;
     use std::collections::HashMap;
 
@@ -586,5 +589,50 @@ mod tests {
         assert!(VolumeExtentMap::from_root(volume_root).is_ok());
         assert!(LogSegmentIndex::from_root(log_index_root).is_ok());
         assert!(ArtifactChunkIndex::from_root(artifact_index_root).is_ok());
+    }
+
+    #[test]
+    fn artifact_map_splits_an_oversized_insert_into_three_leaf_nodes() {
+        let mut store = MemoryStore::default();
+        let content_root = ObjectRef {
+            object_id: ObjectId::from_bytes([0xB0; 32]),
+            object_type: ObjectType::ArtifactBlob,
+            encoded_len: 17,
+        };
+        let dependency = ObjectRef {
+            object_id: ObjectId::from_bytes([0xD0; 32]),
+            object_type: ObjectType::ArtifactBlob,
+            encoded_len: 16,
+        };
+        let descriptor = |id, dependency_count| ArtifactDescriptor {
+            artifact_id: ArtifactId::from_bytes([id; 16]),
+            logical_len: 1,
+            content_root,
+            dependencies: vec![dependency; dependency_count],
+        };
+        let a = descriptor(1, 712); // about 30 KiB
+        let b = descriptor(2, 950); // about 40 KiB
+        let c = descriptor(3, 712); // about 30 KiB
+
+        let mut map = ArtifactMap::empty(&mut store).unwrap();
+        map = map.insert(&mut store, "A", &a).unwrap();
+        map = map.insert(&mut store, "C", &c).unwrap();
+        map = map.insert(&mut store, "B", &b).unwrap();
+
+        assert_eq!(map.get(&store, "A").unwrap(), Some(a.clone()));
+        assert_eq!(map.get(&store, "B").unwrap(), Some(b.clone()));
+        assert_eq!(map.get(&store, "C").unwrap(), Some(c.clone()));
+        assert!(
+            store
+                .0
+                .values()
+                .all(|encoded| encoded.len() <= MAX_PERSISTENT_NODE_BYTES)
+        );
+
+        let root = map.seal(&mut store).unwrap();
+        let reopened = ArtifactMap::open(&store, root).unwrap();
+        assert_eq!(reopened.get(&store, "A").unwrap(), Some(a));
+        assert_eq!(reopened.get(&store, "B").unwrap(), Some(b));
+        assert_eq!(reopened.get(&store, "C").unwrap(), Some(c));
     }
 }

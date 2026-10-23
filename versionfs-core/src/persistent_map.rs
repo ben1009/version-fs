@@ -42,9 +42,12 @@ pub enum PersistentMapError {
     /// A referenced immutable object was unavailable.
     #[error("missing persistent-map object {0}")]
     MissingObject(ObjectId),
-    /// A single key/value entry cannot fit in one bounded leaf node.
-    #[error("key/value entry exceeds the 64 KiB persistent-node limit")]
+    /// One leaf entry or internal separator cannot fit in a bounded map node.
+    #[error("persistent-map entry exceeds the 64 KiB node limit")]
     EntryTooLarge,
+    /// The separator keys cannot be arranged into any bounded persistent-tree root.
+    #[error("persistent-map separators cannot fit in a bounded root")]
+    RootTooLarge,
 }
 
 /// One key change produced by a structural map diff.
@@ -183,18 +186,7 @@ impl PersistentBTree {
         let root = if edit.children.len() == 1 {
             edit.children[0].1
         } else {
-            let child_level = load_node(store, edit.children[0].1, self.node_type)?.level();
-            let level = child_level
-                .checked_add(1)
-                .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
-            store_node(
-                store,
-                self.node_type,
-                &Node::Internal {
-                    level,
-                    children: edit.children,
-                },
-            )?
+            build_root(store, self.node_type, edit.children)?
         };
         Ok(Self {
             node_type: self.node_type,
@@ -545,63 +537,115 @@ fn write_or_split<S: MapObjectStore>(
             .map(|max_key| vec![(max_key.to_vec(), reference)])
             .unwrap_or_default());
     }
-    let (left, right) = split_node(node_type, node)?;
-    let left_ref = store_node(store, node_type, &left)?;
-    let right_ref = store_node(store, node_type, &right)?;
-    Ok(vec![
-        (
-            left.max_key().expect("split nodes are non-empty").to_vec(),
-            left_ref,
-        ),
-        (
-            right.max_key().expect("split nodes are non-empty").to_vec(),
-            right_ref,
-        ),
-    ])
+    split_node(node_type, node)?
+        .into_iter()
+        .map(|part| {
+            let maximum = part.max_key().expect("split nodes are non-empty").to_vec();
+            let reference = store_node(store, node_type, &part)?;
+            Ok((maximum, reference))
+        })
+        .collect()
 }
 
-fn split_node(node_type: ObjectType, node: Node) -> Result<(Node, Node), PersistentMapError> {
-    let len = match &node {
-        Node::Leaf(entries) => entries.len(),
-        Node::Internal { children, .. } => children.len(),
+fn split_node(node_type: ObjectType, node: Node) -> Result<Vec<Node>, PersistentMapError> {
+    let (entry_count, base_size) = match &node {
+        Node::Leaf(entries) => (entries.len(), 4 + crate::format::ENVELOPE_HEADER_BYTES),
+        Node::Internal { children, .. } => {
+            (children.len(), 10 + crate::format::ENVELOPE_HEADER_BYTES)
+        }
     };
-    if len < 2 {
-        return Err(PersistentMapError::EntryTooLarge);
-    }
-    let mut best: Option<(usize, usize)> = None;
-    for split_at in 1..len {
-        let (left, right) = split_at_node(&node, split_at);
-        let left_len = encoded_len(node_type, &left)?;
-        let right_len = encoded_len(node_type, &right)?;
-        if left_len <= MAX_PERSISTENT_NODE_BYTES && right_len <= MAX_PERSISTENT_NODE_BYTES {
-            let difference = left_len.abs_diff(right_len);
-            if best.is_none_or(|(_, current)| difference < current) {
-                best = Some((split_at, difference));
+    let mut ranges = Vec::new();
+    let mut range_start = 0;
+    let mut current_size = base_size;
+    for index in 0..entry_count {
+        let item_size = node_entry_size(&node, index)?;
+        let next_size = current_size
+            .checked_add(item_size)
+            .ok_or(FormatError::InvalidPersistentNode("node size overflow"))?;
+        if next_size > MAX_PERSISTENT_NODE_BYTES {
+            if range_start == index {
+                return Err(PersistentMapError::EntryTooLarge);
             }
+            ranges.push((range_start, index));
+            range_start = index;
+            current_size = base_size;
+        }
+        current_size = current_size
+            .checked_add(item_size)
+            .ok_or(FormatError::InvalidPersistentNode("node size overflow"))?;
+        if current_size > MAX_PERSISTENT_NODE_BYTES {
+            return Err(PersistentMapError::EntryTooLarge);
         }
     }
-    let Some((split_at, _)) = best else {
+    if range_start == entry_count {
         return Err(PersistentMapError::EntryTooLarge);
-    };
-    Ok(split_at_node(&node, split_at))
+    }
+    ranges.push((range_start, entry_count));
+
+    if ranges.len() < 2 {
+        return Err(FormatError::InvalidPersistentNode(
+            "split requested for a node that already fits",
+        )
+        .into());
+    }
+    validate_node_type(node_type).map_err(|_| {
+        FormatError::InvalidPersistentNode("object type is not a persistent map node")
+    })?;
+    Ok(ranges
+        .into_iter()
+        .map(|(start, end)| slice_node(&node, start, end))
+        .collect())
 }
 
-fn split_at_node(node: &Node, split_at: usize) -> (Node, Node) {
+fn node_entry_size(node: &Node, index: usize) -> Result<usize, FormatError> {
     match node {
-        Node::Leaf(entries) => (
-            Node::Leaf(entries[..split_at].to_vec()),
-            Node::Leaf(entries[split_at..].to_vec()),
-        ),
-        Node::Internal { level, children } => (
-            Node::Internal {
-                level: *level,
-                children: children[..split_at].to_vec(),
-            },
-            Node::Internal {
-                level: *level,
-                children: children[split_at..].to_vec(),
-            },
-        ),
+        Node::Leaf(entries) => {
+            let (key, value) = &entries[index];
+            8_usize
+                .checked_add(key.len())
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(FormatError::InvalidPersistentNode("leaf size overflow"))
+        }
+        Node::Internal { children, .. } => 4_usize
+            .checked_add(OBJECT_REFERENCE_BYTES)
+            .and_then(|size| size.checked_add(children[index].0.len()))
+            .ok_or(FormatError::InvalidPersistentNode("internal size overflow")),
+    }
+}
+
+fn slice_node(node: &Node, start: usize, end: usize) -> Node {
+    match node {
+        Node::Leaf(entries) => Node::Leaf(entries[start..end].to_vec()),
+        Node::Internal { level, children } => Node::Internal {
+            level: *level,
+            children: children[start..end].to_vec(),
+        },
+    }
+}
+
+fn build_root<S: MapObjectStore>(
+    store: &mut S,
+    node_type: ObjectType,
+    mut children: Vec<(Vec<u8>, ObjectRef)>,
+) -> Result<ObjectRef, PersistentMapError> {
+    let mut child_level = load_node(store, children[0].1, node_type)?.level();
+    loop {
+        let level = child_level
+            .checked_add(1)
+            .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
+        if level > MAX_PERSISTENT_TREE_LEVEL {
+            return Err(FormatError::InvalidPersistentNode("tree height overflow").into());
+        }
+        let previous_count = children.len();
+        let parents = write_or_split(store, node_type, Node::Internal { level, children })?;
+        if parents.len() == 1 {
+            return Ok(parents[0].1);
+        }
+        if parents.len() >= previous_count {
+            return Err(PersistentMapError::RootTooLarge);
+        }
+        child_level = level;
+        children = parents;
     }
 }
 
@@ -1194,6 +1238,23 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_key_ranges_that_cannot_fit_in_a_bounded_root() {
+        let mut store = MemoryStore::default();
+        let tree = PersistentBTree::empty(ObjectType::ArtifactMapNode, &mut store).unwrap();
+        let tree = tree
+            .insert(&mut store, vec![b'a'; 30_000], Vec::new())
+            .unwrap();
+        let tree = tree
+            .insert(&mut store, vec![b'c'; 30_000], Vec::new())
+            .unwrap();
+
+        assert!(matches!(
+            tree.insert(&mut store, vec![b'b'; 40_000], Vec::new()),
+            Err(PersistentMapError::RootTooLarge)
+        ));
     }
 
     #[test]
