@@ -207,19 +207,25 @@ requests lose to abort tombstones; stale grants/devices cannot mutate authority.
   live root/revision, receipt, and preparation outcome.
 - [ ] Acknowledge FLUSH/FUA only after S3 and authority durability. Honor preflush
   dependency ordering and native FUA or the qualified kernel emulation path.
+  Persist the prefix through and including the tagged payload before FUA completion;
+  combined preflush/data/FUA persists earlier writes before payload execution.
 - [ ] Block later writes through the initial persistence cut; reconcile unknown
   replies with the same ID and preserve dirty bytes/protection. Renew long barriers.
 - [ ] Restore the current live root on a new attachment after worker loss, including
   acknowledged barriers beyond the last Generation. Stop fenced/failed old devices.
 
 **Exit evidence:** worker destruction loses only permitted volatile writes;
-acknowledged FLUSH/FUA data returns from an empty cache. Combined preflush/data/
-FUA tests cannot be passed by ignoring flags or returning success after local I/O.
+acknowledged FLUSH/FUA data, including the tagged payload itself, returns from an
+empty cache. Combined preflush/data/FUA verifies both persistence boundaries;
+ignoring flags or returning success after local I/O cannot pass.
 
 ### P7. Checkpoint consistency and branch lifecycle
 
 - [ ] Implement raw `block_cut` and reference `filesystem_frozen`/clean-unmount
   boundaries, recording only the mode actually established.
+- [ ] Acquire the capture token against pre-drain revision/root preconditions.
+  A definite conflict restarts capture with a new operation ID and a fresh drain;
+  never refresh roots and reuse the old cut. Reconcile unknown acquisition first.
 - [ ] Keep block service alive during freeze; drain permitted child barriers, then
   stop block mutation admission and seal volume/log/artifact roots plus final revision.
 - [ ] Publish attached/detached Generations with retention/outcome/capture-token
@@ -231,9 +237,10 @@ FUA tests cannot be passed by ignoring flags or returning success after local I/
   volume. An aborted capture does not undo a previously acknowledged child flush.
 
 **Exit evidence:** failed freeze/CAS/descriptor upload never publishes a false
-checkpoint. Frozen and raw-cut recovery have distinct tests. Fork does not walk
-volume extents; journal replay uses a writable fork; name reuse and old-device
-commits cannot affect the new branch state.
+checkpoint. An external mutation between drain and token CAS forces a fresh
+capture/drain, not a revision-only retry. Frozen and raw-cut recovery have distinct
+tests. Fork does not walk volume extents; journal replay uses a writable fork;
+name reuse and old-device commits cannot affect the new branch state.
 
 ### P8. Native logs and artifacts
 
