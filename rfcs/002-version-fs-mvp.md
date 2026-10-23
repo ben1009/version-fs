@@ -16,7 +16,8 @@ implements the Generation semantics and invariants of RFC-001 using:
 
 - Immutable, checksummed objects in Amazon S3 Standard.
 - Persistent copy-on-write metadata trees and fixed-size file chunks.
-- PostgreSQL transactions for publication, references, fencing, and retention.
+- A transactional Metadata Authority for publication, references, fencing, and
+  retention, with toy-kv-engine as the first backend.
 - One active writer per branch.
 - A native SDK and CLI, with managed local directory materialization.
 - Native ordered logs using S2 as the semantic reference.
@@ -52,6 +53,7 @@ or achieved performance.
 | --- | --- |
 | Objects | Typed SHA-256 identity, verified reads, idempotent uploads, workspace-local sharing. |
 | Metadata | Persistent namespace, file-chunk indexes, log indexes, and root maps. |
+| Authority | Backend-independent transactional contract, implemented by `ToyKvMetadataAuthority` for the MVP. |
 | Generations | Complete immutable roots; branch-attached and detached publication; operation outcome lookup. |
 | Filesystem | Regular files, directories, symlinks, declared metadata, range reads, full local materialization. |
 | Branches | Create/fork, checkpoint, conditional head movement, rollback, promote, delete, writer fencing. |
@@ -80,7 +82,8 @@ IDs are not a substitute for coordinated `history_id` identities.
 
 Automatic metadata failover and restoration from an older metadata backup are
 outside the initial service. Their safety requirements are described where they
-affect normal operation.
+affect normal operation. A PostgreSQL adapter is a compatible later backend;
+implementing it and operating a replicated metadata service are not MVP gates.
 
 ## 3. Components and deployment
 
@@ -91,40 +94,75 @@ affect normal operation.
                                   |
                      Version FS service and builders
                        /                       \
-              immutable object I/O        short transactions
+                  ObjectStore          MetadataAuthority
                        |                       |
-                  S3 Standard              PostgreSQL
-                data + manifests        refs + outcomes + roots
+                  S3 Standard          +-------+----------------+
+                data + manifests       |                        |
+                              ToyKvMetadataAuthority   PgMetadataAuthority
+                                   MVP / local          later / hosted
 ```
 
 The implementation uses Rust for the core library, service, SDK, and CLI.
-One service deployment initially owns one metadata database and an S3 prefix.
-Multiple independent branches can prepare objects concurrently. Branch-local
-transactions serialize that branch; normal operations take no exclusive global
-commit lock. Bulk object transfer workers are separate from metadata execution.
-Scaling the API tier and partitioning authority are later work.
+The domain protocol depends on `ObjectStore` and `MetadataAuthority` interfaces.
+One deployment initially owns one metadata namespace and an S3 prefix. Independent
+branches can prepare concurrently; transactional conflicts serialize mutations
+of the same branch without a Version FS global commit lock. Bulk transfer is
+separate from authority execution. Scaling the API tier and partitioning
+authority are later work.
 
-PostgreSQL is Version FS control metadata, not the application database described
-in RFC-001. Its state is as necessary for recovery as the S3 objects.
-Authoritative reads use the writable primary, not an asynchronously lagging
-replica. All control transactions use durable WAL with `fsync=on` and
-`synchronous_commit=on`; see PostgreSQL's
-[commit durability settings](https://www.postgresql.org/docs/current/runtime-config-wal.html).
-If a deployment enables failover, the promoted database must preserve all
-acknowledged commits through synchronous replication and fencing. An
-asynchronous replica cannot silently replace that contract.
+### 3.1 MVP metadata backend
 
-The supported durability boundary survives loss of workspace workers, service
-processes, and their caches. The metadata database must run on storage independent
-of those workers. Losing the only durable metadata copy is a disaster, not an
-ordinary worker-recovery path.
+`ToyKvMetadataAuthority` adapts
+[toy-kv-engine](https://github.com/ben1009/toy-kv-engine) for local development,
+integration and fault-injection tests, and the first end-to-end implementation.
+It uses serializable OCC point transactions with WAL enabled and a verified
+durable commit path, plus read-only snapshots for prefix scans. Section 5.1
+defines the adapter's required semantics and release evidence.
+
+The reference deployment has one authority owner and a persistent metadata
+volume. Its contents are required durable state, not worker cache. Recovery
+tests restart the owner against that volume and replace workspace workers
+independently. An optional in-memory test double cannot claim crash durability.
+
+The toy-kv backend is a test/reference implementation. Selecting it does not
+promise production availability, replication, multi-node operation, or automatic
+failover. Implementing Raft or a new replicated metadata service is outside v0.
+Its internal MVCC timestamps are not Generation identities or GTS coordinates.
+Using the engine for control metadata does not add application database
+snapshots to the MVP.
+
+### 3.2 Compatible PostgreSQL backend
+
+`PgMetadataAuthority` is specified as an interface-compatible future adapter;
+its implementation is not required for the initial MVP. It maps the same
+logical key/value records and transactions to PostgreSQL
+[SERIALIZABLE transactions](https://www.postgresql.org/docs/current/transaction-iso.html),
+consistent read-only snapshots, and
+[durable commit settings](https://www.postgresql.org/docs/current/runtime-config-wal.html).
+Serialization retries and commit uncertainty map to the common authority errors.
+SQL locking, constraints, and schema features stay inside that adapter.
+
+This provides a production path using an existing managed or cloud PostgreSQL
+deployment, so Version FS operators can reuse hosted metadata infrastructure
+before a dedicated replicated authority is justified. The selected deployment
+must satisfy the same read, durability, recovery, and fencing contract, including
+preserving acknowledged commits through any configured failover. Choosing a
+provider alone does not establish those guarantees.
+
+### 3.3 Durability and object storage
+
+The MVP durability boundary survives worker loss and authority-process restart
+while its persistent metadata storage remains intact. Keep that storage
+independent of disposable workspace disks in the recovery demonstration. Loss
+of the only metadata volume is outside this reference backend's guarantee.
+The authority and immutable object graph are both necessary for recovery.
 
 S3 is accessed through an object-store interface, but real AWS S3 is the release
 backend. An emulator or another S3-compatible service is a development backend
 until its behavior passes the same conformance checks. AWS documents strong
 consistency for object PUT, GET, and listing in its
 [consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel).
-This does not create a transaction spanning S3 and PostgreSQL.
+This does not create a transaction spanning S3 and the Metadata Authority.
 
 The deployment initially has one trusted operator and workspace-scoped client
 credentials. Clients cannot directly overwrite or delete stored objects. No v0
@@ -229,40 +267,103 @@ The descriptor is itself an immutable checksummed object. Its root references
 resolve complete current state. No descriptor refers to a parent as the source
 of missing file entries, chunks, or log records.
 
-A SQL catalog entry binds the Generation ID to its descriptor object and
-publication result. Uploading the descriptor creates no visible Generation.
+A Metadata Authority catalog entry binds the Generation ID to its descriptor
+object and publication result. Uploading the descriptor creates no visible
+Generation.
 
 ## 5. Control metadata and operation identity
 
-### 5.1 Authoritative records
+### 5.1 MetadataAuthority contract
+
+Version FS requires a strongly consistent transactional Metadata Authority.
+The interface describes key/value semantics rather than a SQL abstraction.
+Conceptually, without fixing a final Rust ABI:
+
+```rust
+trait MetadataAuthority {
+    fn get(&self, key: Key) -> Result<Option<Value>>;
+    fn transact<R>(
+        &self,
+        body: impl FnMut(&mut dyn MetadataTxn) -> Result<R>,
+    ) -> Result<R>;
+    fn snapshot(&self) -> Result<SnapshotHandle>;
+    fn scan_prefix(
+        &self,
+        snapshot: &SnapshotHandle,
+        prefix: Key,
+        cursor: Option<Cursor>,
+        limit: usize,
+    ) -> Result<Page>;
+}
+
+trait MetadataTxn {
+    fn get(&mut self, key: Key) -> Result<Option<Value>>;
+    fn put(&mut self, key: Key, value: Value) -> Result<()>;
+    fn delete(&mut self, key: Key) -> Result<()>;
+}
+```
+
+| Property | Required semantics |
+| --- | --- |
+| Atomic multi-key commit | The complete write set commits together, including reference, Generation, retention, and operation-outcome records. No partial commit is visible. |
+| Serializable point transactions | Point reads, including missing/deleted keys and read-your-writes, participate in conflict validation. Concurrent read/write preconditions cannot both succeed when no serial execution permits them. |
+| Fresh authoritative reads | New gets, transactions, and snapshot acquisition observe commits completed before they begin. An explicitly held snapshot retains its earlier boundary. Stale caches/replicas are not authoritative reads. |
+| Durable commit and recovery | Success waits for the selected backend's durable commit boundary. Reopening its preserved storage recovers every acknowledged complete transaction. Memory-only visibility is insufficient. |
+| Consistent prefix scans | Every page uses one read-only snapshot, with bytewise ordered keys and an explicit cursor/end. Losing that snapshot is an error, never a silent switch to current state. |
+| Explicit outcomes | A conflict/rejection is known not to commit. A timeout or error after possible commit is an unknown outcome, resolved through the operation record before another logical mutation. |
+
+`transact` may rerun its closure on a definite conflict. The closure performs
+metadata reads and buffered mutations only: no S3 I/O, command execution, local
+file mutation, or new logical operation ID on retry. Unknown commit outcomes
+cannot be retried as fresh operations. Deleting a metadata key is unrelated to
+physical object deletion; v0 still issues no S3 DELETE.
+
+Mutating transactions use point keys. Prefix scans are for read-only snapshots,
+listing, and reports; their results cannot act as transactional absence or
+range predicates. Name uniqueness reads a deterministic name-index key,
+including its absence, and writes it atomically with the new branch. Other
+set-based preconditions, including retention eligibility, use explicit point
+guards/index records maintained with the membership changes. The protocol
+does not depend on SQL unique constraints, foreign keys, or row locks.
+
+The toy-kv source's serializable transaction API currently rejects range/prefix
+scans because phantom tracking is absent; its separate read-only snapshot API
+provides consistent scans. `ToyKvMetadataAuthority` preserves this separation
+instead of silently reducing isolation. Both backends use the same logical
+record encoding and domain transaction code. Adapter-specific engine types,
+commit timestamps, SQL connections, and native errors stay behind the interface.
+The implementation pins a reviewed toy-kv revision and must pass the authority
+conformance gates; source inspection alone is not that evidence.
+
+### 5.2 Authoritative records
 
 | Record | Required state |
 | --- | --- |
 | Workspace | Stable ID, access scope, and retention policy. |
+| Authority owner | Durable incarnation used to fence lease grants across owner restart. |
 | Branch | Stable ID, unique live name, head Generation, revision, writer epoch/lease, stream epoch, live log-map root. |
+| Name / retention indexes | Point-key name bindings and per-Generation eligibility guards, updated atomically with their referenced records. |
 | Generation | Descriptor reference, publication operation, retention deadline, lifecycle state. |
 | Operation | ID, request fingerprint, phase, allocated identities, prepared dependencies, terminal result. |
 | Protection | Pins, reader leases, workspace bases, and preparation roots. |
 | GC report | Report ID, root snapshot/time, inventory window, completeness, and candidate summary/pages. |
 
-These are logical records; the SQL schema may normalize them. Branch IDs,
+These are logical records encoded as versioned keys and values. Branch IDs,
 workspace IDs, and stream epochs are never reused. Deleting and recreating a
 branch name creates a new branch ID. Every head or live-view mutation increments
 its state revision, including durable changes to its live log map. Lease-only
 renewal does not change this revision. Writer ownership changes advance the
 writer epoch. Comparing only head Generation IDs is insufficient for CAS.
 
-Normal transactions lock affected branch records in sorted ID order, then their
-operation/protection records, using PostgreSQL's
-[row locking](https://www.postgresql.org/docs/current/explicit-locking.html).
-Retention eligibility and protection acquisition are checked atomically;
-transactions spanning retention records use serializable isolation and retry
-serialization failures with the same operation ID. Independent branches need
-no exclusive workspace admission lock. A GC report snapshots metadata without
-pausing writers or reader acquisition. No SQL transaction remains open across
-S3 I/O.
+Normal transactions read and validate their branch, owner, operation, and
+retention/index keys, then buffer all required changes in one `transact` call.
+Retention eligibility and protection acquisition are checked atomically. A
+concurrent change to a read precondition causes a conflict, retried with the
+same operation ID. Independent branches need no exclusive workspace admission
+lock. A GC report uses an authority snapshot without pausing writers or reader
+acquisition. No mutation transaction remains open across S3 I/O.
 
-### 5.2 Idempotent mutations
+### 5.3 Idempotent mutations
 
 Every authoritative mutating SDK operation carries an opaque `operation_id`,
 scoped to its workspace and authenticated caller. An append uses `append_id` as
@@ -306,13 +407,21 @@ The caller can learn that an operation committed while its returned read lease,
 writer grant, or historical Generation has since expired. Obtaining new rights
 requires a new operation and current preconditions.
 
-### 5.3 Writer grants
+### 5.4 Writer grants
 
-The first implementation permits one active grant per branch. A new acquisition
-locks the branch, validates the expected epoch and ownership policy, advances
-the epoch, and records a grant with a 30-second renewable lease. Renewal is
-normally attempted every 10 seconds. Expiration is evaluated using primary
-database time after acquiring the lock, never the worker's clock.
+The first implementation permits one active grant per branch. An acquisition
+transaction reads the branch and authority incarnation, validates the expected
+epoch and ownership policy, advances the epoch, and records a 30-second
+renewable grant. Renewal is normally attempted every 10 seconds.
+
+Expiry uses the authority owner's trusted lease clock, with an injectable clock
+for deterministic tests; it does not require a database time function or GTS.
+Clock comparisons cannot regress within an owner incarnation. Before serving
+after restart, the owner advances its durable incarnation. Old lease grants
+cannot authorize new requests across that boundary; workers reacquire their
+grants/protections. Transactions validate the incarnation as a point-read
+precondition along with branch epochs. This is restart fencing for one authority
+owner, not a multi-node election or availability protocol.
 
 Acquisition has its own operation ID. A lost acquisition reply followed by a
 retry returns the same grant and epoch; it must not fence that grant by creating
@@ -321,9 +430,9 @@ new renewal uses a new operation ID. An expired grant cannot renew itself;
 reacquisition advances the epoch.
 
 Every final authoritative mutation validates branch ID, epoch, grant, lease,
-and relevant revision under the branch lock. Admission or upload under a valid
-grant does not authorize a later commit after handover. An authorized forced
-handover advances the epoch before granting the replacement writer. Release,
+authority incarnation, and relevant revision in its transaction. Upload under
+a valid grant does not authorize a later commit after handover. An authorized
+forced handover advances the epoch before granting the replacement writer. Release,
 branch deletion, and head-reset operations revoke the old grant.
 
 The SDK serializes data/head mutations for one branch and permits one checkpoint
@@ -484,8 +593,8 @@ inside opaque log text does not retain that digest's object.
 [atomic durable appends](https://s2.dev/docs/concepts/appends), and
 [conditional appends](https://s2.dev/docs/concepts/concurrency-control)
 are the reference model. Version FS implements its own segment/index path on S3
-and PostgreSQL. S2 is not a required dependency, and Version FS does not claim
-wire compatibility or S2's latency and throughput.
+and the Metadata Authority. S2 is not a required dependency, and Version FS does
+not claim wire compatibility or S2's latency and throughput.
 
 Each named log has a stable `log_id` in the immutable log map. Its current
 writable identity is:
@@ -504,7 +613,7 @@ A branch points to a persistent map of its live log views. A fork shares that
 map and creates a distinct effective StreamId through its new branch ID.
 Rollback or adoption replaces the map and advances `stream_epoch`. This makes
 fork and reset independent of the amount of historical log payload and avoids
-eagerly recreating every stream record in SQL.
+eagerly recreating every stream record in the authority.
 
 ### 7.2 Append protocol
 
@@ -631,9 +740,10 @@ metadata transaction or release unresolved operation protection.
 
 ### 8.3 Publication transaction
 
-The final transaction locks branch and operation records in the order defined
-in Section 5.1 and checks its exact preconditions, current grant,
-sealed root proof, and preparation state. It then atomically:
+The final transaction reads and validates the branch, authority incarnation,
+operation, and retention/index keys under Section 5.1's contract. It checks
+exact preconditions, the current grant, sealed root proof, and preparation
+state, then atomically:
 
 1. Creates the published Generation catalog entry and descriptor binding.
 2. Establishes its initial retention deadline.
@@ -742,9 +852,12 @@ they continue to report the original outcome after independent retention ends.
 reports observed unreachable objects; it never issues an object DELETE or
 changes a Generation's publication or retention state.
 
-1. In a PostgreSQL repeatable-read snapshot transaction, persist the report's
-   root set, snapshot time, and known preparation dependencies. End it before S3
-   I/O. Keep this snapshot on retries of the same report operation.
+1. Open a read-only authority snapshot. Enumerate retained/protected roots and
+   known preparation dependencies through snapshot-bound prefix scans; copy
+   them into report pages using separate point transactions. Seal that copied
+   root set, record its boundary, and release the snapshot before S3 I/O.
+   Retries use the same sealed root set. Losing the snapshot before sealing
+   aborts that report attempt; a new boundary requires a new operation ID.
 2. Traverse durable roots and typed edges with a visited set that can spill to
    disk. Include protected staged keys; surface incomplete preparations and
    unknown outcomes as uncertainty. Missing, corrupt, or unsupported required
@@ -815,16 +928,18 @@ operation ID. Restart first reconciles that operation. It cannot clear local
 work based only on the branch's current head. A different head or epoch requires
 explicit salvage or rematerialization, not automatic deletion of local changes.
 
-The service restarts from PostgreSQL, retaining protections and terminal
-operation results. Active preparations can resume while their authority remains
-valid or be durably aborted. It never reconstructs publication by listing uploaded
-Generation descriptors. If PostgreSQL is unavailable, authoritative mutations
-fail closed; a cached branch head is not a replacement authority.
+The service reopens the Metadata Authority's preserved durable state, reconciles
+its owner incarnation, and recovers protections and terminal operation results.
+Prior-incarnation lease grants are rejected. Prepared work may be durably
+aborted; a committed result remains authoritative regardless of restart.
+The service never reconstructs publication by listing uploaded Generation
+descriptors. If the authority is unavailable or has unresolved recovery errors,
+authoritative mutations fail closed; a cached head is not a replacement.
 
 ### 11.3 Metadata recovery boundary
 
-The operator must preserve durable metadata and its configured replication
-contract. Keeping all object bytes does not make an old metadata backup current:
+The operator must preserve durable metadata and any configured replication
+guarantees. Keeping all object bytes does not make an old metadata backup current:
 it can omit acknowledged head movements, writer epochs, and operation outcomes.
 The MVP runbook keeps the service offline after such a restore until a separate
 recovery procedure reconciles authority and fences obsolete writers. It cannot
@@ -838,7 +953,7 @@ worker-loss guarantee.
 ## 12. SDK and CLI surface
 
 The following specifies logical requests and results, not a final network or
-Rust ABI. Each mutation uses Section 5.2's operation contract. Workspace
+Rust ABI. Each mutation uses Section 5.3's operation contract. Workspace
 creation scopes its initial ID to the deployment and caller until the new
 workspace ID is known; other operations use the workspace scope.
 
@@ -897,6 +1012,9 @@ are no fake mount or Git-server commands before those adapters exist.
 | Descriptor uploaded, transaction not committed | Descriptor is invisible preparation data; old head remains authoritative. |
 | Commit succeeds, reply is lost | `get_operation` returns the original committed result, even if the branch later moved. |
 | Acquire/create reply is lost | Return the original writer grant or branch ID; allocate no replacement on replay. |
+| Authority owner restarts | Recover acknowledged metadata atomically, advance the owner incarnation before serving, and reject old lease grants. |
+| Authority reports a definite transaction conflict | Retry metadata logic with the same operation ID; repeat no S3 or local side effects inside the closure. |
+| Commit error may follow durable application | Treat the result as unknown; recover/query the operation record, never assume every backend error means abort. |
 | Import setup is interrupted or its reply is lost | Reconcile the recorded base protection and local binding under the same ID; do not claim imported file bytes are remotely durable. |
 | Writer replaced during upload | Final commit rejects the old epoch. Local work is preserved; aborted staged bytes remain stored and can appear in a later report. |
 | Append commits, receipt is lost | Replay returns its exact original range without another append. |
@@ -935,10 +1053,14 @@ Let `N` be namespace entries, `B` total regular-file bytes, `S` log segments,
 | GC report | Root snapshot, `O(R)` distinct-node marking, object inventory, and report storage; no publication pause or physical reclamation. |
 
 Small-file object count, fixed-chunk suffix rewrites, full scans, per-batch S3
-latency, the primary metadata database, unreclaimed object bytes, and lifetime
+latency, reference authority capacity, unreclaimed object bytes, and lifetime
 operation-result growth are expected v0 limits.
 This release proves correctness and sharing; it does not claim production
 throughput for millions of concurrent agents.
+
+Backend-internal commit serialization and durable-write cost are measured
+separately from domain-level branch conflicts. The toy-kv reference adapter
+does not imply hosted-service throughput or multi-node scalability.
 
 ### 14.2 Bounded resources and overload
 
@@ -958,17 +1080,19 @@ idempotency results. A report that cannot finish within its resource budget
 returns an incomplete/failed outcome without blocking workspace mutations.
 
 These bounds cover working resources and admission, not a bounded lifetime
-storage footprint. Both unreclaimed S3 bytes and permanent PostgreSQL operation
+storage footprint. Both unreclaimed S3 bytes and permanent authority operation
 records can grow with cumulative mutations. Trimming logs or expiring
 Generations does not remove either class in v0. Capacity limits may reject new
 work; they cannot erase deduplication history or enable deletion to make room.
 
 ### 14.3 Benchmark report
 
-The release includes a reproducible report on real S3 and the specified
-PostgreSQL deployment. Scenarios below are separate experiments, not one
-required Cartesian product. Record hardware, region, network, service limits,
-format version, retention settings, cache size, and raw sample counts.
+The release includes a reproducible report on real S3 and
+`ToyKvMetadataAuthority` using preserved metadata storage. PostgreSQL benchmarks
+are deferred with that adapter. Scenarios below are separate experiments, not
+one required Cartesian product. Record backend/engine revision, WAL/durability
+settings, hardware, region, network, service limits, format version, retention
+settings, cache size, and raw sample counts.
 
 | Scenario | Initial fixture / comparison |
 | --- | --- |
@@ -980,11 +1104,12 @@ format version, retention settings, cache size, and raw sample counts.
 | Logs | 100,000 1 KiB records; batches of 1, 100, and 1,000 records; capture, fork, and trim. |
 | Cold recovery | Empty cache versus warm cache; one-file native read versus full materialization. |
 | Reachability report | Shared/divergent retained roots, abandoned preparations, concurrent publication, and interrupted reports. |
-| Lifetime metadata | Operation-result rows/bytes after repeated appends, trims, and Generation expiry; verify records remain replay-safe. |
+| Lifetime metadata | Operation-result keys/bytes after repeated appends, trims, and Generation expiry; verify records remain replay-safe. |
+| Authority contention | Independent branches versus one hot branch; measure transaction conflicts, retries, and durable commit latency through the common interface. |
 
 Measure capture pause and total completion separately; bytes scanned, hashed,
 uploaded, downloaded, and newly stored; data and manifest object counts;
-metadata commits and retained operation rows/bytes; peak RAM/disk; and report
+metadata commits and retained operation keys/bytes; peak RAM/disk; and report
 duration/resource use alongside ongoing checkpoint and append latency.
 Report latency distributions with sample counts and achieved append/checkpoint
 throughput. Single-stream and independent-branch throughput are separate.
@@ -999,12 +1124,14 @@ latency SLO. A later performance proposal can set budgets from those results.
 | Phase | Deliverables | Exit evidence |
 | --- | --- | --- |
 | 1. Immutable state | Canonical encoding, object-store adapter, verified cache, persistent maps/chunks, descriptor reader, directory scanner/export, structural diff. | One complete fixture resolves on an empty worker without ancestor reads; unchanged nodes/chunks are physically shared. |
-| 2. Authority and writes | PostgreSQL schema, durable operation outcomes, writer grants, initial-import binding, managed capture, attached/detached publication, branch lifecycle, native log append/read/trim, artifact edges. | The import-to-checkpoint and candidate workflows work; lost replies and stale writers have one recoverable authoritative outcome. |
+| 2. Authority and writes | MetadataAuthority contract/conformance fixtures, ToyKvMetadataAuthority, common key schema and point transactions, durable outcomes, writer grants, initial import, capture/publication, branch lifecycle, logs, artifact edges. | The first end-to-end workflows run through the toy-kv adapter; conflicts, lost replies, restart, and stale writers have recoverable outcomes without backend-specific protocol calls. |
 | 3. Retention and recovery | Pins/read protections, mark-only reports, restart reconciliation, operator runbooks, real-backend fault campaigns, benchmark report. | Reports classify the captured graph without mutating it or pausing writers; a fresh worker restores every retained fixture after worker loss. |
 
 Physical deletion stays outside v0 regardless of these phases' completion.
 Development backends can accelerate iteration, but cannot replace real-backend
-release evidence.
+release evidence. The PostgreSQL mapping must remain compatible with the same
+contract, record model, and domain transactions; implementing or benchmarking
+that adapter is not an MVP completion requirement.
 
 ## 16. Acceptance criteria
 
@@ -1043,6 +1170,17 @@ release evidence.
 10. Verify capture/materialization do not follow restored external symlinks.
     Document that trusted runner commands can access their host targets and
     that those bytes and effects are outside the captured state.
+11. Run the backend-neutral authority conformance fixtures against the toy-kv
+    adapter: multi-key atomicity, missing-key and stale-read conflicts,
+    read-your-writes, read-after-commit, durable crash recovery, and consistent
+    multi-page snapshot scans. Concurrent branch-name claims must yield one
+    binding through an absent-key check, without SQL-only constraints.
+12. Verify Version FS protocol code depends only on the common interface and
+    logical schema. Report scans never substitute for transactional predicates;
+    toy-kv commit timestamps never become Version FS identities. Document the
+    compatible PostgreSQL mapping for the same contract. Every later adapter
+    must pass the same conformance suite before use. Implementing the PostgreSQL
+    adapter is not a v0 gate.
 
 ### 16.2 Failure-injection gates
 
@@ -1061,6 +1199,11 @@ cases include:
   already committed result.
 - Writer expiry and handover during preparation; a delayed old writer cannot
   publish, append, trim, or move a reference.
+- Authority crash before and after durable commit, a conflict during a retried
+  transaction closure, and an error after possible commit. Recover one complete
+  metadata outcome through the adapter; old-incarnation grants stay fenced.
+- Snapshot loss before a report's root set is sealed; report failure is explicit
+  and does not silently combine prefix pages from different boundaries.
 - Appends racing the capture gate; no batch is split or assigned to the wrong
   checkpoint interval. Local mutation admission stays closed until capture has
   a definite outcome.
@@ -1082,9 +1225,9 @@ should cover boundaries that are difficult to trigger reliably on real services.
 | RFC-001 invariants | MVP evidence |
 | --- | --- |
 | I1-I3: immutable, complete, independent state | Encoding/graph validation, independent restore with ancestor reads denied, sharing and diff fixtures. |
-| I4-I5, I8: durability and atomic publication | Real-backend upload/commit failures, detached publication, CAS, lost-reply recovery. |
+| I4-I5, I8: durability and atomic publication | S3 plus toy-kv authority upload/commit failures, conformance evidence, detached publication, CAS, lost-reply recovery. |
 | I6, I14: retention and log safety | Atomic retention/protection, closure marking and report races, trim with retained historical reads, and no physical deletion. |
-| I7, I11: authority and retry | Handover/expiry, ABA fixtures, identified create/acquire/append/publication retries and abort tombstones. |
+| I7, I11: authority and retry | Point-transaction conflicts, owner restart/handover/expiry, ABA fixtures, identified mutation retries and abort tombstones. |
 | I9: disposable workers | Destroy all worker state after publication and recover on a fresh worker. |
 | I12-I13: authorization and durable ordered append | Workspace authorization/data scoping, atomic batches, conditional tails, receipts and attachment retention; no runner sandbox claim. |
 | I10, I15: explicit participant/global boundaries | No runtime/DB/global-checkpoint support is claimed; no synthetic timestamp-based consistency assertion. |
@@ -1092,14 +1235,17 @@ should cover boundaries that are difficult to trigger reliably on real services.
 The MVP is complete when all required capabilities and gates have evidence,
 the real-backend benchmark report is published, and operator instructions cover
 backup assumptions, unknown outcomes, trusted runner/import behavior, mark-only
-report limits, and storage/metadata capacity growth. Physical reclamation and
-other deferred integrations are not release blockers.
+report limits, toy-kv's storage/availability boundary, and cumulative metadata
+growth. Physical reclamation, the PostgreSQL implementation, and other deferred
+integrations are not release blockers.
 
 ## 17. Selected tradeoffs
 
 | Decision | Reason and accepted cost |
 | --- | --- |
-| PostgreSQL authority | Reuse durable multi-record transactions; adds an independent durable service and one primary capacity boundary. |
+| Transactional MetadataAuthority | Keep publication, fencing, and retry logic independent of the backend; explicit point-key indexes and a reusable conformance suite are required. |
+| Toy-kv reference backend | Exercise OCC, crash recovery, and faults in the first implementation; preserve its metadata volume and make no production HA/replication commitment. |
+| Compatible later PostgreSQL backend | Reuse managed database infrastructure through the same contract before building a replicated authority; implementation and production deployment qualification are deferred. |
 | S3 immutable object graph | Portable worker recovery and sharing; small objects and each synchronous append incur remote request cost. |
 | Persistent ordered trees | Selective reads, range iteration, and metadata sharing; tree encoding and mutation correctness require care. |
 | Fixed chunks | Simple, measurable range reuse; insertions can rewrite suffixes. |
@@ -1107,7 +1253,7 @@ other deferred integrations are not release blockers.
 | Captured Git repository files | Normal local Git tooling works without a server adapter; no native Git protocol or object-format translation. |
 | One sealed segment per batch | Append durability and checkpoint capture are simple; tiny batches amplify S3 objects and requests. |
 | Mark-only GC reports | Validate reachability without a deletion protocol or collection pause; unreferenced object bytes remain stored and storage grows. |
-| Workspace-lifetime operation results | Preserve mutation IDs for replay-safe idempotency; every append and other mutation adds permanent metadata even after trim/expiry. High-rate, long-lived workloads need more PostgreSQL capacity; bounded deduplication is deferred. |
+| Workspace-lifetime operation results | Preserve mutation IDs for replay-safe idempotency; every append and other mutation adds permanent metadata even after trim/expiry. High-rate, long-lived workloads need more authority storage; bounded deduplication is deferred. |
 | Trusted managed runner | Coordinate capture without building a sandbox; commands retain host-filesystem access under their OS credentials, including through external symlinks. |
 
 Future changes can replace these mechanisms while preserving RFC-001's
@@ -1131,6 +1277,12 @@ and release gates above are proposals of this RFC, not vendor guarantees.
   inform the immutable object adapter.
 - [S3 object-version deletion](https://docs.aws.amazon.com/AmazonS3/latest/userguide/DeletingObjectVersions.html)
   informs only the future reclamation boundary; v0 issues no physical DELETE.
-- [PostgreSQL WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html)
-  and [explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html)
-  inform durable metadata acknowledgement and transaction-level coordination.
+- [toy-kv-engine](https://github.com/ben1009/toy-kv-engine), its
+  [point-transaction implementation](https://github.com/ben1009/toy-kv-engine/blob/0e69b0ef7cb2ff29c4bbfd116a2cdbe18a806d8e/kv-engine/src/mvcc/txn.rs),
+  and [read-only snapshots](https://github.com/ben1009/toy-kv-engine/blob/0e69b0ef7cb2ff29c4bbfd116a2cdbe18a806d8e/kv-engine/src/mvcc/snapshot.rs)
+  inform the reference adapter. The cited revision separates serializable point
+  transactions from snapshot scans; the adapter's conformance remains a
+  release gate.
+- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
+  and [WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html)
+  inform the compatible later adapter, not an initial PostgreSQL requirement.
