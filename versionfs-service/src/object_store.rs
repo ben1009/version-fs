@@ -516,7 +516,7 @@ impl ObjectStore for S3ObjectStore {
                 "backend exceeded the requested inventory page size".to_owned(),
             ));
         }
-        if page.next_token.as_deref() == backend_token {
+        if backend_token.is_some() && page.next_token.as_deref() == backend_token {
             return Err(ObjectStoreError::Backend(
                 "backend returned a non-advancing inventory cursor".to_owned(),
             ));
@@ -1141,6 +1141,33 @@ mod tests {
                 .await,
             Err(ObjectStoreError::LimitExceeded(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn inventory_returns_empty_and_single_page_results_without_a_cursor() {
+        let backend = Arc::new(MemoryBackend::default());
+        let store = make_store(Arc::clone(&backend));
+
+        let empty_page = store
+            .inventory_page(workspace(1), None, 10)
+            .await
+            .expect("empty workspace has a valid final page");
+        assert!(empty_page.entries.is_empty());
+        assert!(empty_page.next_cursor.is_none());
+
+        store
+            .put(
+                workspace(1),
+                &encoded(ObjectType::ArtifactBlob, b"one object"),
+            )
+            .await
+            .expect("test object is stored");
+        let single_page = store
+            .inventory_page(workspace(1), None, 10)
+            .await
+            .expect("single-page inventory has a valid final page");
+        assert_eq!(single_page.entries.len(), 1);
+        assert!(single_page.next_cursor.is_none());
     }
 
     #[tokio::test]
