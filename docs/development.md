@@ -4,10 +4,12 @@ The tooling baseline comes from
 [`toy-kv-engine` at `8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe`](https://github.com/ben1009/toy-kv-engine/tree/8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe).
 This repository contains four Rust packages matching the
 [MVP implementation plan](mvp-implementation-plan.md#2-initial-code-organization).
-P0 adds canonical-format primitives, bounded shared fixtures, and an opt-in
-RAM-backed ublk/ext4 feasibility harness. The storage protocols, remote object
-adapter, service daemon, and user-facing commands are not implemented yet.
-Tooling checks do not qualify any MVP storage or durability gate.
+P0 added canonical-format primitives, bounded shared fixtures, and an opt-in
+RAM-backed ublk/ext4 feasibility harness. P1 adds the workspace-scoped S3 object
+adapter and deterministic conformance tests. The real-S3 test is explicitly
+ignored and requires a dedicated test bucket; the metadata authority, higher
+storage protocols, service daemon, and user-facing commands remain unimplemented.
+Tooling checks do not qualify any MVP durability gate.
 
 ## Setup and tools
 
@@ -58,6 +60,7 @@ not download or execute an unpinned bootstrap script.
 | `./dev test-lsan` | Run LeakSanitizer tests with the shared suppression file. |
 | `cargo build -p versionfs-sdk --features ublk-smoke --bin versionfs-ublk-smoke` | Build the opt-in ublk RAM target. |
 | `sudo ./scripts/ublk-ext4-smoke.sh` | Format/mount ext4, exercise file I/O and flush/freeze, check unsupported discard, and verify orderly and abrupt-server teardown. |
+| `docs/s3-conformance.md` | Dedicated-bucket setup and command for the ignored real-S3 conformance test. |
 
 The ublk smoke requires Linux with `CONFIG_BLK_DEV_UBLK`, `/dev/ublk-control`,
 effective `CAP_SYS_ADMIN` (or equivalent device permissions), mount namespaces,
@@ -75,6 +78,10 @@ so the kernel may emulate FUA as WRITE followed by FLUSH. The harness does not
 qualify FUA durability, S3 durability, Generation publication, or recovery of
 durable state after server death. Run it only on a disposable privileged Linux
 host.
+
+The deterministic object-store tests run with `./dev test`. The real-S3 test is
+ignored unless explicitly requested; its dedicated-bucket guard and setup are in
+[`docs/s3-conformance.md`](s3-conformance.md). Ordinary CI never contacts AWS.
 
 Checks do not rewrite Rust sources or manifests. Formatting and dependency fixes
 have separate commands; spelling failures propagate as failed checks. Build and

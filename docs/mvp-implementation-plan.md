@@ -2,14 +2,14 @@
 
 | Field | Value |
 | --- | --- |
-| Status | In progress; P0 implementation is under review |
+| Status | P0 merged; P1 object layer implemented, real-S3 run pending |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
 
 This plan implements the block-volume MVP from RFC-002. It supersedes the earlier
 directory-scanning plan. RFC-001 owns system semantics; RFC-002 owns mechanisms,
-durability boundaries, and release criteria. P0 work is underway. Writing this
+durability boundaries, and release criteria. P0 is merged and P1 implementation is in progress. Writing this
 plan or building a smoke harness does not establish remote durability or
 benchmark evidence.
 
@@ -102,7 +102,7 @@ those tests across processes; it is not the first durability or fencing test.
 
 - [x] Establish reproducible Rust workspace/toolchain/dependency lock, Linux CI,
   formatting/lint/package checks, and bounded shared golden fixtures.
-- [ ] Establish the opt-in real-S3 conformance lane with the object-store adapter
+- [x] Establish the opt-in real-S3 conformance lane with the object-store adapter
   in P1; do not run it against a production bucket.
 - [x] Pin the Linux ublk userspace binding and add an ext4 tools/configuration
   plus a tiny READ/WRITE/FLUSH mount/freeze smoke harness.
@@ -126,17 +126,26 @@ durability, remote storage, or Generation publication.
 
 ### P1. Immutable objects and S3
 
-- [ ] Implement scoped SHA-256 typed identities and complete length/hash/type
+- [x] Implement scoped SHA-256 typed identities and complete length/hash/type
   verification; provide bounded PUT, verified GET, and inventory, with no DELETE API.
-- [ ] Implement conditional create and verified reuse. Reconcile ambiguous PUTs
+- [x] Implement conditional create and verified reuse. Reconcile ambiguous PUTs
   by verified GET or identical retry; object existence alone is insufficient.
-- [ ] Configure TLS/encryption, workspace prefixes, transfer budgets, and release
-  credentials without object deletion; disable lifecycle expiration on the prefix.
-- [ ] Exercise duplicates, wrong/corrupt/missing objects, lost upload replies,
-  and storage outages against a deterministic store and real S3.
+- [x] Require HTTPS and server-side encryption, scope keys by deployment/workspace,
+  bound transfer concurrency, expose no overwrite/delete API, and document the
+  required no-delete IAM and no-expiration lifecycle policy.
+- [x] Exercise duplicates, wrong/corrupt/missing objects, lost upload replies,
+  and storage outages against a deterministic backend; add a guarded, opt-in real-S3
+  conformance test.
+- [ ] Configure the dedicated test identity without object deletion, ensure its
+  prefix has no lifecycle expiration, then run the real-S3 conformance test against
+  a dedicated `versionfs-test-*` bucket and retain request evidence before claiming
+  external-backend qualification.
 
-**Exit evidence:** verified objects are reusable; bad bytes never enter trusted
-state; real request traces include no object DELETE.
+**Exit evidence:** deterministic tests verify conditional reuse, corrupt/missing
+object rejection, ambiguous-upload recovery, bounded paging/transfers, and workspace
+scoping. The ignored real-S3 test exercises the same API without running in ordinary
+CI; an actual dedicated-bucket run remains pending. The public adapter has no DELETE
+or overwrite method, and the real-S3 role must have no object-delete permission.
 
 ### P2. MetadataAuthority and toy-kv
 
