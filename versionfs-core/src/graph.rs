@@ -6,7 +6,7 @@ use crate::format::{
     MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, SegmentIndexEntry, VolumeRoot, decode_object,
 };
 use crate::identity::ObjectId;
-use crate::persistent_map::{MapObjectStore, PersistentBTree, PersistentMapError};
+use crate::persistent_map::{MapContents, MapObjectStore, PersistentBTree, PersistentMapError};
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -118,8 +118,8 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     fn verify_volume(&mut self, root_ref: ObjectRef) -> Result<(), GraphError> {
         let root = VolumeRoot::decode(&self.load(root_ref)?)?;
         let map = PersistentBTree::from_root(root.extent_map_root)?;
-        let (entries, nodes) = map.entries_and_nodes(self.store)?;
-        for node in nodes {
+        let MapContents { entries, node_refs } = map.entries_and_nodes(self.store)?;
+        for node in node_refs {
             // The map traversal has already fetched, checksummed, and
             // structurally validated each node. Keep only its reference so
             // proving a large volume does not retain every node's bytes.
@@ -154,7 +154,10 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     fn verify_logs(&mut self, root_ref: ObjectRef) -> Result<(), GraphError> {
         let root = LogMapRoot::decode(&self.load(root_ref)?)?;
         let map = PersistentBTree::from_root(root.log_index_root)?;
-        let (logs, map_nodes) = map.entries_and_nodes(self.store)?;
+        let MapContents {
+            entries: logs,
+            node_refs: map_nodes,
+        } = map.entries_and_nodes(self.store)?;
         if logs.len() as u64 != root.log_count {
             return Err(GraphError::InvalidGraph(
                 "log count differs from root metadata",
@@ -175,7 +178,10 @@ impl<S: MapObjectStore> Verifier<'_, S> {
 
     fn verify_log(&mut self, log: LogMapEntry) -> Result<(), GraphError> {
         let index = PersistentBTree::from_root(log.segment_index_root)?;
-        let (segments, index_nodes) = index.entries_and_nodes(self.store)?;
+        let MapContents {
+            entries: segments,
+            node_refs: index_nodes,
+        } = index.entries_and_nodes(self.store)?;
         for node in index_nodes {
             self.record(node)?;
         }
@@ -214,7 +220,10 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     fn verify_artifacts(&mut self, root_ref: ObjectRef) -> Result<(), GraphError> {
         let root = ArtifactMapRoot::decode(&self.load(root_ref)?)?;
         let map = PersistentBTree::from_root(root.artifact_index_root)?;
-        let (artifacts, map_nodes) = map.entries_and_nodes(self.store)?;
+        let MapContents {
+            entries: artifacts,
+            node_refs: map_nodes,
+        } = map.entries_and_nodes(self.store)?;
         if artifacts.len() as u64 != root.artifact_count {
             return Err(GraphError::InvalidGraph(
                 "artifact count differs from root metadata",
@@ -249,7 +258,10 @@ impl<S: MapObjectStore> Verifier<'_, S> {
             }
         } else {
             let index = PersistentBTree::from_root(artifact.content_root)?;
-            let (chunks, index_nodes) = index.entries_and_nodes(self.store)?;
+            let MapContents {
+                entries: chunks,
+                node_refs: index_nodes,
+            } = index.entries_and_nodes(self.store)?;
             for node in index_nodes {
                 self.record(node)?;
             }
@@ -442,12 +454,7 @@ mod tests {
         assert_eq!(proof.descriptor(), descriptor_ref);
         assert_eq!(proof.capture_mode(), CaptureMode::BlockCut);
         assert_eq!(proof.objects().len(), 7);
-        assert!(
-            !proof
-                .objects()
-                .iter()
-                .any(|reference| *reference == parent_ref)
-        );
+        assert!(!proof.objects().contains(&parent_ref));
     }
 
     #[test]
@@ -593,7 +600,7 @@ mod tests {
         let mut store = MemoryStore::default();
         let descriptor_ref = empty_generation(&mut store, GenerationId::from_bytes([7; 16]), None);
         let descriptor =
-            GenerationDescriptor::decode(&store.0.get(&descriptor_ref.object_id).unwrap()).unwrap();
+            GenerationDescriptor::decode(store.0.get(&descriptor_ref.object_id).unwrap()).unwrap();
         let mut artifact_map = ArtifactMap::empty(&mut store).unwrap();
         let chunk = store_object(&mut store, encode_artifact_chunk(b"short").unwrap());
         let chunks = ArtifactChunkIndex::empty(&mut store)

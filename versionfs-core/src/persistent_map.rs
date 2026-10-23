@@ -68,6 +68,18 @@ pub enum MapChange {
     },
 }
 
+/// One ordered key/value entry returned by a persistent map.
+pub type MapEntry = (Vec<u8>, Vec<u8>);
+
+/// All entries and node references reachable from one persistent map root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapContents {
+    /// Entries in strict bytewise key order.
+    pub entries: Vec<MapEntry>,
+    /// Every reachable immutable map-node reference.
+    pub node_refs: Vec<ObjectRef>,
+}
+
 /// An immutable root for a typed persistent B+ tree.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersistentBTree {
@@ -222,7 +234,7 @@ impl PersistentBTree {
     pub fn entries<S: MapObjectStore>(
         &self,
         store: &S,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, PersistentMapError> {
+    ) -> Result<Vec<MapEntry>, PersistentMapError> {
         let mut entries = Vec::new();
         let mut nodes = Vec::new();
         collect_subtree(
@@ -241,7 +253,7 @@ impl PersistentBTree {
     pub fn entries_and_nodes<S: MapObjectStore>(
         &self,
         store: &S,
-    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<ObjectRef>), PersistentMapError> {
+    ) -> Result<MapContents, PersistentMapError> {
         let mut entries = Vec::new();
         let mut nodes = Vec::new();
         collect_subtree(
@@ -253,7 +265,10 @@ impl PersistentBTree {
             &mut entries,
             &mut nodes,
         )?;
-        Ok((entries, nodes))
+        Ok(MapContents {
+            entries,
+            node_refs: nodes,
+        })
     }
 
     /// Diffs two maps, skipping identical subtrees and falling back to sorted
@@ -275,10 +290,8 @@ impl PersistentBTree {
             self.root,
             newer.root,
             self.node_type,
-            None,
-            None,
-            None,
-            None,
+            NodeExpectation::default(),
+            NodeExpectation::default(),
             &mut changes,
         )?;
         Ok(changes)
@@ -293,6 +306,12 @@ enum Node {
         /// Each key is the maximum key contained in the corresponding child.
         children: Vec<(Vec<u8>, ObjectRef)>,
     },
+}
+
+#[derive(Clone, Debug, Default)]
+struct NodeExpectation {
+    level: Option<u16>,
+    max_key: Option<Vec<u8>>,
 }
 
 impl Node {
@@ -827,23 +846,27 @@ fn diff_subtrees<S: MapObjectStore>(
     before_ref: ObjectRef,
     after_ref: ObjectRef,
     node_type: ObjectType,
-    before_level: Option<u16>,
-    after_level: Option<u16>,
-    before_max: Option<Vec<u8>>,
-    after_max: Option<Vec<u8>>,
+    before_expected: NodeExpectation,
+    after_expected: NodeExpectation,
     changes: &mut Vec<MapChange>,
 ) -> Result<(), PersistentMapError> {
     let before = load_node(store, before_ref, node_type)?;
     let after = load_node(store, after_ref, node_type)?;
-    if before_level.is_some_and(|level| level != before.level())
-        || after_level.is_some_and(|level| level != after.level())
+    if before_expected
+        .level
+        .is_some_and(|level| level != before.level())
+        || after_expected
+            .level
+            .is_some_and(|level| level != after.level())
     {
         return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
     }
-    if before_max
+    if before_expected
+        .max_key
         .as_deref()
         .is_some_and(|maximum| before.max_key() != Some(maximum))
-        || after_max
+        || after_expected
+            .max_key
             .as_deref()
             .is_some_and(|maximum| after.max_key() != Some(maximum))
     {
@@ -880,10 +903,14 @@ fn diff_subtrees<S: MapObjectStore>(
                     *before_child,
                     *after_child,
                     node_type,
-                    Some(*before_level - 1),
-                    Some(*after_level - 1),
-                    Some(before_max.clone()),
-                    Some(after_max.clone()),
+                    NodeExpectation {
+                        level: Some(*before_level - 1),
+                        max_key: Some(before_max.clone()),
+                    },
+                    NodeExpectation {
+                        level: Some(*after_level - 1),
+                        max_key: Some(after_max.clone()),
+                    },
                     changes,
                 )?;
             }
@@ -900,8 +927,8 @@ fn diff_subtrees<S: MapObjectStore>(
                 store,
                 before_ref,
                 node_type,
-                before_level,
-                before_max,
+                before_expected.level,
+                before_expected.max_key,
                 &mut before_entries,
                 &mut before_nodes,
             )?;
@@ -911,8 +938,8 @@ fn diff_subtrees<S: MapObjectStore>(
                 store,
                 after_ref,
                 node_type,
-                after_level,
-                after_max,
+                after_expected.level,
+                after_expected.max_key,
                 &mut after_entries,
                 &mut after_nodes,
             )?;
@@ -1062,14 +1089,14 @@ mod tests {
                 .unwrap();
         }
         let before_root = before.root();
-        let (_, before_nodes) = before.entries_and_nodes(&store).unwrap();
+        let before_nodes = before.entries_and_nodes(&store).unwrap().node_refs;
         let root_level = load_node(&store, before_root, ObjectType::ArtifactIndexNode)
             .unwrap()
             .level();
         let after = before
             .insert(&mut store, key(3001), vec![0xEE; 24])
             .unwrap();
-        let (_, after_nodes) = after.entries_and_nodes(&store).unwrap();
+        let after_nodes = after.entries_and_nodes(&store).unwrap().node_refs;
         let replaced_old_nodes = before_nodes
             .iter()
             .filter(|node| !after_nodes.contains(node))
