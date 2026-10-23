@@ -12,6 +12,7 @@ use std::{
     thread,
 };
 
+use kv_engine::lsm_storage::{KvEngine, LsmStorageOptions};
 use versionfs_core::{
     fault::{FailureInjector, FailurePoint, InjectedFailure, OneShotFailures},
     metadata::{MetadataAuthority, MetadataError, MutationIdentity, ReconciledOutcome},
@@ -20,6 +21,7 @@ use versionfs_core::{
 use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+const PENDING_OPERATION_KEY: &[u8] = b"\0versionfs/metadata/pending-operation";
 
 struct TestDir(PathBuf);
 
@@ -81,6 +83,33 @@ fn operation<'a>(id: &'a [u8], outcome_key: &'a [u8]) -> MutationIdentity<'a> {
 
 fn authority(path: &std::path::Path) -> ToyKvMetadataAuthority {
     ToyKvMetadataAuthority::open(path).expect("open toy-kv metadata authority")
+}
+
+fn pending_marker(path: &std::path::Path) -> Option<Vec<u8>> {
+    let engine = KvEngine::open(
+        path,
+        LsmStorageOptions {
+            enable_wal: true,
+            serializable: true,
+            ..LsmStorageOptions::default()
+        },
+    )
+    .expect("open raw toy-kv engine to inspect pending marker");
+    let value = engine
+        .get(PENDING_OPERATION_KEY)
+        .expect("read raw pending marker")
+        .map(|value| value.as_ref().to_vec());
+    engine.close().expect("close raw toy-kv engine");
+    value
+}
+
+fn expected_pending_marker(operation_id: &[u8], outcome_key: &[u8]) -> Vec<u8> {
+    let mut encoded = vec![0, 1];
+    encoded.extend_from_slice(&(operation_id.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(operation_id);
+    encoded.extend_from_slice(&(outcome_key.len() as u32).to_be_bytes());
+    encoded.extend_from_slice(outcome_key);
+    encoded
 }
 
 #[test]
@@ -452,6 +481,21 @@ fn restart_reconciles_persisted_unknown_outcomes_before_serving_mutations() {
 
     let committed_dir = TestDir::new();
     crash_child(committed_dir.path(), "committed");
+    assert_eq!(
+        pending_marker(committed_dir.path()),
+        Some(expected_pending_marker(
+            b"restart-committed",
+            b"outcome/restart-committed",
+        )),
+        "child exit must leave the committed operation's marker durable"
+    );
+    let committed = authority(committed_dir.path());
+    drop(committed);
+    assert_eq!(
+        pending_marker(committed_dir.path()),
+        None,
+        "opening the authority must resolve and clear the committed marker"
+    );
     let committed = authority(committed_dir.path());
     assert_eq!(
         committed
@@ -479,6 +523,21 @@ fn restart_reconciles_persisted_unknown_outcomes_before_serving_mutations() {
 
     let aborted_dir = TestDir::new();
     crash_child(aborted_dir.path(), "not-committed");
+    assert_eq!(
+        pending_marker(aborted_dir.path()),
+        Some(expected_pending_marker(
+            b"restart-not-committed",
+            b"outcome/restart-not-committed",
+        )),
+        "child exit must leave the uncommitted operation's marker durable"
+    );
+    let aborted = authority(aborted_dir.path());
+    drop(aborted);
+    assert_eq!(
+        pending_marker(aborted_dir.path()),
+        None,
+        "opening the authority must resolve and clear the uncommitted marker"
+    );
     let aborted = authority(aborted_dir.path());
     assert_eq!(
         aborted
