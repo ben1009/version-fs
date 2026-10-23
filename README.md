@@ -1,15 +1,16 @@
 # Version FS
 
-Version FS is a proposed versioned storage substrate for files, Git state, logs,
-and artifacts produced by agents and other automated workloads.
+Version FS is a proposed versioned storage substrate for block volumes, files,
+Git state, logs, and artifacts produced by agents and other automated workloads.
 
 Its central abstraction is a **Generation**: an immutable, independently readable
 logical state. Generations share unchanged objects and metadata, allowing
 workspaces to checkpoint, fork, roll back, and promote state without copying a
 complete workspace.
 
-Published state lives in durable storage. Compute nodes keep a mutable overlay
-and a disposable cache. Transactional databases remain separate systems.
+Published Generations and acknowledged durable live state live in durable
+storage. Compute nodes may additionally keep volatile mutable state and disposable
+caches. Transactional databases remain separate systems.
 
 The proposed MVP exposes a versioned block volume through Linux ublk, with ext4
 as the reference filesystem consumer, alongside native ordered logs and artifacts.

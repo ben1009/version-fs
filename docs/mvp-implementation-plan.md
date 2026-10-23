@@ -28,9 +28,9 @@ worker B
 
 The authority has separate preserved storage. Also demonstrate that acknowledged
 FLUSH/FUA boundaries newer than the last Generation survive worker loss via the
-branch's live VolumeRoot. A raw block cut, a frozen filesystem checkpoint, and an
-application-consistent checkpoint are distinct promises; the MVP provides only
-the declared block/filesystem boundaries.
+branch's live VolumeRoot. A raw block cut, a frozen or clean-unmounted filesystem
+checkpoint, and an application-consistent checkpoint are distinct promises;
+the MVP provides only the declared block/filesystem boundaries.
 
 The scope is [RFC-002 Section 2](../rfcs/002-version-fs-mvp.md#2-release-scope).
 Native logs and artifacts remain first-class views. Native file-tree capture,
@@ -57,8 +57,9 @@ Keep these boundaries enforceable:
   or SQL constructs. Use point-key preconditions and snapshot-only prefix scans.
 - The trusted builder validates bytes, ownership, typed graph edges, and durable
   outcomes. Client-provided digests/roots never prove publication eligibility.
-- No S3 I/O, freeze/mount command, or local file mutation runs inside the authority
-  commit gate/transaction. Worker control/cache files live outside the exported volume.
+- No S3 I/O, filesystem/device operation, or other external side effect runs
+  inside the authority commit gate/transaction. Worker control/cache files live
+  outside the exported volume.
 - Block devices/handles and native views enforce workspace scope. No raw public
   digest lookup or filesystem UUID substitutes for authorization.
 
@@ -106,7 +107,8 @@ those tests across processes; it is not the first durability or fencing test.
   accelerate exploration but is not the ublk release qualification.
 - [ ] Write the format note and golden vectors before durable writers: typed
   length-delimited encoding, zeros, extent/sector geometry, ordered keys, complete
-  roots, log segments, artifact chunks, and metadata schema versions.
+  roots, all three capture modes, log segments, artifact chunks, and metadata
+  schema versions.
 - [ ] Define typed identities/errors, injected time, named upload/commit/reply/
   device/freeze failure points, I/O/object counters, and bounded test fixtures.
 
@@ -227,16 +229,17 @@ using P3's formats and normal durability/graph validation, not placeholder diges
 The descriptor and capture protocol already include native-view slots; P8 supplies
 their mutation protocols and connects them to this same coordinator.
 
-- [ ] Implement raw `block_cut` and reference `filesystem_frozen`/clean-unmount
-  boundaries, recording only the mode actually established.
-- [ ] Drain producers, then read authoritative revision/live roots together and
-  acquire the capture token against those exact preconditions. Keep the worker's
-  original writer grant, attachment identity, and fencing epochs; never adopt a new owner.
+- [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
+  boundaries, persisting only the mode actually established and rejecting unknown modes.
+- [ ] Close local admission, read authoritative revision/live roots together,
+  then drain producers and acquire the capture token against those exact pre-drain
+  preconditions. Keep the worker's original writer grant, attachment identity,
+  and fencing epochs; never adopt a new owner.
   A definite conflict restarts capture with a new operation ID and a fresh drain;
   never refresh roots and reuse the old cut. Reconcile unknown acquisition first.
-- [ ] Keep block service alive during freeze; drain permitted child barriers, then
-  stop block mutation admission and seal the volume root, canonical empty native
-  roots, and final revision through the common-cut framework.
+- [ ] Keep block service alive during freeze or clean unmount; drain permitted
+  child barriers, then stop block mutation admission and seal the volume root,
+  canonical empty native roots, and final revision through the common-cut framework.
 - [ ] Publish attached/detached Generations with retention/outcome/capture-token
   changes atomically. Reconcile/sync the local result before thaw/reopening.
 - [ ] Implement metadata-only fork, conditional adoption/rollback/promotion/delete,
@@ -246,11 +249,11 @@ their mutation protocols and connects them to this same coordinator.
   volume. An aborted capture does not undo a previously acknowledged child flush.
 
 **Exit evidence:** failed freeze/CAS/descriptor upload never publishes a false
-checkpoint. Drain-time volume barriers are included without an artificial retry;
-an external mutation between the post-drain root read and token CAS forces a fresh
-capture/drain, not a revision-only retry. Ownership changes fence the original
-worker even before the root read. Frozen and raw-cut recovery have distinct
-tests. Fork does not walk volume extents; journal replay uses a writable fork;
+checkpoint. Any live mutation between the pre-drain root read and token CAS forces
+a fresh capture/drain, including a legitimate drain-time volume barrier. Never
+retry by refreshing only the revision/roots. Ownership changes fence the original
+worker. All three capture modes have distinct descriptor and recovery tests.
+Fork does not walk volume extents; journal replay uses a writable fork;
 name reuse and old-device commits cannot affect the new branch state.
 
 ### P8. Native logs and artifacts
@@ -268,9 +271,9 @@ name reuse and old-device commits cannot affect the new branch state.
 
 **Exit evidence:** native views can be read without mounting the filesystem;
 append races fall wholly on one side of capture; retained log ranges/attachments
-survive live trim. Appends completing during drain are included in the post-drain
-root read without an artificial retry. Native artifact identity is explicit,
-not inferred from a path.
+survive live trim. An append completing after the pre-drain snapshot invalidates
+that attempt and forces a fresh capture/drain under P7's existing protocol.
+Native artifact identity is explicit, not inferred from a path.
 
 ### P9. SDK, service, and CLI lifecycle
 
