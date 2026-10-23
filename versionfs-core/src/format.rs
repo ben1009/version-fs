@@ -22,6 +22,8 @@ pub const EXTENT_BYTES: u32 = 64 * 1024;
 const OBJECT_MAGIC: [u8; 4] = *b"VFSO";
 const METADATA_MAGIC: [u8; 4] = *b"VFSM";
 const ENVELOPE_HEADER_BYTES: usize = 16;
+const OBJECT_REFERENCE_BYTES: usize = 42;
+const LOG_SEGMENT_FIXED_PAYLOAD_BYTES: usize = 40;
 
 /// Stable object type codes. Codes are never reused after publication.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -592,6 +594,19 @@ impl LogSegment {
             return Err(FormatError::PayloadTooLarge {
                 actual: record_bytes,
                 maximum: MAX_LOG_RECORD_BYTES,
+            });
+        }
+        let payload_len = self
+            .attachments
+            .len()
+            .checked_mul(OBJECT_REFERENCE_BYTES)
+            .and_then(|total| total.checked_add(LOG_SEGMENT_FIXED_PAYLOAD_BYTES))
+            .and_then(|total| total.checked_add(record_bytes))
+            .ok_or(FormatError::InvalidLogSegment)?;
+        if payload_len > MAX_OBJECT_PAYLOAD_BYTES {
+            return Err(FormatError::PayloadTooLarge {
+                actual: payload_len,
+                maximum: MAX_OBJECT_PAYLOAD_BYTES,
             });
         }
         let mut encoder = CanonicalEncoder::new();
