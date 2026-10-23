@@ -340,8 +340,13 @@ trait MetadataAuthority {
     fn get(&self, key: Key) -> Result<Option<Value>>;
     fn transact<R>(
         &self,
+        operation: MutationIdentity,
         body: impl FnMut(&mut dyn MetadataTxn) -> Result<R>,
     ) -> Result<R>;
+    fn reconcile_unknown(
+        &self,
+        operation: MutationIdentity,
+    ) -> Result<ReconciledOutcome>;
     fn snapshot(&self) -> Result<SnapshotHandle>;
     fn scan_prefix(
         &self,
@@ -356,8 +361,16 @@ trait MetadataTxn {
     fn get(&mut self, key: Key) -> Result<Option<Value>>;
     fn put(&mut self, key: Key, value: Value) -> Result<()>;
     fn delete(&mut self, key: Key) -> Result<()>;
+    fn now(&self) -> MonotonicTime;
 }
 ```
+
+Every mutation supplies a stable operation ID and outcome key, and writes its
+immutable terminal outcome at that key in the same transaction as its state
+changes. Lease checks use a fresh owner-clock read at the final gated decision.
+An unknown backend result blocks later mutations until the authority recovers
+and checks that exact outcome key; an absent result proves the operation did not
+commit and allows the caller to retry the same logical operation.
 
 | Property | Required semantics |
 | --- | --- |
