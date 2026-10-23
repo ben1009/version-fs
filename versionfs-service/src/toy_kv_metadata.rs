@@ -482,12 +482,12 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
                 pending.requires_reopen,
             )
         });
-        if let Some((operation_id, outcome_key, _)) = &unresolved {
-            if operation_id != operation.operation_id || outcome_key != operation.outcome_key {
-                return Err(MetadataError::ReconciliationRequired {
-                    operation_id: operation_id.clone(),
-                });
-            }
+        if let Some((operation_id, outcome_key, _)) = &unresolved
+            && (operation_id != operation.operation_id || outcome_key != operation.outcome_key)
+        {
+            return Err(MetadataError::ReconciliationRequired {
+                operation_id: operation_id.clone(),
+            });
         }
         if unresolved
             .as_ref()
@@ -504,21 +504,10 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
                 outcome_key,
             };
             if let Some(pending) = read_pending_marker(&engine)? {
-                if pending == queried {
-                    if let Err(error) = clear_pending_marker(&engine, &pending) {
-                        gate.unresolved = Some(UnresolvedMutation {
-                            operation_id: queried.operation_id.clone(),
-                            outcome_key: queried.outcome_key.clone(),
-                            requires_reopen: true,
-                        });
-                        return Err(MetadataError::UnknownOutcome {
-                            operation_id: queried.operation_id,
-                            cause: error.to_string(),
-                        });
-                    }
-                } else if outcome.is_none()
-                    && read_domain_value(&engine, &pending.outcome_key)?.is_some()
-                {
+                let pending_outcome_is_resolved = pending == queried
+                    || (outcome.is_none()
+                        && read_domain_value(&engine, &pending.outcome_key)?.is_some());
+                if pending_outcome_is_resolved {
                     if let Err(error) = clear_pending_marker(&engine, &pending) {
                         gate.unresolved = Some(UnresolvedMutation {
                             operation_id: queried.operation_id.clone(),
