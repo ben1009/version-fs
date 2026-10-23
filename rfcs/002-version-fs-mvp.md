@@ -307,6 +307,7 @@ trait MetadataTxn {
 | --- | --- |
 | Atomic multi-key commit | The complete write set commits together, including reference, Generation, retention, and operation-outcome records. No partial commit is visible. |
 | Serializable point transactions | Point reads, including missing/deleted keys and read-your-writes, participate in conflict validation. Concurrent read/write preconditions cannot both succeed when no serial execution permits them. |
+| Commit-linearized lease checks | Every write authorized by a lease revalidates that lease against the authority owner's clock at the transaction serialization/commit decision. An earlier closure read alone cannot authorize the commit; an expired lease rejects the complete write set. |
 | Fresh authoritative reads | New gets, transactions, and snapshot acquisition observe commits completed before they begin. An explicitly held snapshot retains its earlier boundary. Stale caches/replicas are not authoritative reads. |
 | Durable commit and recovery | Success waits for the selected backend's durable commit boundary. Reopening its preserved storage recovers every acknowledged complete transaction. Memory-only visibility is insufficient. |
 | Consistent prefix scans | Every page uses one read-only snapshot, with bytewise ordered keys and an explicit cursor/end. Losing that snapshot is an error, never a silent switch to current state. |
@@ -317,11 +318,17 @@ metadata reads and buffered mutations, and MAY read the authority owner's
 monotonic lease clock. The clock is a trusted local input, not an external side
 effect. Lease-dependent preconditions MUST use a fresh clock reading on every
 transaction attempt, including retries; a value captured before `transact` or
-by an earlier attempt MUST NOT authorize a new mutation. The closure performs
-no S3 I/O, command execution, local file mutation, or allocation of a new logical
-operation ID on retry. Unknown commit outcomes cannot be retried as fresh
-operations. Deleting a metadata key is unrelated to physical object deletion;
-v0 still issues no S3 DELETE.
+by an earlier attempt MUST NOT authorize a new mutation. In addition, after
+closure evaluation and conflict validation, `transact` MUST revalidate each
+lease-dependent precondition at its serialization/commit decision using the
+authority clock. The lease check and commit decision form one logical
+linearization point: if the lease is expired there, the complete transaction is
+rejected; a later durability acknowledgement does not invalidate a transaction
+that linearized while the lease was valid. The closure performs no S3 I/O,
+command execution, local file mutation, or allocation of a new logical operation
+ID on retry. Unknown commit outcomes cannot be retried as fresh operations.
+Deleting a metadata key is unrelated to physical object deletion; v0 still
+issues no S3 DELETE.
 
 Mutating transactions use point keys. Prefix scans are for read-only snapshots,
 listing, and reports; their results cannot act as transactional absence or
@@ -424,8 +431,12 @@ Expiry uses the authority owner's trusted lease clock, with an injectable clock
 for deterministic tests; it does not require a database time function or GTS.
 Every attempt that authorizes a mutation or renewal reads the clock inside the
 transaction body and re-evaluates lease validity using that attempt's metadata.
-A retry after expiry cannot reuse an earlier valid time. Returning an existing
-terminal operation result still follows Section 5.3 and grants no new rights.
+A retry after expiry cannot reuse an earlier valid time. The body check is an
+early rejection only; the Metadata Authority repeats the lease check at the
+serialization/commit decision required by Section 5.1. A mutation is authorized
+according to that decision point, even if durable acknowledgement arrives later.
+Returning an existing terminal operation result still follows Section 5.3 and
+grants no new rights.
 Clock comparisons cannot regress within an owner incarnation. Before serving
 after restart, the owner advances its durable incarnation. Old lease grants
 cannot authorize new requests across that boundary; workers reacquire their
@@ -1076,6 +1087,7 @@ are no fake mount or Git-server commands before those adapters exist.
 | Acquire/create reply is lost | Return the original writer grant or branch ID; allocate no replacement on replay. |
 | Authority owner restarts | Recover acknowledged metadata atomically, advance the owner incarnation before serving, and reject old lease grants. |
 | Authority reports a definite transaction conflict | Retry metadata logic with the same operation ID; repeat no S3 or local side effects inside the closure. |
+| Lease expires after closure evaluation | Revalidate at the serialization/commit decision; reject the complete write set with no partial publication, head movement, or live-root change. |
 | Commit error may follow durable application | Treat the result as unknown; recover/query the operation record, never assume every backend error means abort. |
 | Import setup is interrupted or its reply is lost | Reconcile the recorded base protection and local binding under the same ID; do not claim imported file bytes are remotely durable. |
 | Base-protection renewal reply is lost | Retry the same renewal ID or query it; preserve local files until the result is known. If the worker stops renewing, the five-minute protection expires and is removed; the old handle cannot checkpoint until explicitly rebound by a new import under current branch preconditions. |
@@ -1282,6 +1294,11 @@ cases include:
 - A lease is valid on the first transaction attempt, which conflicts; advance
   the injected clock past expiry before retry. The next attempt must read time
   again and reject a new mutation or renewal under the expired grant.
+- Evaluate a lease-dependent mutation while its lease is valid, then advance
+  the injected clock past expiry after the closure returns but before the
+  serialization/commit decision. The commit-time check rejects the complete
+  transaction with no partial writes. Also verify a transaction that linearizes
+  before expiry remains committed if its durable acknowledgement is delayed.
 - Authority crash before and after durable commit, a conflict during a retried
   transaction closure, and an error after possible commit. Recover one complete
   metadata outcome through the adapter; old-incarnation grants stay fenced.
