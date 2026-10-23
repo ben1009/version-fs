@@ -28,9 +28,9 @@ worker B
 
 The authority has separate preserved storage. Also demonstrate that acknowledged
 FLUSH/FUA boundaries newer than the last Generation survive worker loss via the
-branch's live VolumeRoot. A raw block cut, a frozen filesystem checkpoint, and an
-application-consistent checkpoint are distinct promises; the MVP provides only
-the declared block/filesystem boundaries.
+branch's live VolumeRoot. A raw block cut, a frozen or clean-unmounted filesystem
+checkpoint, and an application-consistent checkpoint are distinct promises;
+the MVP provides only the declared block/filesystem boundaries.
 
 The scope is [RFC-002 Section 2](../rfcs/002-version-fs-mvp.md#2-release-scope).
 Native logs and artifacts remain first-class views. Native file-tree capture,

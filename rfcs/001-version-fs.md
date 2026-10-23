@@ -473,10 +473,12 @@ conditions hold.
 
 ### 11.2 Failure and retry
 
-Before publication, a failed attempt leaves the prior authoritative state in
-place. After publication, the new Generation remains authoritative even if the
-worker crashes or loses the reply. Auxiliary preparation or commit markers do
-not override the authoritative outcome.
+Before Generation publication, a failed capture leaves the prior published
+Generation and branch head in place. Separately committed durable live-view
+updates remain authoritative according to their own outcomes; capture failure
+does not undo them. After publication, the new Generation remains authoritative
+even if the worker crashes or loses the reply. Auxiliary preparation or commit
+markers do not override the authoritative outcome.
 
 A timeout can leave the outcome unknown to the caller. Recovery must distinguish
 an unknown result from a rejected operation before retrying or releasing
@@ -486,10 +488,6 @@ logical mutation twice.
 Publishing one boundary must not discard writes outside that boundary. A
 failed or stale attempt must preserve unpublished work for explicit recovery
 under the adapter's contract.
-
-A failed Generation capture does not undo separately acknowledged durable live
-updates made during preparation. Publication and live-view durability have
-separate authoritative outcomes.
 
 ## 12. Fork, rollback, promotion, and deletion
 
