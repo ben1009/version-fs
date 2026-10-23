@@ -15,7 +15,9 @@ and a disposable cache. Transactional databases remain separate systems.
 
 - [RFC-001: Version FS Architecture](rfcs/001-version-fs.md)
 - [RFC-002: Version FS MVP](rfcs/002-version-fs-mvp.md)
+- [MVP Implementation Plan](docs/mvp-implementation-plan.md)
 
 The project is at the design stage. RFC-001 defines the architecture and core
 semantics; RFC-002 proposes the first implementation and release criteria. Both
-are drafts. This repository does not yet contain an implementation.
+are drafts. The implementation plan translates RFC-002 into ordered work packages
+and completion evidence. This repository does not yet contain an implementation.
