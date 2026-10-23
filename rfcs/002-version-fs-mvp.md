@@ -15,18 +15,19 @@ another worker without copying its complete state for every version. It
 implements the Generation semantics and invariants of RFC-001 using:
 
 - Immutable, checksummed objects in Amazon S3 Standard.
-- Persistent copy-on-write metadata trees and fixed-size file chunks.
+- A versioned block-volume view with a persistent copy-on-write extent map.
 - A transactional Metadata Authority for publication, references, fencing, and
   retention, with toy-kv-engine as the first backend.
 - One active writer per branch.
-- A native SDK and CLI, with managed local directory materialization.
+- A native SDK and CLI, with a Linux ublk block server and ext4 as the reference
+  filesystem consumer.
 - Native ordered logs using S2 as the semantic reference.
 - Explicit retention, pins, reader protection, and mark-only reachability reports.
 
 A successful demonstration is:
 
 ```text
-worker A: materialize G0 -> edit files + append events -> checkpoint G1
+worker A: attach volume -> format/mount ext4 -> write + append -> checkpoint G1
                                                                |
                                       fork candidate branches --+
                                                 |
@@ -34,11 +35,23 @@ worker A: materialize G0 -> edit files + append events -> checkpoint G1
                                                 |
                                       conditionally promote G2
                                                 |
-worker B: empty cache -> open G2 -> read files, logs, and artifacts
+worker B: empty cache -> attach G2 on a fork -> mount -> files/logs/artifacts
 ```
 
 Worker A can be destroyed after successful publication. Worker B needs neither
 its disk nor any ancestor Generation to resolve G2.
+
+The block volume is one first-class Version FS view alongside native ordered
+logs and artifacts. Version FS remains a Generation-based state system. The
+block-volume interface is filesystem-agnostic: ext4 is the reference consumer,
+not a required internal format or the definition of Version FS correctness.
+Other filesystems or block-aware engines may consume this interface after
+qualification. PostgreSQL, SQLite, and RocksDB ordinarily access it through a
+filesystem; this RFC provides no raw-block database adapter.
+
+This revision replaces the directory-scanning filesystem adapter with a block
+adapter. Native namespace capture, pathname APIs, and filename-level diff are
+deferred; the first implementation observes changed block ranges directly.
 
 This RFC selects mechanisms for v0. RFC-001 remains the authority for system
 semantics; implementation shortcuts cannot weaken its invariants. Numerical
@@ -52,25 +65,28 @@ or achieved performance.
 | Area | MVP behavior |
 | --- | --- |
 | Objects | Typed SHA-256 identity, verified reads, idempotent uploads, workspace-local sharing. |
-| Metadata | Persistent namespace, file-chunk indexes, log indexes, and root maps. |
+| Metadata | Persistent volume-extent map, artifact-chunk indexes, log indexes, and root maps. |
 | Authority | Backend-independent transactional contract, implemented by `ToyKvMetadataAuthority` for the MVP. |
 | Generations | Complete immutable roots; branch-attached and detached publication; operation outcome lookup. |
-| Filesystem | Regular files, directories, symlinks, declared metadata, range reads, full local materialization. |
+| Block volume | One fixed-capacity volume per workspace, sparse zero extents, range reads, dirty-extent tracking, and fenced writable attachment. |
+| Filesystem | Linux ublk device with ext4 reference formatting/mounting; filesystem operations and metadata are implemented by Linux. |
 | Branches | Create/fork, checkpoint, conditional head movement, rollback, promote, delete, writer fencing. |
 | Logs | Atomic durable batch append, conditional tail, receipts, historical reads, live cursors, retention-safe trim. |
 | Artifacts | Named immutable payloads and explicit log attachments, sharing the object layer. |
-| Git | Capture and restore a self-contained repository directory, including `.git`. |
-| Recovery | Fresh-worker reads and materialization; interrupted operations resolved from durable authority. |
+| Git | Preserve self-contained worktree and `.git` bytes inside the volume; no Git protocol or object translation. |
+| Recovery | Fresh-worker volume attachment and lazy extent reads; interrupted operations resolved from durable authority. |
 | Retention | Recent-Generation retention, explicit pins, protected workspace bases and readers. |
 | GC report | Snapshot retained/protected roots, traverse reachability, and report observed unreachable objects without deleting bytes. |
-| Tooling | SDK and CLI for the workflow in Section 1; structural namespace diff. |
+| Tooling | SDK and CLI for the workflow in Section 1; structural extent-range, log-view, and artifact diff. |
 
 ### 2.2 Deferred capabilities
 
-The MVP does not implement FUSE, virtio-fs, a Git server or smart protocol,
+The MVP does not implement a native file-tree scanner/materializer, pathname
+read/list/stat APIs, semantic filesystem diff, FUSE, virtio-fs, a Git server or smart protocol,
 semantic merge, concurrent writers on one branch, physical object deletion,
 online reclamation, cross-region writable branches, compression, content-defined
-chunking, automatic autosave, or a remote mutation WAL for local file writes.
+chunking, volume resize, multi-volume atomic checkpoints, discard/TRIM,
+automatic autosave, or a remote mutation WAL for unflushed block writes.
 The v0 object store only grows. Safe reclamation and deletion fencing belong
 in a follow-up RFC, tentatively RFC-003: Safe Object Reclamation.
 
@@ -88,9 +104,11 @@ implementing it and operating a replicated metadata service are not MVP gates.
 ## 3. Components and deployment
 
 ```text
-                     SDK / CLI / managed command runner
+                     SDK / CLI / checkpoint coordinator
                                   |
-                   materialized directory + local cache
+              ext4 consumer -> /dev/ublkbN -> block server
+                                  |
+                       dirty extents + verified cache
                                   |
                      Version FS service and builders
                        /                       \
@@ -110,6 +128,20 @@ execution. The single-owner MVP adapter may serialize the short metadata commit
 region with an authority-level gate, but does not hold it during preparation or
 object transfer. The domain protocol does not require one Version FS lock across
 preparation. Scaling the API tier and partitioning authority are later work.
+
+The first block adapter uses Linux
+[ublk](https://docs.kernel.org/block/ublk.html). Pin and qualify the kernel,
+userspace binding, queue parameters, and filesystem tools before release.
+NBD may be used for an exploratory prototype, but does not replace the ublk
+release gate. Kernel mounts and device administration require an appropriately
+configured worker; the block server is not a sandbox or process-memory runtime.
+
+[Fly.io's Sprites Block Device design](https://fly.io/blog/sprites-block-device/)
+is a reference for placing ext4 above an object-backed block device. The article
+describes NBD, local caching, checksummed remote blocks, and volume checkpoints.
+Version FS chooses its own ublk adapter and publication protocol and retains
+native log/artifact views; it does not inherit Fly's implementation or performance
+guarantees.
 
 ### 3.1 MVP metadata backend
 
@@ -202,75 +234,95 @@ by a verified GET or a retry of the identical bytes. It is never treated as
 publication.
 
 All individual objects are bounded by the sizes below, so multipart upload is
-unnecessary for v0. Large artifacts use the file-chunk representation. Object
+unnecessary for v0. Large artifacts use the artifact-chunk representation. Object
 listing is useful for inventory and GC, never for discovering published
 Generations.
 
 ### 4.2 Persistent maps
 
 The MVP uses a persistent ordered B+ tree with nodes of at most 64 KiB. Mutations
-copy affected leaves and ancestors; insertions split nodes by encoded size.
-Rebuilding or repartitioning the entire map on every checkpoint is prohibited.
-Stable unchanged nodes retain their object identities.
+copy affected leaves and ancestors; insertions split by encoded size. Unchanged
+nodes keep their identities. Rebuilding the full volume map per flush or
+checkpoint is prohibited.
 
 | Map | Key | Value |
 | --- | --- | --- |
-| Filesystem namespace | Normalized relative path | Entry type, metadata, and content reference. |
-| File chunks | Chunk number | Chunk reference and actual length. |
+| Volume extents | Logical extent number | Immutable extent reference; an absent entry means zeros. |
+| Artifact chunks | Chunk number | Chunk reference and actual length. |
 | Logs | Log name | Stable log ID, visible sequence range, and segment-index root. |
-| Segment index | Batch starting sequence number | Exclusive end and sealed-segment reference. |
-| Artifacts | Artifact name | File/blob representation and declared dependencies. |
+| Segment index | Batch starting sequence | Exclusive end and sealed-segment reference. |
+| Artifacts | Artifact name | Blob/chunk representation and declared dependencies. |
 
-The namespace contains explicit directory entries, including empty directories;
-the root directory is explicit as well. Prefix iteration implements directory
-listing. A directory rename changes the keys of its descendants and can cost
-proportional to that subtree in v0. File-chunk and log indexes are trees, not
-ever-growing arrays embedded in one manifest object.
+Diff skips equal identities and compares differing ranges; sorted merge handles
+changed tree boundaries. Its volume results are changed logical byte ranges,
+not file paths. Native log ranges and named-artifact changes remain inspectable
+without interpreting a filesystem image.
 
-Diff skips equal object identities and compares differing ranges. Node splits
-can change tree boundaries; a sorted merge fallback preserves correctness.
-The worst case visits the complete compared namespace.
+### 4.3 Volume representation
 
-### 4.3 File and artifact contents
+v0 has one fixed-capacity volume per workspace, shared geometrically by its
+branches. Capacity is selected at creation, is a positive multiple of 64 KiB,
+and cannot change in v0. The initial logical sector is 4 KiB; storage extents
+are 64 KiB. These are Version FS choices, not ext4 or ublk universal limits.
 
-| Encoded content size | Representation |
-| --- | --- |
-| Up to 64 KiB | One immutable blob. |
-| Larger | Fixed 4 MiB chunks, a possibly shorter final chunk, and a persistent chunk index. |
+```text
+VolumeRoot {
+    format_version,
+    capacity_bytes,
+    logical_sector_bytes: 4096,
+    extent_bytes: 65536,
+    extent_map_root,
+}
+```
 
-A file manifest records its logical length and representation. Empty files
-have a defined empty blob. Content beyond the logical end is never exposed.
-A range read fetches and verifies each intersecting complete chunk before
-returning the requested slice. Partial unverified object reads are not exposed.
+Each present extent references exactly 64 KiB of immutable data. Unmapped
+extents read as zeros; bytes beyond capacity are rejected. A partial-extent
+write reads or reuses the previous verified extent, changes the requested
+sectors, and creates a new extent at persistence. Fully zero extents may be
+represented by absence. Sharing is by immutable identity, not parent replay.
+Filesystem free space does not imply unmapped extents. With discard disabled,
+unlinking a file does not reclaim its old blocks or S3 objects; Version FS does
+not infer allocation state by parsing the filesystem.
 
-A small overwrite in a large file can reuse all unaffected chunks. An insertion
-that shifts later fixed boundaries can rewrite the suffix; this tradeoff is
-accepted. Sparse holes are materialized as bytes; preserving physical sparseness
-is deferred.
+Dirty-sector/extent tracking comes from admitted block writes. No directory
+scan, inode discovery, or filesystem parse is needed to discover the storage
+delta. A 4 KiB write can still upload 64 KiB plus changed map nodes; filesystem
+journals can dirty additional extents. Report application bytes, device bytes,
+dirty extents, and uploaded bytes separately.
 
-### 4.4 Complete Generation descriptor
+### 4.4 Native artifact contents
+
+Artifacts remain native objects, independent of the volume's on-disk format.
+Payloads up to 64 KiB use one blob; larger payloads use fixed 4 MiB chunks and
+a persistent chunk index. Logical length bounds reads. Verify every intersecting
+complete object before returning a range. An empty artifact has a defined empty
+blob. Log attachments are explicit typed edges, not hashes inside opaque text.
+
+### 4.5 Complete Generation descriptor
 
 ```text
 GenerationDescriptor {
     format_version,
     generation_id,
     parent_generation_id?,   // lineage, not a required object edge
-    filesystem_root,
+    volume_root,
     logs_root,
     artifacts_root,
-    git_view: captured_repository_files | none,
-    created_at,              // informational, not a global version coordinate
+    capture: { mode, volume_boundary_id },
+    created_at,              // informational, not a global coordinate
 }
 ```
 
-Generation IDs are opaque UUIDs allocated once per checkpoint operation.
-The descriptor is itself an immutable checksummed object. Its root references
-resolve complete current state. No descriptor refers to a parent as the source
-of missing file entries, chunks, or log records.
+Generation IDs are opaque UUIDs allocated once per checkpoint. The descriptor
+is immutable and checksummed. Its volume, log, and artifact roots resolve
+complete declared state without an ancestor descriptor or replay journal.
+Filesystem and Git bytes reside inside the volume; no native namespace/Git
+index is inferred. Capture mode records the actual protocol used in Section 6.
 
-A Metadata Authority catalog entry binds the Generation ID to its descriptor
-object and publication result. Uploading the descriptor creates no visible
-Generation.
+The authority catalog binds a Generation ID to its descriptor and publication
+result. Uploading a descriptor creates no visible Generation. A live durable
+volume root is also not automatically a Generation or a coordinated log/artifact
+checkpoint.
 
 ## 5. Control metadata and operation identity
 
@@ -370,17 +422,18 @@ conformance gates; source inspection alone is not that evidence.
 | --- | --- |
 | Workspace | Stable ID, access scope, and retention policy. |
 | Authority owner | Durable incarnation used to fence lease grants across owner restart. |
-| Branch | Stable ID, unique live name, head Generation, revision, writer epoch/lease, stream epoch, live log-map root. |
+| Branch | Stable ID/name, head Generation, revision, writer epoch/lease, volume and stream epochs, live VolumeRoot/log-map root, active attachment, and capture token. |
 | Name / retention indexes | Point-key name bindings and per-Generation eligibility guards, updated atomically with their referenced records. |
 | Generation | Descriptor reference, publication operation, retention deadline, lifecycle state. |
 | Operation | ID, request fingerprint, phase, allocated identities, prepared dependencies, terminal result. |
-| Protection | Pins, reader leases, workspace bases, and preparation roots. |
+| Protection | Pins, reader leases, attachment base roots, and preparation dependencies, including capture/flush children. |
 | GC report | Report ID, root snapshot/time, inventory window, completeness, and candidate summary/pages. |
 
 These are logical records encoded as versioned keys and values. Branch IDs,
-workspace IDs, and stream epochs are never reused. Deleting and recreating a
+workspace IDs, and attachment IDs are never reused. Volume and stream epochs
+are never reset or reused within their branch. Deleting and recreating a
 branch name creates a new branch ID. Every head or live-view mutation increments
-its state revision, including durable changes to its live log map. Lease-only
+its state revision, including durable changes to its live volume or log map. Lease-only
 renewal does not change this revision. Writer ownership changes advance the
 writer epoch. Comparing only head Generation IDs is insufficient for CAS.
 
@@ -398,6 +451,12 @@ Every authoritative mutating SDK operation carries an opaque `operation_id`,
 scoped to its workspace and authenticated caller. An append uses `append_id` as
 its operation ID, not as a second deduplication mechanism. The caller durably
 records the ID before sending a request.
+
+The block server generates internal operation IDs for durable barriers and records
+the attachment, covered I/O boundary, and sealed dirty version outside the exported
+volume before sending them. A retried barrier cannot substitute another root.
+Ordinary local READ/WRITE requests do not each create permanent remote operation
+records; durable root changes, including every FLUSH/FUA commit, do.
 
 ```text
 ABSENT -> PREPARING -> COMMITTED(result)
@@ -419,7 +478,7 @@ executable again. Results include the created branch ID, writer grant,
 Generation, append range, pin, or resulting revision as applicable.
 
 This is a monotonically growing metadata class: every append and other
-authoritative mutation, including writer lease, base-protection, and preparation
+authoritative mutation, including volume barriers, writer lease, base-protection, and preparation
 renewals, keeps an idempotency record even after its log range is trimmed or its
 Generation expires. v0 provides replay-safe idempotency for the workspace
 lifetime at this storage cost. Bounded deduplication windows and safe result
@@ -473,173 +532,172 @@ a valid grant does not authorize a later commit after handover. An authorized
 forced handover advances the epoch before granting the replacement writer. Release,
 branch deletion, and head-reset operations revoke the old grant.
 
-The SDK serializes data/head mutations for one branch and permits one checkpoint
-or log-mutation preparation at a time there. Writer/base-protection renewals,
-preparation heartbeats, and operation query/abort remain available during a
-long preparation or a closed workspace gate. Server-side CAS and fencing remain
-required even if clients violate this convention. Different branches proceed
-independently.
+The SDK sequences authoritative volume barriers, log mutations, and head changes
+for one branch. A registered checkpoint capture token blocks other external
+head/live-view mutations; its identified drain-flush children remain permitted
+until sealing. Each final transaction checks token ownership and phase. Writer/
+base-protection renewals, preparation heartbeats, and outcome query/abort remain
+available while capture or a durable barrier holds admission. Explicit ownership
+handover can fence the capture; expiry cleanup clears a token only after its
+operation is durably aborted or otherwise resolved. CAS/fencing remain required
+against clients that violate SDK admission. Different branches prepare independently.
 
-## 6. Managed filesystem workspace
+## 6. Versioned block-volume view
 
-### 6.1 Supported state
+### 6.1 Device contract and filesystem boundary
 
-The materialized adapter initially targets Linux. Paths are case-sensitive,
-normalized relative UTF-8 paths; components are at most 255 bytes and paths at
-most 4096 bytes. Empty interior components, NUL, `.` and `..` are rejected.
-The root has its own distinguished key. The adapter never follows a symlink
-while walking a captured tree.
+The block server exposes a fixed-capacity Linux ublk device backed by a complete
+VolumeRoot plus a mutable dirty overlay. Initial requests are sector-aligned
+READ, WRITE, and FLUSH, with correctly negotiated FUA/preflush behavior. Start
+with one hardware queue and one ordered mutation stream per writable attachment;
+additional queues require an equivalent device-wide barrier protocol.
 
-The supported metadata is entry type, file length, permission bits `0777`,
-modification time, and symlink target. Restore creates entries under the current
-user. Owner IDs, ACLs, extended attributes, special permission bits, devices,
-sockets, FIFOs, and hard-linked regular files are unsupported. Capture rejects
-such state explicitly instead of silently changing it. Access time and inode
-identity are outside the declared view.
+Reject out-of-range/unaligned requests and unsupported commands. Do not advertise
+discard/TRIM, resize, write-zeroes, secure erase, or atomic multi-sector writes.
+Ordinary zero-valued writes work normally. Device geometry and limits must match
+the qualified kernel/userspace binding; unsupported required features fail setup.
 
-Symlink targets are stored as text, not imported dependencies. The materializer
-uses directory-relative operations without following existing links and writes
-into a fresh staging directory. It never writes through a captured symlink.
-An external symlink target remains external after restore. Managed commands
-can follow it to host paths permitted by their operating-system credentials;
-the no-follow capture/materialization rules do not confine command execution.
+ext4 is the first reference filesystem, with its journal inside this volume.
+Linux implements inodes, hard links, symlinks, permissions, xattrs, rename, sparse
+files, mmap, and journal recovery under the tested ext4 configuration. Version
+FS preserves block bytes and ordering; it does not independently implement or
+promise those filesystem semantics for every consumer. Multi-device filesystems,
+external journals, and dependencies outside the volume are outside the reference
+restore guarantee. A filesystem UUID is not a Version FS branch identity.
 
-### 6.2 Capture boundary
+A self-contained Git repository works through ordinary filesystem calls. Git
+alternates, external worktree state, and database/WAL bytes outside the volume
+are external dependencies unless separately captured. A database using ext4 is
+a filesystem workload, not a native Version FS database participant.
 
-The writable workspace is a local directory associated with a protected base
-Generation and a writer grant. Its files are mutable overlay state even when
-they were originally materialized from immutable objects.
-Local control records and caches live outside the captured directory so grants,
-pending-operation state, and cached objects do not become workspace contents.
+### 6.2 Attachment, overlay, and fencing
 
-The managed runner coordinates execution and checkpoint boundaries. It is not
-a security sandbox. Managed commands are trusted with the worker filesystem
-under their operating-system credentials. Accesses through external symlinks
-or absolute host paths, and other external effects, are outside captured
-Version FS state. The gate does not provide process or filesystem containment;
-a sandboxed runner is a future adapter.
+`attach_volume` binds a branch's current live durable VolumeRoot to a new stable
+attachment ID under its exact writer grant and volume epoch. One writable
+attachment is active per branch. A fork gets an independent writable identity;
+reset, detach/replacement, and ownership handover fence the previous attachment.
+Every durable root replacement validates that identity and the writer lease.
 
-The managed runner admits write commands and SDK file mutations through one
-workspace gate. A checkpoint closes that gate, waits for admitted commands and
-their write-capable descendants to finish, drains log requests, and prevents
-new file mutations and appends until the outcome is resolved. Long-lived
-background writers are unsupported. An imported directory requires an explicit
-caller quiescence contract; the scanner cannot infer that contract from stable
-file sizes or timestamps.
+The worker records the attachment, base root/protection, pending operation IDs,
+and capture/freeze intent outside the exported volume. Control files, block-server
+state, and heartbeat workers must not depend on the filesystem they freeze.
+A base protection is renewed every minute and expires after five minutes.
+Replaying a renewal returns its original deadline. Expiry requires explicit
+reattachment; an old attachment cannot silently rebind to a newer root.
 
-Once all producers are quiesced, the service captures the branch revision and
-live log-map root, then scans the directory while the gate remains closed.
-Consequently files, artifacts, and the selected log ranges describe the same
-interval without admitted mutation. An unsupervised write invalidates the
-capture contract; observed changes during the scan cause capture to fail.
-A successful scan is not presented as proof that arbitrary external writers
-were absent.
+READ resolves the latest admitted dirty extent, then the immutable base map,
+then a verified local/remote object. Ordinary WRITE completion acknowledges the
+local volatile overlay only. Dirty bytes are not disposable clean-cache entries
+and cannot be evicted before persistence or a definite, explicit discard.
+Background uploads may prepare immutable extents, but cannot by themselves
+advance authoritative state or justify a durable acknowledgement.
 
-v0 keeps the gate closed through upload and publication. It does not implement
-concurrent next-overlay writes during checkpoint. On a lost reply it queries or
-aborts the original operation before reopening the gate. On rejection the local
-directory remains available for explicit salvage; it is never cleared merely
-because a lease or CAS check failed.
+Once fencing, lease/protection expiry, or unrecoverable server failure is known,
+the old device stops accepting writes and fails persistence requests. It must
+not hot-switch its backing root beneath a mounted filesystem. Preserve available
+dirty state for explicit salvage; unmount/stop and create a fresh attachment for
+normal use. Transparent ublk server reissue/recovery is deferred in v0.
 
-This boundary is not an application database snapshot. A live database directory
-requires that database's export or quiescence protocol before capture. Process
-memory, open connections, and external side effects are not captured.
+### 6.3 FLUSH, FUA, and remote durability
 
-### 6.3 Initial directory import
+The device advertises a volatile write cache honestly. The Linux
+[cache-control contract](https://docs.kernel.org/block/writeback_cache_control.html)
+requires preflush to persist earlier writes before its dependent write, and
+FUA to make its flagged write durable before completion. The adapter must
+negotiate native FUA or the kernel's supported flush-based emulation; it must
+never ignore either condition or claim a nonvolatile cache while acknowledging
+only local dirty bytes.
 
-`import_directory` attaches an existing worker-local directory as a managed
-workspace; it does not publish its contents. Its SDK inputs are:
+For this MVP, the persistence boundary for successful FLUSH/FUA is S3 plus the
+authority's durable live-volume-root replacement, not the worker disk:
 
-```text
-import_directory {
-    operation_id,
-    branch_id,
-    expected_revision,
-    grant,
-    source_directory,
-    quiescence_ack,
-}
-    -> ManagedWorkspaceHandle { local_handle_id, branch_id, base_generation,
-                                base_protection_id }
-```
+1. Sequence the barrier after the writes it covers. Stop later writes from
+   mutating that sealed extent version until the barrier outcome is resolved.
+2. Persist an internal operation ID and barrier boundary outside the volume;
+   register a protected preparation with the exact attachment, old live root,
+   volume epoch, branch revision, and writer grant.
+3. Upload changed extents and copied map nodes; verify the complete root through
+   trusted builder dependencies. Do no S3 I/O inside a metadata transaction.
+4. Atomically CAS the branch's live VolumeRoot, advance its revision, record the
+   barrier receipt, and close preparation. Recheck lease validity at Section 5.1's
+   logical serialization point. Acknowledge the kernel only after durable success.
 
-`source_directory` is resolved by the worker SDK, not opened as a path on the
-remote service. The caller holds it quiescent through setup and agrees to route
-subsequent writers through the managed gate. The SDK verifies the directory
-binding, records the operation and worker/directory identity outside that
-directory, and obtains a protected base under the current branch revision and
-grant. It atomically installs the local control record before returning a
-usable handle. A matching retry reconciles the recorded protection/result and
-returns the same local handle; it cannot substitute a different worker/directory
-identity under the old operation ID. Replay does not renew an expired base
-protection.
+The initial FUA implementation may persist the entire preceding ordered dirty
+prefix, a stronger guarantee than persisting only its flagged write. A preflush
+write must not execute its dependent payload before the preflush succeeds.
+These boundaries apply across the device, not merely to one upload task.
 
-The worker SDK owns `base_protection_id` while its managed workspace handle is
-open. It renews the protection every minute with a five-minute expiry. A renewal
-uses its own operation ID; replay returns that renewal's original expiry and
-does not extend it again. `close_workspace` quiesces the local gate, resolves or
-definitively aborts any active capture, then releases the base protection. It
-does not publish or delete the branch. If a worker disappears, the protection
-expires. Expired protection is no longer a retention root and the authority
-removes it during ordinary cleanup; an abandoned import therefore cannot
-retain its Generation indefinitely.
+A lost reply is resolved with the same internal operation ID. An unknown commit
+is never converted to successful I/O or retried as a new barrier; later dependent
+writes remain blocked or fail explicitly. Replay can reveal an already committed
+barrier, but does not renew expired rights. A fresh writable attachment resumes
+from the current live root even when it is newer than the branch's last Generation.
+Older flush roots are not permanent historical snapshots; later writes/reset may
+replace them. Only retained Generations/pins provide that historical guarantee.
 
-If renewal has an unknown outcome, the SDK retries that same renewal ID or
-queries its result while preserving local files. After the protection expires,
-the old handle cannot checkpoint against its base. Rebinding requires a new
-`import_directory` operation under current branch preconditions. If the branch
-head moved, the caller must explicitly choose whether to import onto that head
-or salvage the old local work; the SDK never silently changes the base.
+### 6.4 Checkpoint consistency modes
 
-The imported directory supplies the complete local filesystem view. Relative
-to a nonempty base, absent files are deletions at the next checkpoint. Import
-does not reset live logs or the named-artifact view. Its result acknowledges
-the local binding and base protection, not remote durability of file bytes:
+| Mode | Captured boundary | Guarantee |
+| --- | --- | --- |
+| `block_cut` | Drain admitted block requests and durably flush one exact device cut. | Complete block state respecting acknowledged ordering; mounted filesystems/applications may need crash recovery. |
+| `filesystem_frozen` | Quiesce participating producers, successfully freeze the reference filesystem, drain/flush the device, then capture. A clean unmount is also an explicit supported filesystem boundary. | A stable filesystem image under the qualified freeze/unmount protocol; no automatic application transaction guarantee. |
 
-```text
-create_workspace -> empty G0
-acquire_writer
-import_directory("/repo", quiescence_ack) -> managed local workspace
-checkpoint(managed local workspace)      -> durable G1
-```
+The mounted ext4 CLI workflow uses `filesystem_frozen`. Freeze support follows
+[fsfreeze](https://man7.org/linux/man-pages/man8/fsfreeze.8.html); ext4's
+[journal recovery](https://docs.kernel.org/filesystems/ext4/journal.html) remains
+the filesystem's responsibility. A block cut alone is not labelled as a frozen
+filesystem snapshot. A shared timestamp, flush, or freeze does not create a
+consistent application/database/process-memory snapshot.
 
-Capture validates the supported state before publication. Host loss before
-checkpoint may lose all imported file changes. Alternatively, `materialize`
-exports a protected Generation to a fresh directory; `import_directory` binds
-that directory to a branch before managed writes. The CLI may compose these
-calls.
+A database needing a particular transaction/WAL boundary must first use its own
+checkpoint/quiescence protocol. v0 records no claim of application consistency
+from merely placing database files on ext4. External services, RAM, connections,
+and side effects are not captured.
 
-### 6.4 Change discovery and materialization
+### 6.5 Coordinating the common Generation boundary
 
-The first scanner enumerates all entries and hashes all regular-file content.
-It compares the result with the protected base and updates only differing
-manifest paths and chunks. Stat information alone is not trusted as evidence
-that bytes are unchanged. Thus scan I/O can be proportional to the whole
-workspace even when new stored bytes are small.
+The trusted worker coordinator gates application commands, native log mutations,
+and named-artifact staging. It drains admitted producers and registers the
+checkpoint's branch capture token/preparation. Other head/live-view mutations
+are rejected as Busy while that token is held. The checkpoint's own device-drain
+flushes are permitted as identified children until the capture is sealed.
 
-`open_generation` and native path/range reads are lazy. They fetch the descriptor,
-required tree nodes, and demanded chunks. Full directory materialization is an
-explicit export: it enumerates and fetches the entire namespace. A local
-directory does not acquire lazy paging merely because the SDK supports lazy
-reads. FUSE and sparse writable materialization are deferred.
+For `filesystem_frozen`, keep block I/O service running while calling freeze:
+freeze itself must be able to write back data/journal blocks and issue flushes.
+Closing the low-level device gate first would deadlock that operation. Once
+freeze succeeds, issue the final durable barrier, close/drain block mutation
+admission, and seal the resulting VolumeRoot, exact log-map root, staged
+artifacts, and resulting branch revision. Child flushes cannot continue after
+sealing. Unmanaged raw writers violate the capture contract.
 
-### 6.5 Git and artifacts
+Hold mutation admission and the filesystem freeze through publication or a
+definite abort. Renew writer, attachment-base, and preparation protection on
+independent workers. On an unknown renewal, pause further uploads/publication
+and reconcile that same renewal ID. Preserve dirty bytes and the freeze intent.
 
-The MVP's Git authority is captured repository files. A quiesced, self-contained
-`.git` directory is captured with the worktree and restored byte-for-byte under
-the filesystem metadata contract. Native Git object/ref translation is absent.
-Git commands run normally in the materialized directory between checkpoints.
+A surviving coordinator/watchdog reconciles a lost publication reply using its
+recorded operation ID before thawing. On fencing, stop/unmount the old attachment
+rather than resuming it against another root. If the worker is gone, restore
+from durable authority on a new worker; do not infer an outcome from a local
+freeze flag. A committed child flush stays committed if the later Generation
+capture aborts; abort never undoes an acknowledged durability barrier.
 
-The adapter rejects Git alternates and external worktree administrative
-directories. Submodule gitlinks and other external repositories are not imported
-automatically. A declared self-contained repository must include the bytes
-required for the Git operations promised by that repository view. No Generation
-is automatically converted into a Git commit.
+The managed runner and coordinator enforce an execution boundary, not a security
+sandbox. Commands retain their OS permissions. Effects through external symlinks,
+host paths, network services, or other devices are outside this captured state.
 
-Named artifacts use the same blob/chunk objects as files. Adding or removing a
-named artifact is a gated local overlay mutation captured by checkpoint. Log
-attachments are explicit object edges in the appended batch; putting a digest
-inside opaque log text does not retain that digest's object.
+### 6.6 Native artifacts and immutable inspection
+
+Named artifacts remain a gated local overlay of explicit payloads/references,
+captured into the native artifacts root at checkpoint. Log attachments are
+explicit durable object edges at append. Neither requires parsing ext4.
+
+A protected Generation may be exposed as an immutable read-only block device.
+Filesystem recovery must never write to that retained root. If a filesystem
+needs journal replay, fork a writable volume and replay there; a read-only
+inspection that cannot proceed without writes fails explicitly. In particular,
+a filesystem mount labelled read-only is not by itself proof that recovery
+will issue no block writes.
 
 ## 7. Ordered log implementation
 
@@ -714,8 +772,8 @@ one branch for a small correctness surface.
 
 ### 7.3 Checkpoint, fork, and trim
 
-After the workspace gate drains appends, a checkpoint binds the existing live
-log-map root. It does not recopy, reseal, or replay historical segments. Because
+After the checkpoint coordinator gates and drains native appends, it binds the
+existing live log-map root. It does not recopy, reseal, or replay historical segments. Because
 each segment is one atomic batch, its captured `next_seq` is a batch boundary.
 An append racing checkpoint belongs entirely before the gate's cut or entirely
 after it reopens.
@@ -759,139 +817,118 @@ receipt. Log deletion and recreation allocate a new log ID.
 
 ### 8.1 Proving a closed durable graph
 
-The service owns the trusted object builder. It hashes and validates bytes,
-checks workspace ownership and encoding, and records durable upload results.
-A client assertion that it uploaded a root is not sufficient.
+The trusted builder hashes and validates object bytes, ownership, type, encoding,
+and durable upload results. A client-supplied root is not proof of durability.
+Each new node references either verified durable objects from its protected
+preparation or shared subtrees from already validated protected roots. Unprotected
+reuse requires complete verified reads/uploads. Validation proceeds bottom-up
+without walking every unchanged protected subtree.
 
-Preparation registers its base Generation, captured live log root, and staged
-objects as protected dependencies. A new manifest node is accepted only if
-every child is either:
-
-- A verified durable object built in the same protected preparation.
-- A shared subtree reachable from an already validated, protected base or log
-  root, selected by the trusted builder.
-
-Arbitrary object IDs supplied by a client are not proofs of protected
-reachability. Reusing otherwise unprotected content requires a complete verified
-read or upload during preparation. Validation proceeds bottom-up over new
-nodes; it need not traverse every unchanged protected subtree on each checkpoint.
-The prepared root and its validation dependencies are recorded durably before
-the final transaction. Immutable keys and the no-deletion backend preserve
-verified bytes; preparation protections track the dependencies until commit
-or a definite abort. No collection admission barrier is needed in v0.
+This applies equally to durable volume barriers, checkpoint descriptors, native
+log roots, and artifact attachments. Required dependencies are protected until
+commit or a definite abort. No object deletion or GC admission barrier exists
+in v0. The parent Generation ID is not a required content edge.
 
 ### 8.2 Capture sequence and preparation lifetime
 
-1. Record the operation ID and capture token locally. Close and drain the
-   workspace gate while maintaining the existing base protection and writer
-   lease. Bind retries to this same frozen capture; if it is lost, abort it.
-2. Register a preparation, allocating its fixed Generation ID and validating
-   branch identity, revision, head, and writer epoch. In that transaction,
-   protect the base and exact live log root. A stale precondition rejects the
-   capture rather than silently changing it.
-3. Scan the quiesced directory, collect named artifacts, and build the persistent
-   complete state.
-4. Wait for durable completion of all new data and metadata objects. Seal the
-   prepared root and upload its Generation descriptor.
-5. Request attached or detached publication using the recorded preparation.
+1. Record the checkpoint ID/freeze intent outside the volume, close application/
+   log/artifact admission, and drain active producers. Register the branch capture
+   token and protected preparation under exact branch/attachment/grant preconditions.
+2. Establish the requested Section 6 boundary. Keep the device serving freeze's
+   I/O; permit only the capture's identified drain-flush children. Each child
+   advances the live root/revision normally and records its own durable outcome.
+3. After the final durable barrier, stop/drain block mutations and seal one
+   immutable tuple of volume boundary/root, log root, artifact input, and the
+   resulting revision. Track only authorized child revision changes; unrelated
+   mutations conflict rather than silently rebasing the capture.
+4. Build/upload new artifact/index nodes and a complete Generation descriptor.
+   The volume root and historical log segments are reused, not rescanned or recopied.
+5. Publish the sealed tuple in one authority transaction, then reconcile the
+   result and local baseline before thawing/reopening admission.
 
-Every protected preparation that spans remote object I/O has a renewable
-ten-minute inactivity deadline. This shared contract covers checkpoint capture
-and log mutations, including append, create, trim, and delete. An operation may
-declare a shorter non-renewable lifetime; otherwise this default applies. The
-SDK sends `renew_preparation` every three minutes for renewable preparations,
-with a fresh renewal operation ID, the prepared operation ID, and its exact
-writer grant. Object upload traffic alone does not extend the deadline. For
-append, the prepared operation ID is `append_id`. The authority extends the
-deadline only while the preparation is nonterminal and the grant, lease, branch
-epoch, and owner incarnation remain valid. Replaying one renewal ID returns its
-original expiry. Renewals cannot revive an aborted operation or a fenced writer.
+Every protected preparation spanning remote object I/O has a renewable ten-minute
+inactivity deadline, with a new identified heartbeat every three minutes. This
+includes checkpoint, volume FLUSH/FUA barriers, and log create/append/trim/delete.
+A capture's internal flush is an authorized child, not a competing external
+capture. An operation may explicitly declare a shorter non-renewable lifetime.
 
-If renewal has an unknown outcome, the SDK retries the same renewal ID or
-queries it before creating another renewal. It pauses further scan and object
-uploads and final publication/root replacement while the result is unresolved,
-and preserves all preparation protections. A checkpoint keeps the workspace
-gate closed; a log mutation keeps its branch admission and protected roots. A
-definite expiry, abort, or fencing result prevents the final authoritative
-mutation. The SDK resolves the prepared operation and its protections before
-release; a checkpoint preserves its local directory for explicit salvage, an
-append returns no receipt, and other log mutations return no updated live root.
-Newly uploaded objects not referenced by other state remain stored as
-preparation garbage. The authority orders expiry/abort and final publication in
-its metadata transactions: a committed result remains committed, while an
-aborted preparation cannot later publish or replace a live root. A deadline
-permits the authority to record an abort; it is not permission to guess an
-unknown transaction outcome or release unresolved protection.
+`renew_preparation(renewal_operation_id, prepared_operation_id, exact_grant)`
+extends only nonterminal preparations under a valid grant/epoch/incarnation.
+Upload traffic does not renew protection. Replaying a renewal returns its recorded
+expiry; an unknown renewal must be retried/queried under the same ID before another
+is allocated. Pause further work while unresolved, keeping the capture freeze or
+barrier admission and dependencies protected.
+
+Expiry permits the authority to record an abort; it never proves an unknown
+transaction did not commit. Abort/expiry and final commit are ordered atomically.
+An aborted operation cannot later publish a Generation or replace a live root;
+committed results remain committed. Definite failure preserves checkpoint/dirty
+state for salvage and returns no successful append/barrier receipt. Late uploaded
+unreferenced bytes remain stored and may appear in mark-only reports.
 
 ### 8.3 Publication transaction
 
-The final transaction reads and validates the branch, authority incarnation,
-operation, and retention/index keys under Section 5.1's contract. It checks
-exact preconditions, the current grant, sealed root proof, and preparation
-state, then atomically:
+Validate authority incarnation, writer/attachment epochs, current lease,
+capture token, sealed roots, exact resulting branch revision, preparation state,
+and retention guards under Section 5.1. Atomically:
 
-1. Creates the published Generation catalog entry and descriptor binding.
-2. Establishes its initial retention deadline.
-3. For attached publication, moves the branch head, advances its revision, and
-   moves the managed workspace's base protection to the new Generation.
-4. Records the immutable operation result and closes preparation protection.
+1. Create the Generation catalog/descriptor binding and initial retention.
+2. For attached publication, move the head, advance revision, and move the
+   attachment's Generation base protection to the new Generation.
+3. Record the immutable operation result, release the branch capture token,
+   and close preparation protection.
 
-For detached publication, step 3 is absent. The same captured state becomes
-visible and retained by Generation ID while the branch head remains unchanged.
-The captured live log map is not reset. Detached publication does not rebase the
-local branch baseline; a later head adoption is a separate conditional operation.
+The already committed live volume/log roots must still equal the sealed roots.
+Detached publication omits step 2: the Generation is visible and retained by ID
+without moving the head or rebasing the attachment's Generation baseline.
+Its preceding durable flushes remain ordinary live-root changes.
 
-Before commit, the old authoritative state remains in force. After commit, the
-Generation is published even if the service crashes before replying. A rejected
-transaction publishes no Generation and makes no partial head movement.
-
-After an attached success, the worker atomically records and syncs its new base
-Generation locally before reopening its mutation gate. Recovery of a lost reply
-uses the operation result, not a comparison with the current branch head. The
-head may have moved again since the operation committed.
+Before the transaction, no uploaded descriptor is published. After commit, the
+Generation is authoritative even if the reply is lost or the head moves again.
+The coordinator queries the operation result, syncs its local baseline where
+applicable, and only then releases the freeze/admission boundary. A failed CAS
+produces no partial Generation/head update and never clears dirty local work.
 
 ## 9. Branch lifecycle and reference operations
 
 ### 9.1 Create and fork
 
-Workspace creation installs an empty Generation and a `main` branch in one
-identified operation after the empty descriptor graph is durable. Branch
-creation takes a retained base Generation and returns a new stable branch ID.
-The transaction verifies retention, copies only the head and live log-root
-references, establishes branch protection, and records the result.
+Workspace creation accepts fixed volume geometry and installs a zero VolumeRoot,
+an empty log/artifact view, an empty Generation, and main after the immutable
+empty graph is durable. Formatting ext4 is an explicit later consumer operation;
+an empty Generation is not falsely presented as a formatted filesystem.
 
-The branch starts without a writer grant. Retrying branch creation after a lost
-reply returns the original branch ID, even if its name has since changed or
-been reused. Branch creation does not enumerate the base namespace, segments,
-or named logs.
+Branch creation takes a retained Generation, allocates a new stable branch ID,
+and copies only its volume/log root references and head. It starts without a
+writer or attachment. No volume extents, filesystem namespace, or log history
+are enumerated. Replay returns the original branch ID despite later name reuse.
 
 ### 9.2 Adopt, roll back, and promote
 
-`move_head` adopts a retained Generation; rollback uses that same operation to
-select older state. Promotion takes a source branch/revision and a destination
-branch/revision. In one transaction it validates both references and selects the
-source's published head as the destination head. The source's uncheckpointed
-live logs and local overlay are not promoted.
+Adoption/rollback selects a retained Generation. Promotion validates source and
+destination stable IDs/revisions in one transaction and adopts the source's
+published head. Uncheckpointed live volume roots, live log appends, and local
+artifact staging are not promoted merely because they belong to that source.
 
-Head reset replaces the destination live log-map root with the selected
-Generation's log map, advances its branch revision, stream epoch, and writer
-epoch, and revokes its old writer grant. If that destination has live log
-changes beyond its head, the caller must explicitly set `discard_live_logs`;
-otherwise the reset is rejected. CAS includes stable branch identity and
-revision, preventing both name-reuse and head-away/head-back ABA.
+Reset replaces destination live volume and log roots from the selected Generation,
+advances branch revision plus volume/stream/writer epochs, and revokes its old
+writer/attachment. If durable live volume or log state differs from the destination
+head, explicit `discard_live_state` is required. Stable identity/revision CAS
+prevents name-reuse and head-away/head-back ABA. An active capture must be resolved
+or explicitly fenced before replacement.
 
-The caller needs current destination write authority. A running local directory
-is never rewritten by a remote reference update. Its old grant cannot publish;
-the user must preserve/export its unpublished work or explicitly materialize
-the new head and acquire a new grant.
+Never switch a mounted device to another root. The SDK requires unmount/stop and
+fresh attachment before using the selected state; local dirty bytes and staged
+artifacts remain available for explicit salvage. Fork and attach a writable clone
+for journal recovery instead of modifying a retained Generation.
 
 ### 9.3 Delete
 
-Deletion validates the expected branch revision and current write authority,
-revokes the writer, removes the live name and branch root, and records the
-outcome atomically. Historical Generations, pins, and readers retain their own
-protection. A new branch with the same name gets a different ID. Retrying the
-old delete operation cannot delete that new branch.
+Deletion validates current write authority/revision, revokes the attachment/writer,
+removes the live name and volume/log branch roots, and records the result atomically.
+Historical Generations, pins, readers, and unresolved operations retain their own
+protections. A replacement name gets a new branch ID; replay of the old deletion
+cannot affect it. Deletion removes no S3 bytes and never forcibly remounts a worker.
 
 ## 10. Retention and reachability reports
 
@@ -905,8 +942,9 @@ Automatic hourly/daily selection and branch expiration are deferred.
 Retained and protected roots include:
 
 - Descriptors and complete graphs of retained Generations and branch heads.
-- Current live log-map roots, including appends not yet in a Generation.
-- Explicit pins, workspace-base protections, and reader protections.
+- Current live VolumeRoots and live log-map roots, including durable barriers
+  and appends not yet captured in a Generation.
+- Explicit pins, attachment-base protections, and reader protections.
 - Prepared objects and dependency roots until their operations have definite
   outcomes or have been durably aborted and fenced.
 
@@ -916,11 +954,11 @@ edges. Reachability marking includes each retained descriptor as well as its
 complete content graph.
 
 Opening a Generation transactionally verifies publication and current retention
-and creates a five-minute renewable read protection. An open mutable workspace
-also protects its selected base under the worker SDK's one-minute heartbeat and
-five-minute lease. Eligibility and protection acquisition are checked in one
+and creates a five-minute renewable read protection. An open writable volume attachment
+also protects its selected base roots under the worker SDK's one-minute heartbeat
+and five-minute lease. Eligibility and protection acquisition are checked in one
 metadata transaction; physically present bytes alone cannot make an expired
-Generation eligible again. Expired workspace-base and preparation protections
+Generation eligible again. Expired attachment-base and preparation protections
 cease to be roots at their deadlines and are removed by authority cleanup,
 without requiring the worker to close normally.
 Renewal does not change the protected root. Remote object reads have a
@@ -986,403 +1024,367 @@ does not require bucket versioning for the MVP.
 
 ## 11. Reads, cache, and recovery
 
-### 11.1 Immutable reads
+### 11.1 Immutable volume and native-state reads
 
-An authorized protected handle resolves the Generation descriptor and selected
-tree paths. It does not consult branch history or fetch ancestor descriptors.
-The trusted resolver serves only objects reachable from the handle's declared
-view; there is no public unauthenticated `GET <digest>` shortcut.
+An authorized protected handle resolves the Generation's volume descriptor,
+selected extent-map paths, log views, and artifact references. Reads do not
+consult ancestors. Unmapped extents produce zeros; present extents are fetched
+and verified in full before slicing. No unauthenticated or arbitrary-digest
+object-read endpoint is exposed.
 
-Cache keys include workspace scope, type, format version, and digest. Downloads
-land in temporary files and become cache entries only after full hash and length
-verification and atomic installation. Concurrent fills share work. The cache
-has a configured capacity and can evict any clean durable object.
+Clean cache keys include workspace, type, format version, and digest. Download
+to temporary files, verify hash/length, then install atomically; coordinate fills
+and enforce a capacity budget. Corrupt cache entries are replaced from S3.
+Missing/corrupt authoritative objects cause an integrity error, never zero-fill
+of an allocated extent or fallback to older contents. Dirty extents, freeze
+intent, and unresolved barrier/capture records are outside clean-cache eviction.
 
-Dirty directory bytes, unuploaded data, and unresolved capture state are not
-cache entries and cannot be evicted to satisfy that capacity. A corrupt cache
-entry is discarded and fetched again. A corrupt or missing authoritative object
-returns an integrity error; it never becomes an empty file or an older version.
+### 11.2 Worker, device, and authority restart
 
-### 11.2 Worker and service restart
+A fresh worker can open a retained Generation and lazily expose its volume,
+without downloading the entire virtual disk. Fork for a writable mount or
+filesystem recovery. Native logs/artifacts remain available through their own
+Generation handles without mounting ext4. A complete raw-image export is an
+explicit O(volume capacity) operation, not the normal attach/read path.
 
-A fresh worker authenticates, opens a retained Generation, acquires protection,
-and reads or materializes its state with an empty cache. Full materialization
-builds a fresh temporary directory and records completion before making it the
-workspace directory. A failed export leaves no directory labelled as a complete
-restored Generation.
+After ordinary worker/device loss, a fresh writable attachment starts from the
+branch's latest committed live VolumeRoot. A named retained Generation instead
+selects its exact historical root. Successful remote FLUSH/FUA barriers survive
+worker loss; later volatile writes may be lost. Filesystem/application recovery
+uses the guarantees of that boundary, not a false claim that RAM was restored.
 
-A surviving workspace records its branch ID, base, writer grant, and pending
-operation ID. Restart first reconciles that operation. It cannot clear local
-work based only on the branch's current head. A different head or epoch requires
-explicit salvage or rematerialization, not automatic deletion of local changes.
+A surviving worker first reconciles pending barrier/checkpoint IDs and freeze
+intent. Do not infer the outcome from the current head or automatically discard
+dirty bytes. An old mounted device is stopped on server failure/fencing; v0
+requires unmount/restart/re-attach rather than in-place root replacement. Journal
+replay writes go to a new writable state, never to an immutable root.
 
-The service reopens the Metadata Authority's preserved durable state, reconciles
-its owner incarnation, and recovers protections and terminal operation results.
-Prior-incarnation lease grants are rejected. Prepared work may be durably
-aborted; a committed result remains authoritative regardless of restart.
-The service never reconstructs publication by listing uploaded Generation
-descriptors. If the authority is unavailable or has unresolved recovery errors,
-authoritative mutations fail closed; a cached head is not a replacement.
+The authority reopens its preserved volume, advances its durable incarnation
+before serving, and reconciles protections, capture tokens, and terminal results.
+Old grants/attachments are fenced. Prepared work may be definitively aborted;
+committed volume barriers and Generations remain authoritative. Object listing
+cannot reconstruct publication. An unavailable authority fails mutations closed.
 
 ### 11.3 Metadata recovery boundary
 
-The operator must preserve durable metadata and any configured replication
-guarantees. Keeping all object bytes does not make an old metadata backup current:
-it can omit acknowledged head movements, writer epochs, and operation outcomes.
-The MVP runbook keeps the service offline after such a restore until a separate
-recovery procedure reconciles authority and fences obsolete writers. It cannot
-silently serve the old catalog as current authority.
-
-An older backup is not an automatic failover target. Recovery of acknowledged
-data after loss of all durable metadata copies needs a coordinated backup and
-object-retention design beyond this release. This does not change the ordinary
-worker-loss guarantee.
+The reference service survives process restart with its durable metadata volume
+preserved; loss of that only volume is outside the MVP guarantee. An older
+metadata backup can omit acknowledged live roots, heads, epochs, and outcomes.
+Keep the service offline after such a restore until a separate recovery procedure
+reconciles authority and fences obsolete writers. S3 bytes alone do not make an
+old catalog current. Automatic metadata failover is deferred.
 
 ## 12. SDK and CLI surface
 
-The following specifies logical requests and results, not a final network or
-Rust ABI. Each mutation uses Section 5.3's operation contract. Workspace
-creation scopes its initial ID to the deployment and caller until the new
-workspace ID is known; other operations use the workspace scope.
+These are logical requests/results, not a final Rust or network ABI. Authoritative
+mutations use Section 5.3's operation contract. Workspace creation initially scopes
+its ID to deployment/caller; later requests use workspace/caller scope.
 
 | Request | Required arguments / result |
 | --- | --- |
-| `create_workspace` | Operation ID; returns workspace ID and initial main branch/empty Generation. |
-| `create_branch` | Operation ID, name, retained base Generation; returns new branch ID/revision. |
-| `get_branch` | Branch ID or live name; returns stable ID, revision, head, stream epoch, and writer epoch. |
-| `acquire_writer` | Operation ID, branch ID, expected writer epoch, owner, explicit handover policy; returns recorded grant/expiry. |
-| `renew_writer` / `release_writer` | Operation ID and exact grant; renewal returns its recorded new expiry. |
-| `import_directory` | Operation ID, branch ID/revision, grant, worker-local source directory, explicit quiescence acknowledgement; returns the managed local handle and protected base (Section 6.3). |
-| `renew_base_protection` / `close_workspace` | Operation ID and exact managed handle/protection ID; renewal returns the recorded expiry. Close quiesces the gate, resolves capture, and releases the protection. |
-| `checkpoint` | Operation ID, branch ID/revision, grant, managed capture, attached/detached mode; returns Generation and optional new branch revision. |
-| `renew_preparation` | `renewal_operation_id`, `prepared_operation_id` (checkpoint operation ID, `append_id`, or log create/trim/delete operation ID), exact writer grant; returns the recorded extended preparation deadline. |
-| `move_head` | Operation ID, branch ID/revision, grant, retained target, discard policy; returns new revision/epoch. |
-| `promote` | Operation ID, source ID/revision, destination ID/revision/grant, discard policy; returns selected Generation and destination revision/epoch. |
-| `delete_branch` | Operation ID, branch ID/revision, grant; returns deletion result. |
-| `open_generation` | Operation ID and retained Generation ID; returns protected immutable handle and expiry. |
-| `renew_handle` / `close_handle` | Operation ID and handle ID; rights are not renewed by replaying a prior operation. |
-| `read_at` / `list_at` / `stat_at` | Handle and path, plus byte range or listing cursor where applicable. |
-| `materialize` | Protected Generation handle and fresh destination; returns a complete local export, bound for writes separately by `import_directory`. |
-| `diff` | Two protected handles; streams added, removed, and changed entries. |
-| `create_log` / `delete_log` | Operation ID, branch ID/revision, grant, log name/identity; changes the live log map. |
-| `append` | Exact stream, grant, `match_seq_num`, append ID, records and explicit attachments; returns receipt. |
-| `open_live_log` | Operation ID and exact stream; returns protected root/range and expiry. |
-| `read_log_at` | Protected Generation/log handle and sequence range. |
-| `tail_log` | Current stream and cursor; repeats protected current-root acquisition. |
-| `trim_log` | Operation ID, stream, branch revision/grant, batch boundary; returns updated range/revision. |
-| `set_artifact` / `remove_artifact` | Managed local overlay operation; takes effect in a Generation at checkpoint. |
-| `pin_generation` / `unpin` | Operation ID and retained Generation or exact pin ID; returns pin/result. |
-| `get_operation` / `abort_operation` | Original operation ID; query or make its outcome terminal. |
-| `collect` | Operator operation ID and workspace; returns mark-only report ID, root snapshot/inventory window, completeness, counts/bytes, and candidate pages. No physical deletion. |
-| `get_gc_report` | Report ID and optional page cursor; returns the recorded summary/candidate page or `ReportExpired` for expired details. |
+| `create_workspace` | Operation ID and fixed capacity/geometry; returns workspace, main, and zero-volume Generation. |
+| `create_branch` / `get_branch` | Retained base and identified create, or stable ID/name lookup; returns head, live roots, revisions, epochs, and attachment state. |
+| `acquire_writer` / `renew_writer` / `release_writer` | Identified request and exact grant/epoch/handover policy; returns original grant/deadline or release result. |
+| `attach_volume` | Operation ID, branch ID/revision, exact grant; returns fenced attachment ID, protected base, live VolumeRoot/geometry, and device setup inputs. |
+| `renew_base_protection` / `detach_volume` | Operation ID and exact attachment/protection; detach requires unmounted/drained state, resolves pending barriers/capture, and releases protection. It must flush unless explicit discard is requested. |
+| `flush_volume` | Internal operation ID, exact attachment/epoch/grant, covered I/O boundary, sealed dirty version, and expected live revision; returns durable volume boundary/root/revision. |
+| `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
+| `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |
+| `move_head` / `promote` | Stable source/destination identities and revisions, retained target/published source head, destination grant, explicit live-state discard policy. |
+| `delete_branch` | Operation ID, current stable ID/revision/write authority; revokes attachment and removes live refs. |
+| `open_generation` / `renew_handle` / `close_handle` | Identified protected historical view lifecycle; replay does not renew rights. |
+| `read_blocks_at` / `attach_readonly` | Protected Generation and byte range, or immutable block attachment; writes fail. Filesystem replay requires a writable fork. |
+| `diff` | Two protected Generations; streams changed volume ranges, log-view changes, and native named-artifact changes. It returns no inferred filename diff. |
+| `create_log` / `delete_log` / `trim_log` | Identified conditional live-root changes; trim only at batch boundaries. |
+| `append` | Exact stream/grant, conditional next sequence, append ID, records/attachments; returns exact durable receipt. |
+| `open_live_log` / `read_log_at` / `tail_log` | Protected current/historical roots and exact stream/cursor; retain the Section 7 contracts. |
+| `set_artifact` / `remove_artifact` | Gated local staging; native named-artifact changes become Generation state at checkpoint. |
+| `pin_generation` / `unpin` | Identified retained-Generation/exact-pin mutation. |
+| `get_operation` / `abort_operation` | Original operation ID; recover or make the outcome terminal without undoing a committed barrier/publication. |
+| `collect` / `get_gc_report` | Operator mark-only report lifecycle, root boundary/inventory window/completeness and paged candidates; expired details return `ReportExpired`. |
 
-Local file mutations and artifact staging use the managed gate. They are not
-remote durable mutations; retrying an interrupted local command requires the
-application's own contract. The API does not promise exactly-once shell
-execution or external actions.
+The CLI composes device attachment, reference ext4 format/mount/unmount helpers,
+checkpoint/freeze coordination, branch/fork/rollback/promote, log/artifact access,
+pins, diff, and recovery/report operations. Formatting is explicitly destructive
+to the selected writable volume; it is never implicit on attach/restore.
 
-Errors distinguish `Conflict`, `Fenced`, `LeaseExpired`, `OperationMismatch`,
+Block READ/WRITE/FLUSH completion follows Section 6. A kernel write is not a
+remote idempotent shell operation; the API promises neither exactly-once command
+execution nor restoration of external effects. Mount helpers require the declared
+Linux privileges and are not a sandbox.
+
+Errors include `Conflict`, `Fenced`, `LeaseExpired`, `OperationMismatch`,
 `InProgress`, `GenerationExpired`, `StreamReplaced`, `CursorExpired`,
-`IntegrityError`, `UnsupportedState`, `ReportExpired`, and `Busy`. A transport
-timeout does not become a definite rejection. A conditional failure returns
-the relevant current identity/revision when authorized.
-
-The CLI exposes workspace creation, import/materialize, managed command
-execution, checkpoint, branch/fork, rollback, promote, log append/read/tail,
-artifact staging, pin/unpin, diff, operation status, and mark-only GC reports.
-Machine-readable output includes stable identities and operation IDs. There
-are no fake mount or Git-server commands before those adapters exist.
+`IntegrityError`, `UnsupportedOperation`, `InvalidGeometry`, `FreezeFailed`,
+`ReportExpired`, and `Busy`. A transport timeout is an unknown result, not a
+known rejection. Kernel-facing persistence errors propagate as failed I/O rather
+than a weaker durability acknowledgement. Required consumer features are rejected
+explicitly if the adapter cannot support them.
 
 ## 13. Failure behavior
 
-| Failure point | Authoritative result and required recovery |
+| Failure point | Required result and recovery |
 | --- | --- |
-| Crash before preparation is registered | No publication. Retry the same ID or record an abort tombstone. |
-| Upload fails or its reply is lost | Preparation remains protected; verify/retry identical bytes or abort it. |
-| Descriptor uploaded, transaction not committed | Descriptor is invisible preparation data; old head remains authoritative. |
-| Commit succeeds, reply is lost | `get_operation` returns the original committed result, even if the branch later moved. |
-| Acquire/create reply is lost | Return the original writer grant or branch ID; allocate no replacement on replay. |
-| Authority owner restarts | Recover acknowledged metadata atomically, advance the owner incarnation before serving, and reject old lease grants. |
-| Authority reports a definite transaction conflict | Retry metadata logic with the same operation ID; repeat no S3 or local side effects inside the closure. |
-| Lease expires after closure evaluation | Revalidate at the serialization/commit decision; reject the complete write set with no partial publication, head movement, or live-root change. |
-| Commit error may follow durable application | Treat the result as unknown; recover/query the operation record, never assume every backend error means abort. |
-| Import setup is interrupted or its reply is lost | Reconcile the recorded base protection and local binding under the same ID; do not claim imported file bytes are remotely durable. |
-| Base-protection renewal reply is lost | Retry the same renewal ID or query it; preserve local files until the result is known. If the worker stops renewing, the five-minute protection expires and is removed; the old handle cannot checkpoint until explicitly rebound by a new import under current branch preconditions. |
-| Workspace closes with active capture | Quiesce the gate and resolve or definitively abort capture before releasing base protection; close does not publish or delete the branch. |
-| Preparation renewal reply is lost | Retry the same renewal ID or query it. Pause further scan/uploads and final publication or live-root replacement; retain the operation's admission boundary and protections. A checkpoint keeps its workspace gate closed. |
-| Preparation expires or its writer is fenced | Authority orders expiry/abort against the final commit. Once aborted, publication or live-root replacement fails; late uploads cannot make the operation visible and new bytes remain GC-report candidates. Preserve checkpoint files for explicit salvage, and return no append receipt. |
-| Writer replaced during upload | Final commit rejects the old epoch. Local work is preserved; aborted staged bytes remain stored and can appear in a later report. |
-| Append commits, receipt is lost | Replay returns its exact original range without another append. |
-| Append races checkpoint gate | Its entire batch is captured before the cut, or it waits for the next interval. |
-| Trim or reset races a live cursor | Explicit expired/replaced error; retained Generation reads remain unchanged. |
-| Roots change during a GC report | The report describes its captured root boundary and inventory window; normal reader/writer operations continue. |
-| GC report crashes or exhausts its budget | Resume or fail the report; never delete bytes, change retention, or place the workspace in a recovery mode. |
-| Metadata authority is unavailable | No new authoritative outcome is claimed; unknown preparations are not guessed away. |
-| Cache is lost or corrupt | Re-fetch and verify from S3; published state remains intact. |
-| Required S3 object is missing/corrupt | Report an integrity failure; do not publish or restore partial replacement state. |
-| Local host is lost before checkpoint | Uncheckpointed file and named-artifact changes may be lost. Durable accepted log appends survive under their live roots. |
-| Old metadata backup is restored | Keep the service offline and reconcile authority before serving its purported published state. |
+| Ordinary WRITE completes, worker then dies | Volatile writes after the last durable barrier may be lost; restore the committed live root or a selected retained Generation. |
+| FLUSH/FUA fails or its reply is lost | Return no false successful I/O; reconcile the exact barrier ID. Keep dependent writes blocked or fail explicitly. |
+| Barrier commits before worker loss | Its live root survives independently of worker disk; a lost kernel reply does not undo the commit. |
+| Preflush fails | Do not execute/acknowledge its dependent data write as though the barrier succeeded. |
+| Extent upload succeeds, metadata commit fails | Old live root remains authoritative; new objects are unreachable preparation data. |
+| Descriptor uploaded, publication not committed | No Generation is visible. |
+| Barrier/publication reply is lost after commit | Recover the original operation result even if live roots/head later moved. |
+| Definite transaction conflict | Retry metadata logic and the fresh final lease decision under the same operation ID; repeat no remote/local side effects inside the closure. |
+| Lease expires before the logical commit decision | Reject the entire write set; delayed durability acknowledgement after a valid decision remains valid. |
+| Unknown backend commit | Reconcile via authoritative outcome/recovery before admitting conflicting new mutations; do not infer abort. |
+| Writer/attachment fenced during upload | Reject root replacement/publication; fail persistence on the stale device and preserve salvageable local bytes. |
+| Freeze fails | Do not label the capture filesystem-frozen or publish that requested capture; resolve its preparation and preserve local state. |
+| Coordinator dies while filesystem is frozen | Reconcile recorded freeze intent and operation before controlled thaw/stop; do not write local control state through the frozen volume. |
+| Child flush commits, parent checkpoint aborts | Preserve the acknowledged live root; no Generation is published and the flush is not rolled back. |
+| Preparation/base renewal reply is lost | Replay/query the exact renewal ID; do not extend twice or discard unresolved dependencies. |
+| Preparation expires | Durably order abort against final commit; late uploads cannot revive it. Clear capture admission only after a definite outcome. |
+| Device server dies | Fail/stop the old device and recover with a fresh attachment; no transparent hot replacement or unqualified request reissue. |
+| Append races capture | Capture the whole batch before the declared cut or admit it afterward; never split it. |
+| Trim/reset races a cursor | Return explicit expired/replaced errors; retained historical bytes remain unchanged. |
+| Report interrupted or roots change | Report the captured boundary/window and uncertainty; never delete bytes or stop normal publication. |
+| Missing/corrupt allocated extent or index | Integrity error, never zero-fill or older contents. |
+| Queues/disk/metadata/S3 unavailable | Fail or reach a recoverable outcome; no weakened success promise or eviction of dirty/uncertain state. |
+| Older metadata backup restored | Keep authority offline until a separate reconciliation/fencing procedure. |
 
-Local file write completion acknowledges local mutation only. Log append
-completion acknowledges the durable log range only. Checkpoint completion
-acknowledges the coherent Generation and its publication. These three promises
-must remain distinguishable in both SDK results and user documentation.
+Keep four acknowledgements distinct: ordinary block WRITE is local volatile
+state; successful FLUSH/FUA is a durable live volume boundary; append is an exact
+durable log range; checkpoint is a published retained Generation binding its
+volume/log/artifact views. None implies an application-consistent global snapshot.
 
 ## 14. Performance, bounds, and benchmarks
 
-### 14.1 Expected costs
+### 14.1 Expected costs and amplification
 
-Let `N` be namespace entries, `B` total regular-file bytes, `S` log segments,
-`V` retained Generations, and `R` the distinct graph reachable in a report.
+Let E be mapped volume extents, D changed extents in a persistence cut, S log
+segments, V retained Generations, and R the distinct report graph.
 
 | Operation | MVP cost and limitation |
 | --- | --- |
-| Directory capture | Reads `O(N + B)` for discovery; the full pause includes scan, uploads, and commit. |
-| Checkpoint storage | New data chunks plus changed persistent nodes and one descriptor; no copy of unchanged payload or metadata subtrees. |
-| Fork | Bounded reference/protection writes; no traversal of files, logs, or ancestor Generations. |
-| Path/range read | Namespace traversal `O(log N)`, optional chunk-index traversal, and intersecting complete chunks; independent of `V`. |
-| Materialize | All entries and selected bytes; storage sharing does not remove export cost. |
-| Log append | New batch/attachments, `O(log S)` segment-index path changes, log-map path changes, and one metadata commit. |
-| Log checkpoint | Bind the existing log-map root; no historical segment-payload transfer. |
-| Diff | Shared-subtree skipping, with complete namespace traversal possible in the worst case. |
-| GC report | Root snapshot, `O(R)` distinct-node marking, object inventory, and report storage; no publication pause or physical reclamation. |
+| Change discovery | Track admitted dirty block ranges; no O(files + file bytes) directory scan. |
+| Volume persistence | Changed 64 KiB extents plus changed map paths; partial writes may require verified read-modify-write. |
+| Checkpoint | Establish the requested cut/freeze, flush outstanding dirty extents, bind existing volume/log roots, upload staged artifacts/descriptor, and publish. |
+| Fork | Bounded metadata/reference writes, independent of capacity, mapped extents, file count, and ancestry. |
+| Attach/read | Fetch root/index paths and demanded extents; independent of V. Filesystem startup may read its own metadata working set. |
+| Raw image export | O(capacity); an explicit operation, not a prerequisite for lazy attach. |
+| Log append | New batch/attachments plus changed segment/log-map paths and one authority commit. |
+| Diff | Skip shared extent subtrees; worst case full mapped-state comparison. No inherent filename semantics. |
+| Report | Root snapshot, O(R) marking, inventory, and bounded result storage; no physical reclamation. |
 
-Small-file object count, fixed-chunk suffix rewrites, full scans, per-batch S3
-latency, reference authority capacity, unreclaimed object bytes, and lifetime
-operation-result growth are expected v0 limits.
-This release proves correctness and sharing; it does not claim production
-throughput for millions of concurrent agents.
-
-Backend-internal commit serialization and durable-write cost are measured
-separately from domain-level branch conflicts. The toy-kv reference adapter
-does not imply hosted-service throughput or multi-node scalability.
+Storage delta is approximately dirty storage extents plus changed Version FS
+metadata, not application bytes alone. ext4 journal/metadata writes, repeated
+barriers, and 4 KiB-to-64 KiB extent amplification may dominate. Measure these
+costs explicitly. Removing file scans does not promise low remote fsync latency:
+each durable barrier includes object-store work and authority durability.
 
 ### 14.2 Bounded resources and overload
 
-The default transfer pool permits eight object operations per workspace, with
-a service-wide cap of 32. The service queue holds at most 64 admitted requests;
-per-branch SDK mutation admission is one active request. These are configurable
-initial limits. Tree traversal and scanning stream results instead of retaining
-the complete namespace or file in RAM. Cache and temporary-disk budgets are
-explicit deployment settings; report marking spills within its disk budget.
+Initial object transfer limits remain eight per workspace and 32 service-wide,
+with at most 64 admitted service requests. The initial writable device has one
+queue with a configured finite depth and bounded request buffers. One branch
+has one ordered persistence/capture stream; renewals/outcome queries remain
+available independently. Pin exact ublk limits in the release configuration.
 
-Before admission, exhaustion returns `Busy` or an explicit capacity error.
-After admission, the operation must reach a recoverable state or a recorded
-abort. It cannot drop an accepted append, evict dirty working bytes, release an
-unresolved operation's roots, bypass a checksum, or acknowledge a weaker
-durability mode. A full metadata store cannot be worked around by forgetting
-idempotency results. A report that cannot finish within its resource budget
-returns an incomplete/failed outcome without blocking workspace mutations.
+Configure clean-cache, dirty-overlay, temporary-disk, and report budgets separately.
+A full dirty budget applies backpressure or fails I/O; it never evicts unwritten
+bytes. Seal stable extent versions before upload so a concurrent overwrite cannot
+change the bytes associated with an in-flight hash/barrier. The initial flush
+path may block later writes through commit to avoid keeping multiple dirty epochs.
 
-These bounds cover working resources and admission, not a bounded lifetime
-storage footprint. Both unreclaimed S3 bytes and permanent authority operation
-records can grow with cumulative mutations. Trimming logs or expiring
-Generations does not remove either class in v0. Capacity limits may reject new
-work; they cannot erase deduplication history or enable deletion to make room.
+Before admission return Busy/capacity errors. After admission preserve identified
+outcomes/protection or record a definite abort. Report budget exhaustion does not
+block writers. Both unreclaimed S3 objects and workspace-lifetime operation records
+(including durability barriers and heartbeats) grow cumulatively in v0. Expiry or
+trim cannot be used to erase deduplication records or enable physical deletion.
 
 ### 14.3 Benchmark report
 
-The release includes a reproducible report on real S3 and
-`ToyKvMetadataAuthority` using preserved metadata storage. PostgreSQL benchmarks
-are deferred with that adapter. Scenarios below are separate experiments, not
-one required Cartesian product. Record backend/engine revision, WAL/durability
-settings, hardware, region, network, service limits, format version, retention
-settings, cache size, and raw sample counts.
+Publish reproducible results on real S3, preserved toy-kv storage, Linux ublk,
+and the reference ext4 profile. Record exact revisions, WAL settings, kernel and
+userspace binding, device geometry/queue configuration, mkfs/mount/journal settings,
+hardware, region, network, budgets, sample counts, errors, and raw observations.
+Scenarios are separate experiments rather than one Cartesian product.
 
-| Scenario | Initial fixture / comparison |
+| Scenario | Required comparison |
 | --- | --- |
-| Namespace scale | 1,000, 100,000, and 1,000,000 files, including a high-fanout directory. |
-| Large content | 1 GiB and 100 GiB files; overwrite one aligned range versus insert near the beginning. |
-| Small change | No changes, one small-file edit, 1% changed files, subtree rename, and mass deletion. |
-| Version depth | 10, 100, and 1,000 Generations on a small fixed workspace; compare open/read request counts. |
-| Fan-out | 1, 10, and 100 branches sharing one base; fork, independently checkpoint, and drop candidates. |
-| Logs | 100,000 1 KiB records; batches of 1, 100, and 1,000 records; capture, fork, and trim. |
-| Cold recovery | Empty cache versus warm cache; one-file native read versus full materialization. |
-| Reachability report | Shared/divergent retained roots, abandoned preparations, concurrent publication, and interrupted reports. |
-| Lifetime metadata | Operation-result keys/bytes after repeated appends, trims, and Generation expiry; verify records remain replay-safe. |
-| Authority contention | Independent branches versus one hot branch; measure transaction conflicts, retries, and durable commit latency through the common interface. |
+| Capacity and allocation | 1, 100, and 1000 GiB virtual capacity with sparse and populated maps; attach/fork must not enumerate capacity. |
+| Raw writes | 4 KiB random writes versus sequential/coalesced 64 KiB and 1 MiB writes; cold partial-extent read-modify-write versus warm cache. |
+| Filesystem workload | 1,000, 100,000, and 1,000,000 files, high fanout, rename/unlink, sparse files, mmap, and a self-contained Git worktree. |
+| Large content | 1 GiB and 100 GiB files; small overwrite versus append; compare application/device/dirty/uploaded bytes. |
+| Durability | Ordinary writes versus FLUSH/FUA and filesystem fsync; include barrier batching and remote-failure latency. |
+| Checkpoint modes | Raw block cut versus reference ext4 freeze/clean unmount; measure quiescence, freeze, upload, publication, and thaw separately. |
+| History and fan-out | 10/100/1000 Generations and 1/10/100 branches; no-change checkpoint, independent writes, promote/reset. |
+| Logs/artifacts | 100,000 1 KiB records in batches of 1/100/1000; attachments, checkpoint root binding, fork, and trim. |
+| Recovery | Empty versus warm cache; first block/mount working set versus full-image export; journal recovery on writable fork. |
+| Reporting and lifetime growth | Shared/divergent volume/log roots, abandoned preparations, report races, and permanent barrier/append/heartbeat outcome metadata. |
 
-Measure capture pause and total completion separately; bytes scanned, hashed,
-uploaded, downloaded, and newly stored; data and manifest object counts;
-metadata commits and retained operation keys/bytes; peak RAM/disk; and report
-duration/resource use alongside ongoing checkpoint and append latency.
-Report latency distributions with sample counts and achieved append/checkpoint
-throughput. Single-stream and independent-branch throughput are separate.
-Always include errors and saturation, rather than omitting failed requests.
-
-The release gates below require the structural cost properties to hold.
-Latency numbers establish the first baseline; this RFC invents no measured
-latency SLO. A later performance proposal can set budgets from those results.
+Report latency distributions/throughput and failed requests, filesystem journal
+amplification, extent/map object counts, bytes fetched/uploaded/newly stored, peak
+RAM/disk, freeze duration, authority conflicts/serialization, and report overhead.
+Separate independent-branch throughput from one hot volume. Structural costs are
+release gates; numerical latency is a measured baseline, not an invented SLO.
 
 ## 15. Implementation sequence
 
 | Phase | Deliverables | Exit evidence |
 | --- | --- | --- |
-| 1. Immutable state | Canonical encoding, object-store adapter, verified cache, persistent maps/chunks, descriptor reader, directory scanner/export, structural diff. | One complete fixture resolves on an empty worker without ancestor reads; unchanged nodes/chunks are physically shared. |
-| 2. Authority and writes | MetadataAuthority contract/conformance fixtures, ToyKvMetadataAuthority, common key schema and point transactions, durable outcomes, writer grants, initial import, capture/publication, branch lifecycle, logs, artifact edges. | The first end-to-end workflows run through the toy-kv adapter; conflicts, lost replies, restart, and stale writers have recoverable outcomes without backend-specific protocol calls. |
-| 3. Retention and recovery | Pins/read protections, mark-only reports, restart reconciliation, operator runbooks, real-backend fault campaigns, benchmark report. | Reports classify the captured graph without mutating it or pausing writers; a fresh worker restores every retained fixture after worker loss. |
+| 1. Immutable volumes and feasibility | Canonical extent/map formats, S3 adapter/cache, complete root reader/diff, toy-kv conformance, and ublk/ext4 platform spike. | Empty-worker reads need no ancestors; map sharing works; real backend/ublk barrier behavior is demonstrable. |
+| 2. Writable views | Grants/attachments, dirty overlay, durable barriers, freeze/capture publication, branch lifecycle, native logs/artifacts, SDK/CLI. | Checkpoint/fork/promote and fresh-worker recovery run through the real adapters with explicit durability/consistency boundaries. |
+| 3. Qualification | Retention/protection cleanup, mark-only reports, restart/fault campaigns, benchmarks, and runbooks. | Required gates have evidence; acknowledged barriers and Generations survive their declared failures; reports never delete or pause publication. |
 
-Physical deletion stays outside v0 regardless of these phases' completion.
-Development backends can accelerate iteration, but cannot replace real-backend
-release evidence. The PostgreSQL mapping must remain compatible with the same
-contract, record model, and domain transactions; implementing or benchmarking
-that adapter is not an MVP completion requirement.
+Foundational protections and fault tests ship with their protocols rather than
+waiting for Phase 3. The PostgreSQL adapter, physical reclamation, and a native
+file-tree view remain outside v0. The implementation plan tracks review-sized
+work packages under these phases.
 
 ## 16. Acceptance criteria
 
 ### 16.1 Functional and structural gates
 
-1. Execute `create_workspace -> acquire_writer -> import_directory -> checkpoint`
-   with supported files, empty directories, symlinks, and a self-contained Git
-   repository; stage artifacts and append logs before checkpoint. Capture
-   rejects unsupported state. Import replay returns the original local binding
-   and never substitutes for durable file capture.
-2. Create attached and detached Generations. Neither descriptor upload nor
-   failed CAS makes a Generation visible; detached success moves no branch.
-3. Restore each retained Generation on another worker with an empty cache.
-   Make ancestor descriptors unavailable in the read fixture and verify
-   descendant reads still resolve entirely from their own roots. This check
-   requires no physical S3 deletion by the MVP.
-4. Verify a no-change capture reuses its state roots. A small aligned large-file
-   overwrite stores only intersecting chunks and changed tree paths. Measure
-   the full scan separately. A fork copies no payload or complete namespace.
-5. Verify lookup depth/request count does not grow with Generation ancestry.
-   Check namespace diff against a complete comparison, including node splits,
-   deletion, directory rename, and metadata-only changes.
-6. Fork candidates, checkpoint each independently, promote one with source and
-   destination CAS, roll back, delete branches, and reuse names safely. Preserve
-   or explicitly discard live log changes under Section 9's policy.
-7. Validate append atomicity, exact receipts, conditional tails, forked stream
-   identities, exact checkpoint ranges, cursor errors, and trim while an older
-   Generation remains pinned. Attached artifact bytes survive with those logs.
-8. Enforce workspace authorization for reads, cache use, object reuse, and
-   mutations. A known digest does not grant access.
-9. Verify reports mark every retained/protected closure, account for uncertain
-   preparations, and state their root snapshot and inventory window. Concurrent
-   publication and an interrupted report do not block new mutations. No report,
-   trim, expiry, or branch deletion issues an S3 object DELETE; deletion
-   permissions and lifecycle expiration remain disabled.
-10. Verify capture/materialization do not follow restored external symlinks.
-    Document that trusted runner commands can access their host targets and
-    that those bytes and effects are outside the captured state.
-11. Run the backend-neutral authority conformance fixtures against the toy-kv
-    adapter: multi-key atomicity, missing-key and stale-read conflicts,
-    read-your-writes, read-after-commit, durable crash recovery, and consistent
-    multi-page snapshot scans. Concurrent branch-name claims must yield one
-    binding through an absent-key check, without SQL-only constraints.
-12. Verify Version FS protocol code depends only on the common interface and
-    logical schema. Report scans never substitute for transactional predicates;
-    toy-kv commit timestamps never become Version FS identities. Document the
-    compatible PostgreSQL mapping for the same contract. Every later adapter
-    must pass the same conformance suite before use. Implementing the PostgreSQL
-    adapter is not a v0 gate.
+1. Create a fixed-capacity zero volume, acquire a grant, attach via ublk, explicitly
+   format/mount ext4, and use normal filesystem/Git operations. Include hard links,
+   symlinks, permissions/xattrs, rename, sparse files, and mmap under the qualified
+   profile. Native logs and artifacts remain separate Generation views.
+2. Checkpoint in both declared modes. Descriptor uploads and failed CAS are invisible;
+   attached/detached publication behaves as specified. Frozen mode records a successful
+   filesystem boundary; raw block cuts make no application-consistency claim.
+3. Restore retained Generations on an empty worker without ancestor descriptor
+   reads or full-image download. Native logs/artifacts resolve without ext4 mount.
+   Replay a filesystem journal only on a writable fork, preserving the old root.
+4. Verify no-change roots are reused and small writes copy only affected storage
+   extents/map paths. Measure sector-to-extent and filesystem-journal amplification.
+   Fork copies no payload or complete extent map; dirty discovery performs no file scan.
+5. Verify block lookup/request count does not grow with Generation ancestry and
+   extent-range diff matches a complete comparison, including zero transitions and
+   tree splits. Do not label those results as filename or semantic Git diffs.
+6. Fork/checkpoint/promote/rollback/delete and reuse branch names safely. Check
+   source/destination revisions, volume/stream epochs, live-state discard, and
+   rejection of old attachments. No mounted device is hot-rebased.
+7. Validate atomic native append receipts, conditional tails, independent forked
+   streams, exact checkpoint prefixes, cursor errors, and trim with historical
+   pins and attachment bytes retained.
+8. Enforce workspace scope for devices, reads/cache/object reuse, native views,
+   and mutations. Knowing a digest, filesystem UUID, or device number grants no rights.
+9. Verify report closure includes every retained/live volume/log/artifact root and
+   uncertain preparation. Concurrent publication/read protection remains available.
+   No report, trim, expiry, reset, or deletion issues an S3 DELETE; lifecycle expiration
+   and object-delete permissions stay disabled.
+10. Verify Linux READ/WRITE/FLUSH and negotiated preflush/FUA ordering. Successful
+    barriers survive worker disk loss via committed live roots, including barriers
+    newer than the last Generation. Unsupported requests and out-of-bounds I/O fail.
+    A partial ordinary write or block cut is not advertised as application-atomic.
+11. Run backend-neutral authority conformance against preserved toy-kv storage:
+    atomicity, absent/stale point conflicts, fresh reads, durable recovery, paged
+    snapshot consistency, and final lease decisions under the authority commit gate.
+12. Verify backend-independent domain code, point-key uniqueness/retention guards,
+    snapshot-only report scans, no engine timestamp identities, and a documented
+    compatible PostgreSQL mapping. PostgreSQL implementation is not a v0 gate.
 
 ### 16.2 Failure-injection gates
 
-Exercise each upload and metadata transition with process termination, delayed
-requests, duplicate delivery, lost replies, and retried operation IDs. Required
-cases include:
+Exercise each upload, root replacement, capture step, and local/device control
+transition with delayed/duplicate requests, lost replies, injected time, and process
+termination. Check API/kernel outcomes and persisted graph state, not only CLI exits.
 
-- Creation and writer acquisition committing before their replies are lost;
-  replay returns the original identities and never grants a second epoch.
-- Import setup interrupted after base protection is established but before
-  local control installation; a retry reconciles the same binding or requires
-  a new import if its worker/directory is lost.
-- Keep checkpoint and log-mutation preparations alive beyond ten minutes with
-  three-minute heartbeats, including an append with a slow large attachment
-  upload. Lose renewal replies and replay the exact operation IDs without
-  extending twice. Expiry or fencing prevents Generation publication or live
-  log-root replacement, and protections are not released while the outcome is
-  unknown.
-- Stop heartbeats for an abandoned append after staging objects and advance the
-  injected clock past its deadline. Confirm the preparation is aborted, its
-  dependencies cease to be protected roots, no live log root or receipt is
-  created, and the mark-only report can list new unreferenced bytes.
-- Lose a base-protection renewal reply and replay its exact ID; stop the worker
-  and advance the injected clock until the protection expires. The old handle
-  cannot checkpoint or silently rebase, and an explicit close releases the
-  protection immediately after its gate and capture are resolved.
-- Publication/append committing before a lost reply, followed by later branch
-  movement, reset, or name reuse; outcome recovery still returns the original
-  result. An abort tombstone wins against a delayed request or returns the
-  already committed result.
-- Writer expiry and handover during preparation; a delayed old writer cannot
-  publish, append, trim, or move a reference.
-- A lease is valid on the first transaction attempt, which conflicts; advance
-  the injected clock past expiry before retry. The next attempt must read time
-  again and reject a new mutation or renewal under the expired grant.
-- Evaluate a lease-dependent mutation while its lease is valid, then advance
-  the injected clock past expiry after the closure returns but before the
-  serialization/commit decision. The commit-time check rejects the complete
-  transaction with no partial writes. Also verify a transaction that linearizes
-  before expiry remains committed if its durable acknowledgement is delayed.
-- Authority crash before and after durable commit, a conflict during a retried
-  transaction closure, and an error after possible commit. Recover one complete
-  metadata outcome through the adapter; old-incarnation grants stay fenced.
-- Snapshot loss before a report's root set is sealed; report failure is explicit
-  and does not silently combine prefix pages from different boundaries.
-- Appends racing the capture gate; no batch is split or assigned to the wrong
-  checkpoint interval. Local mutation admission stays closed until capture has
-  a definite outcome.
-- Reader acquisition, pin changes, and publication racing a mark-only report;
-  root snapshots and uncertainty are explicit, and current operations proceed.
-- Report interruption, missing reachable metadata, or exhausted report storage;
-  incomplete results never become deletion authorizations or a workspace outage.
-- Missing/corrupt chunks, indexes, and descriptors; no partial successful
-  restore or fallback to older contents.
-- Exhausted buffers/disk, unavailable S3, and unavailable metadata authority;
-  no weaker success acknowledgement and no loss of required protection.
-
-Fault campaigns must check both API outcomes and the persisted state graph;
-a CLI exit code alone is not sufficient evidence. Deterministic fault injection
-should cover boundaries that are difficult to trigger reliably on real services.
+- Create/acquire/attach/barrier replies lost after commit: replay returns the same
+  identity/receipt; never allocate a replacement epoch or apply another barrier.
+- Ordinary writes followed by worker loss: recover the last acknowledged durable
+  barrier, allowing loss only of subsequent volatile work. Simulate the same with
+  a native FUA or the qualified emulation path and combined preflush/data/FUA.
+- Pause a partial-extent upload and overwrite its buffer: the sealed version/root
+  remains stable and later writes cannot contaminate the earlier cut.
+- Fail or lose a FLUSH/FUA commit reply: no successful kernel durability completion
+  before durable outcome; dependent writes cannot overtake it. A committed child
+  barrier remains valid if its parent checkpoint later aborts.
+- Keep device I/O available while ext4 freeze flushes its journal; demonstrate no
+  close-before-freeze deadlock. Kill the coordinator during freeze, seal, commit,
+  local-baseline update, and thaw; reconcile exact operation/freeze intent.
+- Freeze failure and raw writers outside the declared protocol: no false frozen
+  checkpoint. Test clean-unmount and raw-cut recovery separately.
+- Stale writer/device after handover, reset, deletion, or authority restart: cannot
+  replace a live root, publish, append, trim, or resume a mounted device on another root.
+- Lease valid in an earlier transaction attempt but expired on retry/final decision:
+  reject the complete mutation. A successful logical decision remains committed
+  when durability acknowledgement arrives after expiry. No toy-kv precommit hook
+  is assumed; test the adapter gate's actual decision boundary.
+- Barrier/checkpoint/log preparation beyond ten minutes: renew every three minutes,
+  replay a lost renewal without extending twice, pause unresolved work, and reject
+  final commit after definite expiry/fencing. Test large slow artifact attachments.
+- Abandoned barrier/append/capture or attachment: protection expires, operation is
+  definitively aborted/fenced, capture admission is released safely, late uploads
+  remain unreferenced, and old handles cannot silently reacquire rights.
+- Durable publication/append followed by later head movement/name reuse: original
+  result still resolves. An absent-operation abort tombstone wins against delayed
+  execution; committed operations cannot be undone by abort.
+- Authority crash around commit, retried closure conflicts, and unknown commit
+  results: recover complete outcomes, preserve the commit gate's exclusion until
+  resolution, and fence prior-incarnation grants before serving.
+- Native append racing the common volume cut: entire batches belong on one side;
+  native artifacts and log prefixes bind to the same declared capture interval.
+- Report snapshot loss, concurrent roots/pins/readers, missing/corrupt metadata,
+  interruption, and exhausted budgets: explicit failure/uncertainty without deletion
+  authorization, root substitution, or workspace outage.
+- Corrupt/missing allocated extents, maps, segments, or descriptors: error instead
+  of zero-fill, older contents, or a successful partial filesystem recovery.
+- Exhausted dirty/cache/disk/queue/metadata capacity and unavailable S3/authority:
+  fail or preserve recoverable state; no dirty eviction, weakened acknowledgement,
+  release of uncertain protection, or reversion to a cached authoritative head.
 
 ### 16.3 Invariant coverage and completion
 
 | RFC-001 invariants | MVP evidence |
 | --- | --- |
-| I1-I3: immutable, complete, independent state | Encoding/graph validation, independent restore with ancestor reads denied, sharing and diff fixtures. |
-| I4-I5, I8: durability and atomic publication | S3 plus toy-kv authority upload/commit failures, conformance evidence, detached publication, CAS, lost-reply recovery. |
-| I6, I14: retention and log safety | Atomic retention/protection, closure marking and report races, trim with retained historical reads, and no physical deletion. |
-| I7, I11: authority and retry | Point-transaction conflicts, owner restart/handover/expiry, ABA fixtures, identified mutation retries and abort tombstones. |
-| I9: disposable workers | Destroy all worker state after publication and recover on a fresh worker. |
-| I12-I13: authorization and durable ordered append | Workspace authorization/data scoping, atomic batches, conditional tails, receipts and attachment retention; no runner sandbox claim. |
-| I10, I15: explicit participant/global boundaries | No runtime/DB/global-checkpoint support is claimed; no synthetic timestamp-based consistency assertion. |
+| I1-I3 | Immutable complete volume/log/artifact roots, ancestor-independent reads, COW sharing, and structural range diff. |
+| I4-I5, I8 | Durable barrier/root publication, attached/detached Generation commits, CAS, trusted graph validation, and lost-reply recovery. |
+| I6, I14 | Live/retained graph protection, mark-only report races, historical trim safety, and no physical deletion. |
+| I7, I11 | Owner/attachment fencing, strict point preconditions, lease decisions, replay-safe internal/API operation IDs, and abort tombstones. |
+| I9 | Destroy worker dirty/control/cache state; recover acknowledged live barriers and retained Generations from durable services. |
+| I12-I13 | Workspace/device/object authorization and durable ordered native log ranges/attachments. |
+| I10, I15 | Explicit filesystem/application/runtime/DB boundaries; no fabricated coordinated global-checkpoint claim. |
 
-The MVP is complete when all required capabilities and gates have evidence,
-the real-backend benchmark report is published, and operator instructions cover
-backup assumptions, unknown outcomes, trusted runner/import behavior, mark-only
-report limits, toy-kv's storage/availability boundary, and cumulative metadata
-growth. Physical reclamation, the PostgreSQL implementation, and other deferred
-integrations are not release blockers.
+Completion requires every capability and gate above, real ublk/ext4/S3/toy-kv
+benchmark evidence, and operator instructions covering device lifecycle, freeze
+recovery, failed I/O, volume versus Generation recovery, metadata durability,
+unknown outcomes, report limits, and cumulative storage/operation metadata growth.
+Other filesystems are not qualified merely because the block interface is generic.
 
 ## 17. Selected tradeoffs
 
 | Decision | Reason and accepted cost |
 | --- | --- |
-| Transactional MetadataAuthority | Keep publication, fencing, and retry logic independent of the backend; explicit point-key indexes and a reusable conformance suite are required. |
-| Toy-kv reference backend | Exercise OCC, crash recovery, and faults in the first implementation; preserve its metadata volume and make no production HA/replication commitment. |
-| Compatible later PostgreSQL backend | Reuse managed database infrastructure through the same contract before building a replicated authority; implementation and production deployment qualification are deferred. |
-| S3 immutable object graph | Portable worker recovery and sharing; small objects and each synchronous append incur remote request cost. |
-| Persistent ordered trees | Selective reads, range iteration, and metadata sharing; tree encoding and mutation correctness require care. |
-| Fixed chunks | Simple, measurable range reuse; insertions can rewrite suffixes. |
-| Full quiesced scan | A clear coherent boundary; checkpoint pauses and scan work can follow total workspace size. |
-| Captured Git repository files | Normal local Git tooling works without a server adapter; no native Git protocol or object-format translation. |
-| One sealed segment per batch | Append durability and checkpoint capture are simple; tiny batches amplify S3 objects and requests. |
-| Mark-only GC reports | Validate reachability without a deletion protocol or collection pause; unreferenced object bytes remain stored and storage grows. |
-| Workspace-lifetime operation results | Preserve mutation IDs for replay-safe idempotency; every append and other mutation adds permanent metadata even after trim/expiry. High-rate, long-lived workloads need more authority storage; bounded deduplication is deferred. |
-| Trusted managed runner | Coordinate capture without building a sandbox; commands retain host-filesystem access under their OS credentials, including through external symlinks. |
+| First-class block view plus native logs/artifacts | Linux handles filesystem compatibility while Generation/checkpoint/fork/retention semantics remain shared across views. |
+| ext4 over Linux ublk | Reference consumer/adapter; needs a qualified privileged Linux environment and explicit device failure/freeze behavior. NBD is only an optional prototype. |
+| Fixed geometry, 4 KiB sectors / 64 KiB immutable extents | Simple COW mapping and direct dirty tracking; partial writes and journals amplify uploaded bytes. No resize/discard or atomic multi-sector promise. |
+| Remote-durable FLUSH/FUA | Worker-independent fsync/barrier durability; S3 and metadata commit latency is exposed on the persistence path. |
+| Blocking flush/frozen capture | Small correctness surface; later writes may pause through remote commit/publication. |
+| Structural block diff | Cheap shared-subtree comparison; filenames, inode changes, and semantic Git diff require a later filesystem-aware view/tool. |
+| Transactional MetadataAuthority / toy-kv reference | Backend-neutral protocol exercised locally with preserved storage; no production HA or engine-specific lease hook. |
+| Compatible later PostgreSQL | Production path through managed metadata infrastructure; implementation/qualification deferred. |
+| Native sealed log batches and artifact edges | Preserve exact ordered views independent of disk format; each batch adds remote objects and permanent outcome metadata. |
+| S3 immutable graph and mark-only reporting | Portable recovery and reachability evidence; unreclaimed bytes and operation results grow for the workspace lifetime. |
+| Trusted coordinator/runner | Provides capture coordination; OS access and external side effects require a separate sandbox/application protocol. |
 
-Future changes can replace these mechanisms while preserving RFC-001's
-semantics. Safe physical reclamation, a multiplexed log WAL, tracked change
-discovery, or runtime and GTS integration require additional proposals rather
-than hidden extensions to v0's guarantees.
+Safe physical reclamation, native namespace semantics, optimized extent packing,
+transparent device recovery, runtime snapshots, and coordinated GTS/DB integration
+need additional proposals rather than hidden extensions of v0's guarantees.
 
 ## 18. References
 
 Primary sources consulted on 2026-10-23; Version FS formats, protocols, defaults,
 and release gates above are proposals of this RFC, not vendor guarantees.
 
+- [Fly.io: SBD — We Have a Filesystem at Home](https://fly.io/blog/sprites-block-device/)
+  is the object-backed block-device/ext4 reference discussed in Section 3. It uses
+  NBD; it is not a ublk implementation or a Version FS durability guarantee.
+- [Linux ublk](https://docs.kernel.org/block/ublk.html) describes the userspace
+  block framework used by the reference adapter.
+- [Linux write-cache control](https://docs.kernel.org/block/writeback_cache_control.html),
+  [fsfreeze](https://man7.org/linux/man-pages/man8/fsfreeze.8.html), and
+  [ext4 journal](https://docs.kernel.org/filesystems/ext4/journal.html) define
+  the referenced block ordering and filesystem coordination behavior. Version FS
+  remote durability and common Generation capture are requirements of this RFC.
 - [RFC-001: Version FS Architecture](001-version-fs.md) defines the inherited
   semantics and invariants, including the deferred global-checkpoint boundary.
 - [S2 streams](https://s2.dev/docs/concepts/streams),

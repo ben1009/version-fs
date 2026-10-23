@@ -104,8 +104,8 @@ particular implementation mechanism.
 3. A checkpoint atomically publishes one coherent logical state.
 4. Fork and rollback primarily manipulate references rather than copy state.
 5. Published state survives loss of worker compute and local caches.
-6. Files, Git, ordered logs, and artifacts share version, checkpoint, fork, and
-   retention semantics.
+6. Files, block volumes, Git, ordered logs, and artifacts share version, checkpoint,
+   fork, and retention semantics.
 7. Storage state and application databases remain separate systems.
 8. Retention protects the complete reachable state of every retained Generation.
 9. Concurrent or stale operations cannot overwrite newer authoritative state.
@@ -119,6 +119,7 @@ properties should remain practical as state, histories, and concurrency grow.
 | View | Logical state | Relationship to a Generation |
 | --- | --- | --- |
 | Filesystem | Namespace, file contents, and declared metadata. | A complete immutable namespace view. |
+| Block volume | Logical byte ranges, geometry, and declared I/O ordering/durability. | A complete immutable volume root, independent of its consumer's filesystem format. |
 | Git | Source objects, refs, and source-control history. | A coherent declared Git view; machine checkpoints need not become Git commits. |
 | Ordered logs | Durable ordered records. | An exact immutable captured range for each included log. |
 | Artifacts | Named or referenced immutable payloads and outputs. | Explicit reachable content governed by Generation retention. |
@@ -126,6 +127,11 @@ properties should remain practical as state, histories, and concurrency grow.
 Each view defines its own domain operations. Their common contract concerns
 version identity, coherent capture, publication, branching, and retention.
 One shared physical format or storage engine is not required.
+
+A block-volume view may host a filesystem or a block-aware engine. Filesystems
+are consumers of that interface; native ordered logs and artifacts remain
+independent first-class views. A release may realize filesystem access through
+such a consumer without implementing a native file-tree adapter.
 
 ### 3.3 Non-goals
 
@@ -167,6 +173,7 @@ ordering, and retention.
 | Branch | A mutable named reference representing a line of history. |
 | History (agent history) | A stable identity for one coordinated version lineage; forking a coordinated version creates a distinct descendant history identity. |
 | Overlay | Unpublished mutable changes above a base Generation. |
+| Block volume | A logical address space whose complete bytes are resolved by a versioned immutable root. |
 | Checkpoint | Capture and durable publication of a coherent state boundary. |
 | Publication | The authoritative transition making a prepared Generation visible. |
 | Pin | A retention reference keeping a Generation's reachable state live. |
@@ -230,6 +237,7 @@ Generation G102
     +-- parent_generation_id: G101    (lineage only)
     +-- root
           +-- filesystem state
+          +-- block volume state, when included
           +-- Git state
           +-- exact log views
           +-- artifacts
@@ -326,6 +334,12 @@ virtio-fs, or other adapters. Every capture method must explain how it obtains a
 coherent view; a directory walk racing arbitrary writes cannot claim that
 property. Capture of a live database image requires that database's own
 snapshot or quiescence contract.
+
+A block adapter must declare its flush, ordering, durability, and capture cut.
+Generation immutability applies to the captured volume root. A filesystem freeze
+or recovery protocol belongs to the filesystem consumer; application consistency
+requires the application's own coordination. A block snapshot or shared timestamp
+alone cannot establish that boundary. Recovery must not modify a retained root.
 
 ## 9. Log and artifact views
 

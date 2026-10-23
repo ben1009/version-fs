@@ -11,6 +11,10 @@ complete workspace.
 Published state lives in durable storage. Compute nodes keep a mutable overlay
 and a disposable cache. Transactional databases remain separate systems.
 
+The proposed MVP exposes a versioned block volume through Linux ublk, with ext4
+as the reference filesystem consumer, alongside native ordered logs and artifacts.
+Generation, branch, and checkpoint semantics apply across these views.
+
 ## Design
 
 - [RFC-001: Version FS Architecture](rfcs/001-version-fs.md)
