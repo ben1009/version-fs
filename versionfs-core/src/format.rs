@@ -1,6 +1,6 @@
 //! Canonical Version FS v1 object and metadata envelopes.
 
-use crate::identity::{GenerationId, LogId, ObjectId, VolumeBoundaryId};
+use crate::identity::{ArtifactId, GenerationId, LogId, ObjectId, VolumeBoundaryId};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -18,6 +18,12 @@ pub const MAX_LOG_RECORD_BYTES: usize = 1024 * 1024;
 pub const LOGICAL_SECTOR_BYTES: u32 = 4 * 1024;
 /// Immutable volume extent size selected for v0.
 pub const EXTENT_BYTES: u32 = 64 * 1024;
+/// Maximum encoded size of one persistent B+ tree node, including its envelope.
+pub const MAX_PERSISTENT_NODE_BYTES: usize = 64 * 1024;
+/// Fixed logical chunk size for large native artifacts.
+pub const ARTIFACT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum payload kept in one inline artifact blob before chunk indexing is used.
+pub const MAX_ARTIFACT_BLOB_BYTES: usize = 64 * 1024;
 
 const OBJECT_MAGIC: [u8; 4] = *b"VFSO";
 const METADATA_MAGIC: [u8; 4] = *b"VFSM";
@@ -54,6 +60,10 @@ pub enum ObjectType {
     ArtifactMapRoot = 10,
     /// A complete immutable Generation descriptor.
     GenerationDescriptor = 11,
+    /// A persistent ordered native log-name map node.
+    LogMapNode = 12,
+    /// A persistent ordered named-artifact map node.
+    ArtifactMapNode = 13,
 }
 
 impl TryFrom<u16> for ObjectType {
@@ -72,6 +82,8 @@ impl TryFrom<u16> for ObjectType {
             9 => Ok(Self::ArtifactIndexNode),
             10 => Ok(Self::ArtifactMapRoot),
             11 => Ok(Self::GenerationDescriptor),
+            12 => Ok(Self::LogMapNode),
+            13 => Ok(Self::ArtifactMapNode),
             other => Err(FormatError::UnknownObjectType(other)),
         }
     }
@@ -165,6 +177,12 @@ pub enum FormatError {
     ObjectReferenceMismatch,
     /// A log segment has an invalid or empty sequence range.
     InvalidLogSegment,
+    /// A persistent tree node violates its canonical shape or size limit.
+    InvalidPersistentNode(&'static str),
+    /// A native log or artifact root/entry is invalid.
+    InvalidNativeView(&'static str),
+    /// A Generation descriptor is invalid.
+    InvalidGenerationDescriptor(&'static str),
 }
 
 impl fmt::Display for FormatError {
@@ -200,6 +218,15 @@ impl fmt::Display for FormatError {
             }
             Self::InvalidLogSegment => {
                 formatter.write_str("invalid log segment range or record count")
+            }
+            Self::InvalidPersistentNode(reason) => {
+                write!(formatter, "invalid persistent node: {reason}")
+            }
+            Self::InvalidNativeView(reason) => {
+                write!(formatter, "invalid native view: {reason}")
+            }
+            Self::InvalidGenerationDescriptor(reason) => {
+                write!(formatter, "invalid Generation descriptor: {reason}")
             }
         }
     }
@@ -252,7 +279,7 @@ impl ObjectRef {
         Ok(object)
     }
 
-    fn validate(self) -> Result<(), FormatError> {
+    pub(crate) fn validate(self) -> Result<(), FormatError> {
         let minimum_len = ENVELOPE_HEADER_BYTES as u64;
         let maximum_len = MAX_ENCODED_OBJECT_BYTES as u64;
         if !(minimum_len..=maximum_len).contains(&self.encoded_len) {
@@ -444,6 +471,96 @@ impl CanonicalEncoder {
     }
 }
 
+/// Strict cursor for canonical fixed-order payloads shared by core decoders.
+pub(crate) struct CanonicalDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CanonicalDecoder<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    pub(crate) fn u8(&mut self) -> Result<u8, FormatError> {
+        let value = *self
+            .bytes
+            .get(self.offset)
+            .ok_or(FormatError::InvalidEnvelope("truncated payload"))?;
+        self.offset += 1;
+        Ok(value)
+    }
+
+    pub(crate) fn u16_le(&mut self) -> Result<u16, FormatError> {
+        Ok(u16::from_le_bytes(self.fixed()?))
+    }
+
+    pub(crate) fn u32_le(&mut self) -> Result<u32, FormatError> {
+        Ok(u32::from_le_bytes(self.fixed()?))
+    }
+
+    pub(crate) fn u64_le(&mut self) -> Result<u64, FormatError> {
+        Ok(u64::from_le_bytes(self.fixed()?))
+    }
+
+    pub(crate) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], FormatError> {
+        let end = self
+            .offset
+            .checked_add(N)
+            .ok_or(FormatError::InvalidEnvelope("payload cursor overflow"))?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(FormatError::InvalidEnvelope("truncated payload"))?;
+        self.offset = end;
+        Ok(slice
+            .try_into()
+            .expect("fixed-length slice was checked before conversion"))
+    }
+
+    pub(crate) fn bytes(&mut self, maximum: usize) -> Result<&'a [u8], FormatError> {
+        let len = usize::try_from(self.u32_le()?)
+            .map_err(|_| FormatError::InvalidEnvelope("byte string length overflow"))?;
+        if len > maximum {
+            return Err(FormatError::PayloadTooLarge {
+                actual: len,
+                maximum,
+            });
+        }
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(FormatError::InvalidEnvelope("byte string length overflow"))?;
+        let bytes = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(FormatError::InvalidEnvelope("truncated byte string"))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    pub(crate) fn object_ref(&mut self) -> Result<ObjectRef, FormatError> {
+        let object_type = ObjectType::try_from(self.u16_le()?)?;
+        let object_id = ObjectId::from_bytes(self.fixed()?);
+        let encoded_len = self.u64_le()?;
+        let reference = ObjectRef {
+            object_type,
+            object_id,
+            encoded_len,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    pub(crate) fn finish(self) -> Result<(), FormatError> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(FormatError::InvalidEnvelope("trailing payload bytes"))
+        }
+    }
+}
+
 /// Encodes strictly increasing bytewise-sorted key/value entries.
 pub fn encode_ordered_entries(entries: &[(&[u8], &[u8])]) -> Result<Vec<u8>, FormatError> {
     let count = u32::try_from(entries.len()).map_err(|_| FormatError::PayloadTooLarge {
@@ -561,6 +678,386 @@ impl VolumeRoot {
         encoder.object_ref(self.extent_map_root);
         encode_object(ObjectType::VolumeRoot, &encoder.finish())
     }
+
+    /// Decodes and validates a complete volume root object.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let object = decode_object(bytes)?;
+        if object.object_type != ObjectType::VolumeRoot {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        let mut decoder = CanonicalDecoder::new(object.payload);
+        let geometry = VolumeGeometry {
+            capacity_bytes: decoder.u64_le()?,
+            logical_sector_bytes: decoder.u32_le()?,
+            extent_bytes: decoder.u32_le()?,
+        };
+        geometry.validate_range(0, 0)?;
+        let extent_map_root = decoder.object_ref()?;
+        decoder.finish()?;
+        if extent_map_root.object_type != ObjectType::VolumeMapNode {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        Ok(Self {
+            geometry,
+            extent_map_root,
+        })
+    }
+}
+
+/// Complete immutable ordered-log map root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogMapRoot {
+    /// Root node of the log-name to log-state map.
+    pub log_index_root: ObjectRef,
+    /// Number of visible named logs in the map.
+    pub log_count: u64,
+}
+
+impl LogMapRoot {
+    /// Encodes this complete root as a typed immutable object.
+    pub fn encode(self) -> Result<Vec<u8>, FormatError> {
+        if self.log_index_root.object_type != ObjectType::LogMapNode {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        self.log_index_root.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.u64_le(self.log_count);
+        encoder.object_ref(self.log_index_root);
+        encode_object(ObjectType::LogMapRoot, &encoder.finish())
+    }
+
+    /// Decodes a complete native log-map root.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let object = decode_object(bytes)?;
+        if object.object_type != ObjectType::LogMapRoot {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        let mut decoder = CanonicalDecoder::new(object.payload);
+        let log_count = decoder.u64_le()?;
+        let log_index_root = decoder.object_ref()?;
+        decoder.finish()?;
+        if log_index_root.object_type != ObjectType::LogMapNode {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        Ok(Self {
+            log_index_root,
+            log_count,
+        })
+    }
+}
+
+/// One named log's complete visible range and segment index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogMapEntry {
+    /// Stable log identity, independent of its display name.
+    pub log_id: LogId,
+    /// First visible sequence number, inclusive.
+    pub first_seq: u64,
+    /// End of the visible sequence range, exclusive.
+    pub end_seq: u64,
+    /// Root of the persistent segment-range index.
+    pub segment_index_root: ObjectRef,
+}
+
+impl LogMapEntry {
+    /// Encodes a log-map leaf value.
+    pub fn encode(self) -> Result<Vec<u8>, FormatError> {
+        if self.first_seq > self.end_seq
+            || self.segment_index_root.object_type != ObjectType::LogSegmentIndexNode
+        {
+            return Err(FormatError::InvalidNativeView(
+                "invalid log range or index root",
+            ));
+        }
+        self.segment_index_root.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.fixed(self.log_id.as_bytes());
+        encoder.u64_le(self.first_seq);
+        encoder.u64_le(self.end_seq);
+        encoder.object_ref(self.segment_index_root);
+        Ok(encoder.finish())
+    }
+
+    /// Decodes a log-map leaf value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut decoder = CanonicalDecoder::new(bytes);
+        let log_id = LogId::from_bytes(decoder.fixed()?);
+        let first_seq = decoder.u64_le()?;
+        let end_seq = decoder.u64_le()?;
+        let segment_index_root = decoder.object_ref()?;
+        decoder.finish()?;
+        if first_seq > end_seq || segment_index_root.object_type != ObjectType::LogSegmentIndexNode
+        {
+            return Err(FormatError::InvalidNativeView(
+                "invalid log range or index root",
+            ));
+        }
+        Ok(Self {
+            log_id,
+            first_seq,
+            end_seq,
+            segment_index_root,
+        })
+    }
+}
+
+/// A segment-index leaf value, with an exclusive end sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentIndexEntry {
+    /// Exclusive end sequence of the referenced sealed segment.
+    pub end_seq: u64,
+    /// Immutable sealed log segment.
+    pub segment: ObjectRef,
+}
+
+impl SegmentIndexEntry {
+    /// Encodes a segment-index leaf value.
+    pub fn encode(self) -> Result<Vec<u8>, FormatError> {
+        if self.segment.object_type != ObjectType::LogSegment {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        self.segment.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.u64_le(self.end_seq);
+        encoder.object_ref(self.segment);
+        Ok(encoder.finish())
+    }
+
+    /// Decodes a segment-index leaf value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut decoder = CanonicalDecoder::new(bytes);
+        let end_seq = decoder.u64_le()?;
+        let segment = decoder.object_ref()?;
+        decoder.finish()?;
+        if segment.object_type != ObjectType::LogSegment {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        Ok(Self { end_seq, segment })
+    }
+}
+
+/// One named immutable artifact and its declared payload dependencies.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactDescriptor {
+    /// Stable artifact identity, independent of its name.
+    pub artifact_id: ArtifactId,
+    /// Exact logical payload length.
+    pub logical_len: u64,
+    /// Blob reference for small artifacts or chunk-index root for large ones.
+    pub content_root: ObjectRef,
+    /// Explicit strong references to artifact payload dependencies.
+    pub dependencies: Vec<ObjectRef>,
+}
+
+impl ArtifactDescriptor {
+    /// Encodes an artifact-map leaf value.
+    pub fn encode(&self) -> Result<Vec<u8>, FormatError> {
+        let expected_type = if self.logical_len <= MAX_ARTIFACT_BLOB_BYTES as u64 {
+            ObjectType::ArtifactBlob
+        } else {
+            ObjectType::ArtifactIndexNode
+        };
+        if self.content_root.object_type != expected_type {
+            return Err(FormatError::InvalidNativeView(
+                "artifact length and content representation disagree",
+            ));
+        }
+        if expected_type == ObjectType::ArtifactBlob
+            && self.content_root.encoded_len
+                != (ENVELOPE_HEADER_BYTES as u64).saturating_add(self.logical_len)
+        {
+            return Err(FormatError::InvalidNativeView(
+                "inline artifact length differs from its blob reference",
+            ));
+        }
+        self.content_root.validate()?;
+        let dependency_bytes = self
+            .dependencies
+            .len()
+            .checked_mul(OBJECT_REFERENCE_BYTES)
+            .and_then(|size| size.checked_add(4 + 16 + 8 + OBJECT_REFERENCE_BYTES))
+            .ok_or(FormatError::InvalidNativeView(
+                "artifact dependency count overflow",
+            ))?;
+        // The descriptor is stored as one leaf value. Reserve the object
+        // envelope, leaf count/entry framing, and shortest valid UTF-8 name so
+        // every accepted descriptor fits at least one artifact-map node.
+        let max_leaf_value_bytes = MAX_PERSISTENT_NODE_BYTES - ENVELOPE_HEADER_BYTES - 4 - 8 - 1;
+        if dependency_bytes > max_leaf_value_bytes {
+            return Err(FormatError::PayloadTooLarge {
+                actual: dependency_bytes,
+                maximum: max_leaf_value_bytes,
+            });
+        }
+        let mut encoder = CanonicalEncoder::new();
+        encoder.fixed(self.artifact_id.as_bytes());
+        encoder.u64_le(self.logical_len);
+        encoder.object_ref(self.content_root);
+        encoder.u32_le(
+            u32::try_from(self.dependencies.len())
+                .map_err(|_| FormatError::InvalidNativeView("too many artifact dependencies"))?,
+        );
+        for dependency in &self.dependencies {
+            if !matches!(
+                dependency.object_type,
+                ObjectType::ArtifactBlob | ObjectType::ArtifactChunk
+            ) {
+                return Err(FormatError::InvalidNativeView(
+                    "artifact dependencies must reference immutable payload objects",
+                ));
+            }
+            dependency.validate()?;
+            encoder.object_ref(*dependency);
+        }
+        Ok(encoder.finish())
+    }
+
+    /// Decodes an artifact-map leaf value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut decoder = CanonicalDecoder::new(bytes);
+        let artifact_id = ArtifactId::from_bytes(decoder.fixed()?);
+        let logical_len = decoder.u64_le()?;
+        let content_root = decoder.object_ref()?;
+        let dependency_count = usize::try_from(decoder.u32_le()?)
+            .map_err(|_| FormatError::InvalidNativeView("dependency count overflow"))?;
+        let dependency_bytes = dependency_count
+            .checked_mul(OBJECT_REFERENCE_BYTES)
+            .ok_or(FormatError::InvalidNativeView("dependency count overflow"))?;
+        let max_leaf_value_bytes = MAX_PERSISTENT_NODE_BYTES - ENVELOPE_HEADER_BYTES - 4 - 8 - 1;
+        let descriptor_bytes = dependency_bytes
+            .checked_add(4 + 16 + 8 + OBJECT_REFERENCE_BYTES)
+            .ok_or(FormatError::InvalidNativeView("dependency count overflow"))?;
+        if descriptor_bytes > max_leaf_value_bytes {
+            return Err(FormatError::PayloadTooLarge {
+                actual: descriptor_bytes,
+                maximum: max_leaf_value_bytes,
+            });
+        }
+        if dependency_bytes > decoder.bytes.len().saturating_sub(decoder.offset) {
+            return Err(FormatError::InvalidNativeView("truncated dependency list"));
+        }
+        let mut dependencies = Vec::with_capacity(dependency_count);
+        for _ in 0..dependency_count {
+            let dependency = decoder.object_ref()?;
+            if !matches!(
+                dependency.object_type,
+                ObjectType::ArtifactBlob | ObjectType::ArtifactChunk
+            ) {
+                return Err(FormatError::InvalidNativeView(
+                    "artifact dependencies must reference immutable payload objects",
+                ));
+            }
+            dependencies.push(dependency);
+        }
+        decoder.finish()?;
+        let descriptor = Self {
+            artifact_id,
+            logical_len,
+            content_root,
+            dependencies,
+        };
+        let expected_type = if logical_len <= MAX_ARTIFACT_BLOB_BYTES as u64 {
+            ObjectType::ArtifactBlob
+        } else {
+            ObjectType::ArtifactIndexNode
+        };
+        if descriptor.content_root.object_type != expected_type {
+            return Err(FormatError::InvalidNativeView(
+                "artifact length and content representation disagree",
+            ));
+        }
+        if expected_type == ObjectType::ArtifactBlob
+            && descriptor.content_root.encoded_len
+                != (ENVELOPE_HEADER_BYTES as u64).saturating_add(logical_len)
+        {
+            return Err(FormatError::InvalidNativeView(
+                "inline artifact length differs from its blob reference",
+            ));
+        }
+        Ok(descriptor)
+    }
+}
+
+/// One artifact-index leaf value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactChunkEntry {
+    /// Actual payload bytes in this chunk.
+    pub actual_len: u32,
+    /// Immutable artifact-chunk object reference.
+    pub chunk: ObjectRef,
+}
+
+impl ArtifactChunkEntry {
+    /// Encodes one artifact-chunk index leaf value.
+    pub fn encode(self) -> Result<Vec<u8>, FormatError> {
+        if self.actual_len == 0
+            || self.chunk.object_type != ObjectType::ArtifactChunk
+            || self.actual_len as usize > ARTIFACT_CHUNK_BYTES
+            || self.chunk.encoded_len != (ENVELOPE_HEADER_BYTES + self.actual_len as usize) as u64
+        {
+            return Err(FormatError::InvalidNativeView(
+                "invalid artifact chunk length",
+            ));
+        }
+        self.chunk.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.u32_le(self.actual_len);
+        encoder.object_ref(self.chunk);
+        Ok(encoder.finish())
+    }
+
+    /// Decodes one artifact-chunk index leaf value.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut decoder = CanonicalDecoder::new(bytes);
+        let actual_len = decoder.u32_le()?;
+        let chunk = decoder.object_ref()?;
+        decoder.finish()?;
+        let entry = Self { actual_len, chunk };
+        entry.encode()?;
+        Ok(entry)
+    }
+}
+
+/// Complete immutable named-artifact map root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactMapRoot {
+    /// Root node of the artifact-name map.
+    pub artifact_index_root: ObjectRef,
+    /// Number of visible named artifacts in the map.
+    pub artifact_count: u64,
+}
+
+impl ArtifactMapRoot {
+    /// Encodes this complete root as a typed immutable object.
+    pub fn encode(self) -> Result<Vec<u8>, FormatError> {
+        if self.artifact_index_root.object_type != ObjectType::ArtifactMapNode {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        self.artifact_index_root.validate()?;
+        let mut encoder = CanonicalEncoder::new();
+        encoder.u64_le(self.artifact_count);
+        encoder.object_ref(self.artifact_index_root);
+        encode_object(ObjectType::ArtifactMapRoot, &encoder.finish())
+    }
+
+    /// Decodes a complete native artifact-map root.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let object = decode_object(bytes)?;
+        if object.object_type != ObjectType::ArtifactMapRoot {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        let mut decoder = CanonicalDecoder::new(object.payload);
+        let artifact_count = decoder.u64_le()?;
+        let artifact_index_root = decoder.object_ref()?;
+        decoder.finish()?;
+        if artifact_index_root.object_type != ObjectType::ArtifactMapNode {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        Ok(Self {
+            artifact_index_root,
+            artifact_count,
+        })
+    }
 }
 
 /// One immutable append batch in a native ordered log.
@@ -629,6 +1126,50 @@ impl LogSegment {
         }
         encode_object(ObjectType::LogSegment, &encoder.finish())
     }
+
+    /// Decodes a complete sealed segment and validates its ordered range.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let object = decode_object(bytes)?;
+        if object.object_type != ObjectType::LogSegment {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        let mut decoder = CanonicalDecoder::new(object.payload);
+        let log_id = LogId::from_bytes(decoder.fixed()?);
+        let first_seq = decoder.u64_le()?;
+        let end_seq = decoder.u64_le()?;
+        let record_count =
+            usize::try_from(decoder.u32_le()?).map_err(|_| FormatError::InvalidLogSegment)?;
+        if record_count == 0 || record_count > MAX_LOG_RECORDS {
+            return Err(FormatError::InvalidLogSegment);
+        }
+        let mut records = Vec::with_capacity(record_count);
+        for _ in 0..record_count {
+            records.push(decoder.bytes(MAX_LOG_RECORD_BYTES)?.to_vec());
+        }
+        let attachment_count =
+            usize::try_from(decoder.u32_le()?).map_err(|_| FormatError::InvalidLogSegment)?;
+        let remaining = decoder.bytes.len().saturating_sub(decoder.offset);
+        let attachment_bytes = attachment_count
+            .checked_mul(OBJECT_REFERENCE_BYTES)
+            .ok_or(FormatError::InvalidLogSegment)?;
+        if attachment_bytes > remaining {
+            return Err(FormatError::InvalidLogSegment);
+        }
+        let mut attachments = Vec::with_capacity(attachment_count);
+        for _ in 0..attachment_count {
+            attachments.push(decoder.object_ref()?);
+        }
+        decoder.finish()?;
+        let segment = Self {
+            log_id,
+            first_seq,
+            end_seq,
+            records,
+            attachments,
+        };
+        segment.encode()?;
+        Ok(segment)
+    }
 }
 
 /// Complete immutable Generation descriptor payload.
@@ -678,5 +1219,43 @@ impl GenerationDescriptor {
         encoder.fixed(self.volume_boundary_id.as_bytes());
         encoder.u64_le(self.created_at_unix_ms);
         encode_object(ObjectType::GenerationDescriptor, &encoder.finish())
+    }
+
+    /// Decodes a complete immutable Generation descriptor.
+    pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let object = decode_object(bytes)?;
+        if object.object_type != ObjectType::GenerationDescriptor {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        let mut decoder = CanonicalDecoder::new(object.payload);
+        let generation_id = GenerationId::from_bytes(decoder.fixed()?);
+        let parent_generation_id = match decoder.u8()? {
+            0 => None,
+            1 => Some(GenerationId::from_bytes(decoder.fixed()?)),
+            _ => {
+                return Err(FormatError::InvalidGenerationDescriptor(
+                    "invalid parent presence tag",
+                ));
+            }
+        };
+        let volume_root = decoder.object_ref()?;
+        let logs_root = decoder.object_ref()?;
+        let artifacts_root = decoder.object_ref()?;
+        let capture_mode = CaptureMode::try_from(decoder.u8()?)?;
+        let volume_boundary_id = VolumeBoundaryId::from_bytes(decoder.fixed()?);
+        let created_at_unix_ms = decoder.u64_le()?;
+        decoder.finish()?;
+        let descriptor = Self {
+            generation_id,
+            parent_generation_id,
+            volume_root,
+            logs_root,
+            artifacts_root,
+            capture_mode,
+            volume_boundary_id,
+            created_at_unix_ms,
+        };
+        descriptor.encode()?;
+        Ok(descriptor)
     }
 }

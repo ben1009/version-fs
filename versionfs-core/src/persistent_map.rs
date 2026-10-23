@@ -1,0 +1,1147 @@
+//! Immutable copy-on-write ordered maps stored as bounded canonical objects.
+
+use crate::format::{
+    CanonicalDecoder, CanonicalEncoder, FormatError, MAX_PERSISTENT_NODE_BYTES, ObjectRef,
+    ObjectType, encode_object, encode_ordered_entries,
+};
+use crate::identity::ObjectId;
+use std::cmp::Ordering;
+use thiserror::Error;
+
+const INTERNAL_NODE_MARKER: u32 = u32::MAX;
+const OBJECT_REFERENCE_BYTES: usize = 42;
+
+/// Minimal immutable-object access required by the persistent map algorithms.
+///
+/// Implementations must treat an object ID as immutable. The map verifies every
+/// retrieved value against the complete typed reference before decoding it.
+pub trait MapObjectStore {
+    /// Reads an object by content identity.
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String>;
+
+    /// Stores bytes under their already-computed content identity.
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String>;
+}
+
+/// Errors returned while reading or mutating a persistent ordered map.
+#[derive(Debug, Error)]
+pub enum PersistentMapError {
+    /// A canonical object or node was malformed.
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    /// The immutable object repository failed.
+    #[error("object repository error: {0}")]
+    Store(String),
+    /// A referenced immutable object was unavailable.
+    #[error("missing persistent-map object {0}")]
+    MissingObject(ObjectId),
+    /// A single key/value entry cannot fit in one bounded leaf node.
+    #[error("key/value entry exceeds the 64 KiB persistent-node limit")]
+    EntryTooLarge,
+}
+
+/// One key change produced by a structural map diff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MapChange {
+    /// A key only exists in the newer map.
+    Added {
+        /// Changed key.
+        key: Vec<u8>,
+        /// New value.
+        value: Vec<u8>,
+    },
+    /// A key only exists in the older map.
+    Removed {
+        /// Changed key.
+        key: Vec<u8>,
+        /// Previous value.
+        value: Vec<u8>,
+    },
+    /// A key exists in both maps with different values.
+    Updated {
+        /// Changed key.
+        key: Vec<u8>,
+        /// Previous value.
+        before: Vec<u8>,
+        /// New value.
+        after: Vec<u8>,
+    },
+}
+
+/// An immutable root for a typed persistent B+ tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistentBTree {
+    node_type: ObjectType,
+    root: ObjectRef,
+}
+
+impl PersistentBTree {
+    /// Creates a new empty map and stores its canonical empty leaf root.
+    pub fn empty<S: MapObjectStore>(
+        node_type: ObjectType,
+        store: &mut S,
+    ) -> Result<Self, PersistentMapError> {
+        validate_node_type(node_type)?;
+        let root = store_node(store, node_type, &Node::Leaf(Vec::new()))?;
+        Ok(Self { node_type, root })
+    }
+
+    /// Opens a typed map at a complete immutable root reference.
+    pub fn from_root(root: ObjectRef) -> Result<Self, PersistentMapError> {
+        validate_node_type(root.object_type)?;
+        root.validate()?;
+        Ok(Self {
+            node_type: root.object_type,
+            root,
+        })
+    }
+
+    /// Returns the immutable root node reference.
+    pub const fn root(&self) -> ObjectRef {
+        self.root
+    }
+
+    /// Returns this map's node object type.
+    pub const fn node_type(&self) -> ObjectType {
+        self.node_type
+    }
+
+    /// Looks up a key without materializing unrelated subtrees.
+    pub fn get<S: MapObjectStore>(
+        &self,
+        store: &S,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, PersistentMapError> {
+        let mut current = self.root;
+        let mut expected_level = None;
+        let mut expected_max = None;
+        loop {
+            let node = load_node(store, current, self.node_type)?;
+            if expected_level.is_some_and(|level| level != node.level()) {
+                return Err(
+                    FormatError::InvalidPersistentNode("child level differs from parent").into(),
+                );
+            }
+            if expected_max
+                .as_deref()
+                .is_some_and(|maximum: &[u8]| node.max_key() != Some(maximum))
+            {
+                return Err(FormatError::InvalidPersistentNode(
+                    "child maximum differs from parent separator",
+                )
+                .into());
+            }
+            match node {
+                Node::Leaf(entries) => {
+                    return Ok(entries
+                        .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
+                        .ok()
+                        .map(|index| entries[index].1.clone()));
+                }
+                Node::Internal { level, children } => {
+                    let Some(index) = child_index(&children, key) else {
+                        return Ok(None);
+                    };
+                    current = children[index].1;
+                    expected_level = Some(level - 1);
+                    expected_max = Some(children[index].0.clone());
+                }
+            }
+        }
+    }
+
+    /// Returns a new map with one key inserted or replaced, sharing unchanged nodes.
+    pub fn insert<S: MapObjectStore>(
+        &self,
+        store: &mut S,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<Self, PersistentMapError> {
+        let edit = insert_node(store, self.root, self.node_type, None, None, key, value)?;
+        if !edit.changed {
+            return Ok(*self);
+        }
+        let root = if edit.children.len() == 1 {
+            edit.children[0].1
+        } else {
+            let child_level = load_node(store, edit.children[0].1, self.node_type)?.level();
+            let level = child_level
+                .checked_add(1)
+                .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
+            store_node(
+                store,
+                self.node_type,
+                &Node::Internal {
+                    level,
+                    children: edit.children,
+                },
+            )?
+        };
+        Ok(Self {
+            node_type: self.node_type,
+            root,
+        })
+    }
+
+    /// Returns a new map with one key removed, sharing unchanged nodes.
+    pub fn remove<S: MapObjectStore>(
+        &self,
+        store: &mut S,
+        key: &[u8],
+    ) -> Result<Self, PersistentMapError> {
+        let edit = remove_node(store, self.root, self.node_type, None, None, key)?;
+        if !edit.changed {
+            return Ok(*self);
+        }
+        let root = if edit.children.is_empty() {
+            store_node(store, self.node_type, &Node::Leaf(Vec::new()))?
+        } else if edit.children.len() > 1 {
+            let child_level = load_node(store, edit.children[0].1, self.node_type)?.level();
+            let level = child_level
+                .checked_add(1)
+                .ok_or(FormatError::InvalidPersistentNode("tree height overflow"))?;
+            store_node(
+                store,
+                self.node_type,
+                &Node::Internal {
+                    level,
+                    children: edit.children,
+                },
+            )?
+        } else {
+            edit.children[0].1
+        };
+        let root = collapse_root(store, root, self.node_type)?;
+        Ok(Self {
+            node_type: self.node_type,
+            root,
+        })
+    }
+
+    /// Returns all entries in strict bytewise key order.
+    pub fn entries<S: MapObjectStore>(
+        &self,
+        store: &S,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, PersistentMapError> {
+        let mut entries = Vec::new();
+        let mut nodes = Vec::new();
+        collect_subtree(
+            store,
+            self.root,
+            self.node_type,
+            None,
+            None,
+            &mut entries,
+            &mut nodes,
+        )?;
+        Ok(entries)
+    }
+
+    /// Returns ordered entries and every reachable map-node reference.
+    pub fn entries_and_nodes<S: MapObjectStore>(
+        &self,
+        store: &S,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<ObjectRef>), PersistentMapError> {
+        let mut entries = Vec::new();
+        let mut nodes = Vec::new();
+        collect_subtree(
+            store,
+            self.root,
+            self.node_type,
+            None,
+            None,
+            &mut entries,
+            &mut nodes,
+        )?;
+        Ok((entries, nodes))
+    }
+
+    /// Diffs two maps, skipping identical subtrees and falling back to sorted
+    /// entry merging where tree boundaries differ.
+    pub fn diff<S: MapObjectStore>(
+        &self,
+        newer: &Self,
+        store: &S,
+    ) -> Result<Vec<MapChange>, PersistentMapError> {
+        if self.node_type != newer.node_type {
+            return Err(FormatError::InvalidPersistentNode(
+                "cannot diff maps with different node types",
+            )
+            .into());
+        }
+        let mut changes = Vec::new();
+        diff_subtrees(
+            store,
+            self.root,
+            newer.root,
+            self.node_type,
+            None,
+            None,
+            None,
+            None,
+            &mut changes,
+        )?;
+        Ok(changes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Node {
+    Leaf(Vec<(Vec<u8>, Vec<u8>)>),
+    Internal {
+        level: u16,
+        /// Each key is the maximum key contained in the corresponding child.
+        children: Vec<(Vec<u8>, ObjectRef)>,
+    },
+}
+
+impl Node {
+    fn level(&self) -> u16 {
+        match self {
+            Self::Leaf(_) => 0,
+            Self::Internal { level, .. } => *level,
+        }
+    }
+
+    fn max_key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Leaf(entries) => entries.last().map(|entry| entry.0.as_slice()),
+            Self::Internal { children, .. } => children.last().map(|entry| entry.0.as_slice()),
+        }
+    }
+}
+
+struct NodeEdit {
+    children: Vec<(Vec<u8>, ObjectRef)>,
+    changed: bool,
+}
+
+fn validate_node_type(node_type: ObjectType) -> Result<(), PersistentMapError> {
+    if matches!(
+        node_type,
+        ObjectType::VolumeMapNode
+            | ObjectType::LogMapNode
+            | ObjectType::LogSegmentIndexNode
+            | ObjectType::ArtifactMapNode
+            | ObjectType::ArtifactIndexNode
+    ) {
+        Ok(())
+    } else {
+        Err(FormatError::InvalidPersistentNode("object type is not a persistent map node").into())
+    }
+}
+
+fn load_node<S: MapObjectStore>(
+    store: &S,
+    reference: ObjectRef,
+    expected_type: ObjectType,
+) -> Result<Node, PersistentMapError> {
+    if reference.object_type != expected_type {
+        return Err(FormatError::ObjectReferenceMismatch.into());
+    }
+    let bytes = store
+        .get(reference.object_id)
+        .map_err(PersistentMapError::Store)?
+        .ok_or(PersistentMapError::MissingObject(reference.object_id))?;
+    let object = reference.verify(&bytes)?;
+    Ok(decode_node(object.payload, expected_type)?)
+}
+
+fn store_node<S: MapObjectStore>(
+    store: &mut S,
+    node_type: ObjectType,
+    node: &Node,
+) -> Result<ObjectRef, PersistentMapError> {
+    let bytes = encode_node(node_type, node)?;
+    let reference = ObjectRef::from_encoded(&bytes)?;
+    store
+        .put(reference.object_id, bytes)
+        .map_err(PersistentMapError::Store)?;
+    Ok(reference)
+}
+
+fn encode_node(node_type: ObjectType, node: &Node) -> Result<Vec<u8>, FormatError> {
+    validate_node_type(node_type).map_err(|_| {
+        FormatError::InvalidPersistentNode("object type is not a persistent map node")
+    })?;
+    let bytes = match node {
+        Node::Leaf(entries) => {
+            let refs: Vec<(&[u8], &[u8])> = entries
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect();
+            encode_ordered_entries(&refs)?
+        }
+        Node::Internal { level, children } => {
+            if *level == 0 || children.is_empty() {
+                return Err(FormatError::InvalidPersistentNode(
+                    "internal nodes require a positive level and at least one child",
+                ));
+            }
+            ensure_strict_keys(children.iter().map(|entry| entry.0.as_slice()))?;
+            let mut encoder = CanonicalEncoder::new();
+            encoder.u32_le(INTERNAL_NODE_MARKER);
+            encoder.u16_le(*level);
+            encoder.u32_le(
+                u32::try_from(children.len())
+                    .map_err(|_| FormatError::InvalidPersistentNode("too many children"))?,
+            );
+            for (max_key, child) in children {
+                if child.object_type != node_type {
+                    return Err(FormatError::ObjectReferenceMismatch);
+                }
+                child.validate()?;
+                encoder.bytes(max_key)?;
+                encoder.object_ref(*child);
+            }
+            encoder.finish()
+        }
+    };
+    let encoded = encode_object(node_type, &bytes)?;
+    if encoded.len() > MAX_PERSISTENT_NODE_BYTES {
+        return Err(FormatError::InvalidPersistentNode(
+            "encoded node exceeds 64 KiB",
+        ));
+    }
+    Ok(encoded)
+}
+
+fn decode_node(payload: &[u8], node_type: ObjectType) -> Result<Node, FormatError> {
+    if payload.len() + crate::format::ENVELOPE_HEADER_BYTES > MAX_PERSISTENT_NODE_BYTES {
+        return Err(FormatError::InvalidPersistentNode(
+            "encoded node exceeds 64 KiB",
+        ));
+    }
+    if payload.len() < 4 {
+        return Err(FormatError::InvalidPersistentNode("truncated node header"));
+    }
+    let marker = u32::from_le_bytes(payload[..4].try_into().expect("checked four-byte prefix"));
+    if marker != INTERNAL_NODE_MARKER {
+        return decode_leaf(payload);
+    }
+
+    let mut decoder = CanonicalDecoder::new(&payload[4..]);
+    let level = decoder.u16_le()?;
+    let count = usize::try_from(decoder.u32_le()?)
+        .map_err(|_| FormatError::InvalidPersistentNode("child count overflow"))?;
+    if level == 0 || count == 0 {
+        return Err(FormatError::InvalidPersistentNode(
+            "internal nodes require a positive level and at least one child",
+        ));
+    }
+    let min_child_bytes = 4_usize + OBJECT_REFERENCE_BYTES;
+    let required = count
+        .checked_mul(min_child_bytes)
+        .ok_or(FormatError::InvalidPersistentNode("child count overflow"))?;
+    if required > payload.len().saturating_sub(10) {
+        return Err(FormatError::InvalidPersistentNode("truncated child list"));
+    }
+    let mut children = Vec::with_capacity(count);
+    for _ in 0..count {
+        let max_key = decoder.bytes(MAX_PERSISTENT_NODE_BYTES)?.to_vec();
+        let child = decoder.object_ref()?;
+        if child.object_type != node_type {
+            return Err(FormatError::ObjectReferenceMismatch);
+        }
+        children.push((max_key, child));
+    }
+    decoder.finish()?;
+    ensure_strict_keys(children.iter().map(|entry| entry.0.as_slice()))?;
+    Ok(Node::Internal { level, children })
+}
+
+fn decode_leaf(payload: &[u8]) -> Result<Node, FormatError> {
+    let mut decoder = CanonicalDecoder::new(payload);
+    let count = usize::try_from(decoder.u32_le()?)
+        .map_err(|_| FormatError::InvalidPersistentNode("entry count overflow"))?;
+    let min_entry_bytes = count
+        .checked_mul(8)
+        .ok_or(FormatError::InvalidPersistentNode("entry count overflow"))?;
+    if min_entry_bytes > payload.len().saturating_sub(4) {
+        return Err(FormatError::InvalidPersistentNode("truncated leaf entries"));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push((
+            decoder.bytes(MAX_PERSISTENT_NODE_BYTES)?.to_vec(),
+            decoder.bytes(MAX_PERSISTENT_NODE_BYTES)?.to_vec(),
+        ));
+    }
+    decoder.finish()?;
+    ensure_strict_keys(entries.iter().map(|entry| entry.0.as_slice()))?;
+    Ok(Node::Leaf(entries))
+}
+
+fn ensure_strict_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Result<(), FormatError> {
+    let mut previous = None;
+    for key in keys {
+        if previous.is_some_and(|value: &[u8]| value >= key) {
+            return Err(FormatError::UnorderedKeys);
+        }
+        previous = Some(key);
+    }
+    Ok(())
+}
+
+fn encoded_len(node_type: ObjectType, node: &Node) -> Result<usize, FormatError> {
+    let payload_len = match node {
+        Node::Leaf(entries) => entries.iter().try_fold(4_usize, |size, (key, value)| {
+            size.checked_add(8)
+                .and_then(|size| size.checked_add(key.len()))
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(FormatError::InvalidPersistentNode("leaf size overflow"))
+        })?,
+        Node::Internal { children, .. } => {
+            children.iter().try_fold(10_usize, |size, (key, _)| {
+                size.checked_add(4 + OBJECT_REFERENCE_BYTES)
+                    .and_then(|size| size.checked_add(key.len()))
+                    .ok_or(FormatError::InvalidPersistentNode("internal size overflow"))
+            })?
+        }
+    };
+    validate_node_type(node_type).map_err(|_| {
+        FormatError::InvalidPersistentNode("object type is not a persistent map node")
+    })?;
+    payload_len
+        .checked_add(crate::format::ENVELOPE_HEADER_BYTES)
+        .ok_or(FormatError::InvalidPersistentNode("node size overflow"))
+}
+
+fn write_or_split<S: MapObjectStore>(
+    store: &mut S,
+    node_type: ObjectType,
+    node: Node,
+) -> Result<Vec<(Vec<u8>, ObjectRef)>, PersistentMapError> {
+    if encoded_len(node_type, &node)? <= MAX_PERSISTENT_NODE_BYTES {
+        let reference = store_node(store, node_type, &node)?;
+        return Ok(node
+            .max_key()
+            .map(|max_key| vec![(max_key.to_vec(), reference)])
+            .unwrap_or_default());
+    }
+    let (left, right) = split_node(node_type, node)?;
+    let left_ref = store_node(store, node_type, &left)?;
+    let right_ref = store_node(store, node_type, &right)?;
+    Ok(vec![
+        (
+            left.max_key().expect("split nodes are non-empty").to_vec(),
+            left_ref,
+        ),
+        (
+            right.max_key().expect("split nodes are non-empty").to_vec(),
+            right_ref,
+        ),
+    ])
+}
+
+fn split_node(node_type: ObjectType, node: Node) -> Result<(Node, Node), PersistentMapError> {
+    let len = match &node {
+        Node::Leaf(entries) => entries.len(),
+        Node::Internal { children, .. } => children.len(),
+    };
+    if len < 2 {
+        return Err(PersistentMapError::EntryTooLarge);
+    }
+    let mut best: Option<(usize, usize)> = None;
+    for split_at in 1..len {
+        let (left, right) = split_at_node(&node, split_at);
+        let left_len = encoded_len(node_type, &left)?;
+        let right_len = encoded_len(node_type, &right)?;
+        if left_len <= MAX_PERSISTENT_NODE_BYTES && right_len <= MAX_PERSISTENT_NODE_BYTES {
+            let difference = left_len.abs_diff(right_len);
+            if best.is_none_or(|(_, current)| difference < current) {
+                best = Some((split_at, difference));
+            }
+        }
+    }
+    let Some((split_at, _)) = best else {
+        return Err(PersistentMapError::EntryTooLarge);
+    };
+    Ok(split_at_node(&node, split_at))
+}
+
+fn split_at_node(node: &Node, split_at: usize) -> (Node, Node) {
+    match node {
+        Node::Leaf(entries) => (
+            Node::Leaf(entries[..split_at].to_vec()),
+            Node::Leaf(entries[split_at..].to_vec()),
+        ),
+        Node::Internal { level, children } => (
+            Node::Internal {
+                level: *level,
+                children: children[..split_at].to_vec(),
+            },
+            Node::Internal {
+                level: *level,
+                children: children[split_at..].to_vec(),
+            },
+        ),
+    }
+}
+
+fn child_index(children: &[(Vec<u8>, ObjectRef)], key: &[u8]) -> Option<usize> {
+    children
+        .iter()
+        .position(|(maximum, _)| maximum.as_slice() >= key)
+        .or_else(|| (!children.is_empty()).then_some(children.len() - 1))
+}
+
+fn insert_node<S: MapObjectStore>(
+    store: &mut S,
+    reference: ObjectRef,
+    node_type: ObjectType,
+    expected_level: Option<u16>,
+    expected_max: Option<Vec<u8>>,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> Result<NodeEdit, PersistentMapError> {
+    let node = load_node(store, reference, node_type)?;
+    if expected_level.is_some_and(|level| level != node.level()) {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if expected_max
+        .as_deref()
+        .is_some_and(|maximum| node.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    match node {
+        Node::Leaf(mut entries) => {
+            match entries.binary_search_by(|(candidate, _)| candidate.cmp(&key)) {
+                Ok(index) if entries[index].1 == value => {
+                    return Ok(NodeEdit {
+                        children: vec![(entries[index].0.clone(), reference)],
+                        changed: false,
+                    });
+                }
+                Ok(index) => entries[index].1 = value,
+                Err(index) => entries.insert(index, (key, value)),
+            }
+            Ok(NodeEdit {
+                children: write_or_split(store, node_type, Node::Leaf(entries))?,
+                changed: true,
+            })
+        }
+        Node::Internal {
+            level,
+            mut children,
+        } => {
+            let index = child_index(&children, &key)
+                .ok_or(FormatError::InvalidPersistentNode("empty internal node"))?;
+            let child_ref = children[index].1;
+            let edit = insert_node(
+                store,
+                child_ref,
+                node_type,
+                Some(level - 1),
+                Some(children[index].0.clone()),
+                key,
+                value,
+            )?;
+            if !edit.changed {
+                return Ok(NodeEdit {
+                    children: vec![(
+                        children.last().expect("non-empty internal node").0.clone(),
+                        reference,
+                    )],
+                    changed: false,
+                });
+            }
+            children.remove(index);
+            for (offset, child) in edit.children.into_iter().enumerate() {
+                children.insert(index + offset, child);
+            }
+            Ok(NodeEdit {
+                children: write_or_split(store, node_type, Node::Internal { level, children })?,
+                changed: true,
+            })
+        }
+    }
+}
+
+fn remove_node<S: MapObjectStore>(
+    store: &mut S,
+    reference: ObjectRef,
+    node_type: ObjectType,
+    expected_level: Option<u16>,
+    expected_max: Option<Vec<u8>>,
+    key: &[u8],
+) -> Result<NodeEdit, PersistentMapError> {
+    let node = load_node(store, reference, node_type)?;
+    if expected_level.is_some_and(|level| level != node.level()) {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if expected_max
+        .as_deref()
+        .is_some_and(|maximum| node.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    match node {
+        Node::Leaf(mut entries) => {
+            let Ok(index) =
+                entries.binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
+            else {
+                return Ok(NodeEdit {
+                    children: vec![(
+                        entries
+                            .last()
+                            .map(|entry| entry.0.clone())
+                            .unwrap_or_default(),
+                        reference,
+                    )],
+                    changed: false,
+                });
+            };
+            entries.remove(index);
+            Ok(NodeEdit {
+                children: if entries.is_empty() {
+                    Vec::new()
+                } else {
+                    write_or_split(store, node_type, Node::Leaf(entries))?
+                },
+                changed: true,
+            })
+        }
+        Node::Internal {
+            level,
+            mut children,
+        } => {
+            let Some(index) = child_index(&children, key) else {
+                return Ok(NodeEdit {
+                    children: vec![(
+                        children.last().expect("non-empty internal node").0.clone(),
+                        reference,
+                    )],
+                    changed: false,
+                });
+            };
+            if key > children[index].0.as_slice() {
+                return Ok(NodeEdit {
+                    children: vec![(
+                        children.last().expect("non-empty internal node").0.clone(),
+                        reference,
+                    )],
+                    changed: false,
+                });
+            }
+            let child_ref = children[index].1;
+            let edit = remove_node(
+                store,
+                child_ref,
+                node_type,
+                Some(level - 1),
+                Some(children[index].0.clone()),
+                key,
+            )?;
+            if !edit.changed {
+                return Ok(NodeEdit {
+                    children: vec![(
+                        children.last().expect("non-empty internal node").0.clone(),
+                        reference,
+                    )],
+                    changed: false,
+                });
+            }
+            children.remove(index);
+            for (offset, child) in edit.children.into_iter().enumerate() {
+                children.insert(index + offset, child);
+            }
+            let updated = if children.is_empty() {
+                Vec::new()
+            } else {
+                write_or_split(store, node_type, Node::Internal { level, children })?
+            };
+            Ok(NodeEdit {
+                children: updated,
+                changed: true,
+            })
+        }
+    }
+}
+
+fn collapse_root<S: MapObjectStore>(
+    store: &S,
+    mut root: ObjectRef,
+    node_type: ObjectType,
+) -> Result<ObjectRef, PersistentMapError> {
+    loop {
+        let node = load_node(store, root, node_type)?;
+        match node {
+            Node::Internal { children, .. } if children.len() == 1 => root = children[0].1,
+            _ => return Ok(root),
+        }
+    }
+}
+
+fn collect_subtree<S: MapObjectStore>(
+    store: &S,
+    reference: ObjectRef,
+    node_type: ObjectType,
+    expected_level: Option<u16>,
+    expected_max: Option<Vec<u8>>,
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    nodes: &mut Vec<ObjectRef>,
+) -> Result<(), PersistentMapError> {
+    let node = load_node(store, reference, node_type)?;
+    if expected_level.is_some_and(|level| level != node.level()) {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if expected_max
+        .as_deref()
+        .is_some_and(|maximum| node.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    nodes.push(reference);
+    match node {
+        Node::Leaf(leaf) => entries.extend(leaf),
+        Node::Internal { level, children } => {
+            for (maximum, child) in children {
+                collect_subtree(
+                    store,
+                    child,
+                    node_type,
+                    Some(level - 1),
+                    Some(maximum),
+                    entries,
+                    nodes,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn diff_subtrees<S: MapObjectStore>(
+    store: &S,
+    before_ref: ObjectRef,
+    after_ref: ObjectRef,
+    node_type: ObjectType,
+    before_level: Option<u16>,
+    after_level: Option<u16>,
+    before_max: Option<Vec<u8>>,
+    after_max: Option<Vec<u8>>,
+    changes: &mut Vec<MapChange>,
+) -> Result<(), PersistentMapError> {
+    let before = load_node(store, before_ref, node_type)?;
+    let after = load_node(store, after_ref, node_type)?;
+    if before_level.is_some_and(|level| level != before.level())
+        || after_level.is_some_and(|level| level != after.level())
+    {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if before_max
+        .as_deref()
+        .is_some_and(|maximum| before.max_key() != Some(maximum))
+        || after_max
+            .as_deref()
+            .is_some_and(|maximum| after.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    if before_ref == after_ref {
+        return Ok(());
+    }
+    match (&before, &after) {
+        (
+            Node::Internal {
+                level: before_level,
+                children: before_children,
+            },
+            Node::Internal {
+                level: after_level,
+                children: after_children,
+            },
+        ) if before_level == after_level
+            && before_children.len() == after_children.len()
+            && before_children
+                .iter()
+                .zip(after_children)
+                .all(|(left, right)| left.0 == right.0) =>
+        {
+            for ((before_max, before_child), (after_max, after_child)) in
+                before_children.iter().zip(after_children)
+            {
+                diff_subtrees(
+                    store,
+                    *before_child,
+                    *after_child,
+                    node_type,
+                    Some(*before_level - 1),
+                    Some(*after_level - 1),
+                    Some(before_max.clone()),
+                    Some(after_max.clone()),
+                    changes,
+                )?;
+            }
+            Ok(())
+        }
+        (Node::Leaf(before_entries), Node::Leaf(after_entries)) => {
+            merge_diff(before_entries.clone(), after_entries.clone(), changes);
+            Ok(())
+        }
+        _ => {
+            let mut before_entries = Vec::new();
+            let mut before_nodes = Vec::new();
+            collect_subtree(
+                store,
+                before_ref,
+                node_type,
+                before_level,
+                before_max,
+                &mut before_entries,
+                &mut before_nodes,
+            )?;
+            let mut after_entries = Vec::new();
+            let mut after_nodes = Vec::new();
+            collect_subtree(
+                store,
+                after_ref,
+                node_type,
+                after_level,
+                after_max,
+                &mut after_entries,
+                &mut after_nodes,
+            )?;
+            merge_diff(before_entries, after_entries, changes);
+            Ok(())
+        }
+    }
+}
+
+fn merge_diff(
+    before: Vec<(Vec<u8>, Vec<u8>)>,
+    after: Vec<(Vec<u8>, Vec<u8>)>,
+    changes: &mut Vec<MapChange>,
+) {
+    let mut left = before.into_iter().peekable();
+    let mut right = after.into_iter().peekable();
+    loop {
+        match (left.peek(), right.peek()) {
+            (Some((left_key, _)), Some((right_key, _))) => match left_key.cmp(right_key) {
+                Ordering::Less => {
+                    let (key, value) = left.next().expect("peeked entry exists");
+                    changes.push(MapChange::Removed { key, value });
+                }
+                Ordering::Greater => {
+                    let (key, value) = right.next().expect("peeked entry exists");
+                    changes.push(MapChange::Added { key, value });
+                }
+                Ordering::Equal => {
+                    let (key, before_value) = left.next().expect("peeked entry exists");
+                    let (_, after_value) = right.next().expect("peeked entry exists");
+                    if before_value != after_value {
+                        changes.push(MapChange::Updated {
+                            key,
+                            before: before_value,
+                            after: after_value,
+                        });
+                    }
+                }
+            },
+            (Some(_), None) => {
+                let (key, value) = left.next().expect("peeked entry exists");
+                changes.push(MapChange::Removed { key, value });
+            }
+            (None, Some(_)) => {
+                let (key, value) = right.next().expect("peeked entry exists");
+                changes.push(MapChange::Added { key, value });
+            }
+            (None, None) => return,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MapChange, MapObjectStore, Node, PersistentBTree, PersistentMapError, encode_node,
+        load_node,
+    };
+    use crate::format::{
+        MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, decode_object, object_id,
+    };
+    use crate::identity::ObjectId;
+    use std::collections::{BTreeMap, HashMap};
+
+    #[derive(Default)]
+    struct MemoryStore {
+        objects: HashMap<ObjectId, Vec<u8>>,
+        puts: usize,
+    }
+
+    impl MapObjectStore for MemoryStore {
+        fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.objects.get(&id).cloned())
+        }
+
+        fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+            self.puts += 1;
+            self.objects.insert(id, bytes);
+            Ok(())
+        }
+    }
+
+    fn key(index: u32) -> Vec<u8> {
+        index.to_be_bytes().to_vec()
+    }
+
+    fn assert_model(
+        tree: &PersistentBTree,
+        store: &MemoryStore,
+        model: &BTreeMap<Vec<u8>, Vec<u8>>,
+    ) {
+        let actual = tree.entries(store).unwrap();
+        assert_eq!(
+            actual,
+            model
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<Vec<_>>()
+        );
+        for (key, value) in model {
+            assert_eq!(tree.get(store, key).unwrap().as_ref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn copy_on_write_splits_deletes_and_preserves_old_roots() {
+        let mut store = MemoryStore::default();
+        let mut tree = PersistentBTree::empty(ObjectType::VolumeMapNode, &mut store).unwrap();
+        let mut model = BTreeMap::new();
+        for index in 0..2400 {
+            let key = key(index);
+            let value = vec![(index % 251) as u8; 37 + (index as usize % 29)];
+            tree = tree.insert(&mut store, key.clone(), value.clone()).unwrap();
+            model.insert(key, value);
+        }
+        assert_model(&tree, &store, &model);
+        assert!(store.objects.values().all(|bytes| {
+            let object = decode_object(bytes).unwrap();
+            object.object_type != ObjectType::VolumeMapNode
+                || bytes.len() <= MAX_PERSISTENT_NODE_BYTES
+        }));
+
+        let old = tree;
+        let old_count = model.len();
+        let unchanged = old
+            .insert(&mut store, key(1000), model[&key(1000)].clone())
+            .unwrap();
+        assert_eq!(unchanged.root(), old.root());
+
+        for index in (0..2400).step_by(3) {
+            let deleted = key(index);
+            tree = tree.remove(&mut store, &deleted).unwrap();
+            model.remove(&deleted);
+        }
+        assert_model(&tree, &store, &model);
+        assert_eq!(old.entries(&store).unwrap().len(), old_count);
+        assert_ne!(old.root(), tree.root());
+    }
+
+    #[test]
+    fn insertion_copies_a_path_and_structural_diff_matches_full_model() {
+        let mut store = MemoryStore::default();
+        let mut before = PersistentBTree::empty(ObjectType::ArtifactIndexNode, &mut store).unwrap();
+        for index in 0..3000 {
+            before = before
+                .insert(&mut store, key(index), vec![index as u8; 24])
+                .unwrap();
+        }
+        let before_root = before.root();
+        let (_, before_nodes) = before.entries_and_nodes(&store).unwrap();
+        let root_level = load_node(&store, before_root, ObjectType::ArtifactIndexNode)
+            .unwrap()
+            .level();
+        let after = before
+            .insert(&mut store, key(3001), vec![0xEE; 24])
+            .unwrap();
+        let (_, after_nodes) = after.entries_and_nodes(&store).unwrap();
+        let replaced_old_nodes = before_nodes
+            .iter()
+            .filter(|node| !after_nodes.contains(node))
+            .count();
+        assert!(before_nodes.len() > (root_level as usize + 1));
+        assert!(replaced_old_nodes <= root_level as usize + 1);
+        assert_ne!(before_root, after.root());
+        assert_eq!(
+            before.diff(&after, &store).unwrap(),
+            vec![MapChange::Added {
+                key: key(3001),
+                value: vec![0xEE; 24],
+            }]
+        );
+        assert!(before.diff(&before, &store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn internal_node_matches_shared_golden_vector() {
+        let node = Node::Internal {
+            level: 1,
+            children: vec![
+                (
+                    1_u64.to_be_bytes().to_vec(),
+                    ObjectRef {
+                        object_type: ObjectType::VolumeMapNode,
+                        object_id: ObjectId::from_bytes([0x11; 32]),
+                        encoded_len: 20,
+                    },
+                ),
+                (
+                    2_u64.to_be_bytes().to_vec(),
+                    ObjectRef {
+                        object_type: ObjectType::VolumeMapNode,
+                        object_id: ObjectId::from_bytes([0x22; 32]),
+                        encoded_len: 20,
+                    },
+                ),
+            ],
+        };
+        let encoded = encode_node(ObjectType::VolumeMapNode, &node).unwrap();
+        let fixture = include_str!("../../fixtures/storage-format-v1.tsv")
+            .lines()
+            .find_map(|line| {
+                let mut columns = line.split('\t');
+                if columns.next()? == "volume_map_internal_two_children" {
+                    Some((columns.next()?.to_owned(), columns.next()?.to_owned()))
+                } else {
+                    None
+                }
+            })
+            .expect("shared format fixture exists");
+        let actual_hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(actual_hex, fixture.0);
+        assert_eq!(object_id(&encoded).to_string(), fixture.1);
+    }
+
+    #[test]
+    fn rejects_oversized_single_entry_and_wrong_node_type() {
+        let mut store = MemoryStore::default();
+        let tree = PersistentBTree::empty(ObjectType::VolumeMapNode, &mut store).unwrap();
+        assert!(matches!(
+            tree.insert(&mut store, vec![1], vec![2; MAX_PERSISTENT_NODE_BYTES]),
+            Err(PersistentMapError::EntryTooLarge)
+        ));
+        assert!(
+            PersistentBTree::from_root(crate::format::ObjectRef {
+                object_type: ObjectType::Extent,
+                object_id: ObjectId::from_bytes([0; 32]),
+                encoded_len: 16,
+            })
+            .is_err()
+        );
+    }
+}

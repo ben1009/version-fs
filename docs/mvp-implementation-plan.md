@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0 merged; P1 object layer implemented, real-S3 run pending; P2 locally qualified |
+| Status | P0 merged; P1 object layer implemented, real-S3 run pending; P2 locally qualified; P3 implemented on this branch |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -177,18 +177,18 @@ an interface mapping only.
 
 ### P3. Persistent volume roots and native indexes
 
-- [ ] Implement canonical ordered B+ trees bounded to 64 KiB nodes, path copying,
+- [x] Implement canonical ordered B+ trees bounded to 64 KiB nodes, path copying,
   split/delete/iteration, stable unchanged identity, and sorted diff fallback.
-- [ ] Implement fixed-capacity VolumeRoot geometry, 4 KiB sectors, immutable 64 KiB
+- [x] Implement fixed-capacity VolumeRoot geometry, 4 KiB sectors, immutable 64 KiB
   extents, implicit-zero holes, checked range arithmetic, and complete extent maps.
-- [ ] Implement native log-map/segment indexes and artifact blob/chunk indexes.
+- [x] Implement native log-map/segment indexes and artifact blob/chunk indexes.
   Artifact chunks remain distinct from volume extents in format and sizing.
-- [ ] Build complete typed Generation descriptors and trusted bottom-up dependency
+- [x] Build complete typed Generation descriptors and trusted bottom-up dependency
   proofs. Parent IDs are lineage, not required content edges.
 
 **Exit evidence:** map behavior matches a simple model through splits/deletions;
-no-change roots are shared, only affected paths/extents change, and fixtures
-resolve with every ancestor descriptor read denied.
+no-change roots are shared, one-key updates replace only a root-to-leaf path,
+and fixtures resolve with ancestor descriptor reads denied.
 
 ### P4. ublk adapter and local data path
 
