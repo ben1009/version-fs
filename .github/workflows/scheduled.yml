@@ -1,0 +1,53 @@
+name: Rolling
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '7 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  compatibility:
+    name: Linux (${{ matrix.toolchain }}, ${{ matrix.dependencies }} dependencies)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: nightly
+            dependencies: locked
+          - toolchain: beta
+            dependencies: updated
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
+      RUSTFLAGS: -D deprecated
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Update dependencies
+        if: matrix.dependencies == 'updated'
+        run: cargo update
+      - name: Install nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest@0.9.145
+      - name: Library, binary, and integration tests
+        run: cargo nextest run --locked --workspace --all-features --lib --bins --tests --no-tests=warn
+      - name: Documentation tests
+        run: cargo test --locked --workspace --all-features --doc

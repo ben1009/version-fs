@@ -1,0 +1,18 @@
+# Rust build and profiling output.
+target/
+debug/
+**/*.rs.bk
+*.pdb
+perf.data*
+lcov.info
+lcov2.info
+
+# Local editor and agent settings.
+.idea/
+.vscode/
+.aws/
+.agents/
+.codex/
+.claude/
+.kimi-code/
+.remember/

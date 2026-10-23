@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd -- "$repo_dir"
+
+if ! command -v cargo-make >/dev/null 2>&1; then
+    cargo install cargo-make --version 0.37.24 --locked
+fi
+
+if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then
+    exec cargo make --disable-check-for-updates --list-all-steps --hide-uninteresting
+fi
+
+exec cargo make --disable-check-for-updates "$@"

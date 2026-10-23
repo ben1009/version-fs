@@ -1,0 +1,81 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Linux (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [unit, integration]
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: Install nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest@0.9.145
+      # Empty suites are reported explicitly during workspace bootstrapping.
+      - name: Unit tests
+        if: matrix.suite == 'unit'
+        run: cargo nextest run --locked --workspace --all-features --lib --no-tests=warn
+      - name: Binary and integration tests
+        if: matrix.suite == 'integration'
+        run: cargo nextest run --locked --workspace --all-features --lib --bins --tests -E 'not kind(lib)' --test-threads 2 --no-tests=warn
+      - name: Documentation tests
+        if: matrix.suite == 'unit'
+        run: cargo test --locked --workspace --all-features --doc
+
+  coverage:
+    runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          components: llvm-tools-preview
+      - name: Install coverage tools
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest@0.9.145,cargo-llvm-cov@0.9.0
+      - name: Generate coverage
+        run: bash scripts/coverage.sh --lcov --output-path lcov.info
+      - name: Keep coverage report
+        if: hashFiles('lcov.info') != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: lcov.info
+      - name: Upload coverage when Codecov is configured
+        if: env.CODECOV_TOKEN != '' && hashFiles('lcov.info') != ''
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true

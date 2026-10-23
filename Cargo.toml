@@ -1,0 +1,17 @@
+[workspace]
+members = ["versionfs-cli", "versionfs-core", "versionfs-sdk", "versionfs-service"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["ben1009"]
+edition = "2024"
+keywords = ["storage", "versioning"]
+license = "Apache-2.0"
+repository = "https://github.com/ben1009/version-fs"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
