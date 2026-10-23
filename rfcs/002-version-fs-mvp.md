@@ -313,10 +313,15 @@ trait MetadataTxn {
 | Explicit outcomes | A conflict/rejection is known not to commit. A timeout or error after possible commit is an unknown outcome, resolved through the operation record before another logical mutation. |
 
 `transact` may rerun its closure on a definite conflict. The closure performs
-metadata reads and buffered mutations only: no S3 I/O, command execution, local
-file mutation, or new logical operation ID on retry. Unknown commit outcomes
-cannot be retried as fresh operations. Deleting a metadata key is unrelated to
-physical object deletion; v0 still issues no S3 DELETE.
+metadata reads and buffered mutations, and MAY read the authority owner's
+monotonic lease clock. The clock is a trusted local input, not an external side
+effect. Lease-dependent preconditions MUST use a fresh clock reading on every
+transaction attempt, including retries; a value captured before `transact` or
+by an earlier attempt MUST NOT authorize a new mutation. The closure performs
+no S3 I/O, command execution, local file mutation, or allocation of a new logical
+operation ID on retry. Unknown commit outcomes cannot be retried as fresh
+operations. Deleting a metadata key is unrelated to physical object deletion;
+v0 still issues no S3 DELETE.
 
 Mutating transactions use point keys. Prefix scans are for read-only snapshots,
 listing, and reports; their results cannot act as transactional absence or
@@ -416,6 +421,10 @@ renewable grant. Renewal is normally attempted every 10 seconds.
 
 Expiry uses the authority owner's trusted lease clock, with an injectable clock
 for deterministic tests; it does not require a database time function or GTS.
+Every attempt that authorizes a mutation or renewal reads the clock inside the
+transaction body and re-evaluates lease validity using that attempt's metadata.
+A retry after expiry cannot reuse an earlier valid time. Returning an existing
+terminal operation result still follows Section 5.3 and grants no new rights.
 Clock comparisons cannot regress within an owner incarnation. Before serving
 after restart, the owner advances its durable incarnation. Old lease grants
 cannot authorize new requests across that boundary; workers reacquire their
@@ -1199,6 +1208,9 @@ cases include:
   already committed result.
 - Writer expiry and handover during preparation; a delayed old writer cannot
   publish, append, trim, or move a reference.
+- A lease is valid on the first transaction attempt, which conflicts; advance
+  the injected clock past expiry before retry. The next attempt must read time
+  again and reject a new mutation or renewal under the expired grant.
 - Authority crash before and after durable commit, a conflict during a retried
   transaction closure, and an error after possible commit. Recover one complete
   metadata outcome through the adapter; old-incarnation grants stay fenced.
