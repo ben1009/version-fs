@@ -1,0 +1,19 @@
+# One configuration file for the entire workspace.
+coverage:
+  range: 89..100
+  round: down
+  precision: 1
+  status:
+    project:
+      default:
+        threshold: 2%
+    patch:
+      default:
+        target: 30%
+ignore:
+  - "**/tests/**"
+  - "**/integration_tests/**"
+  - "**/benches/**"
+comment:
+  layout: files
+  require_changes: true

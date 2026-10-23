@@ -1,0 +1,13 @@
+[package]
+name = "versionfs-sdk"
+description = "Version FS client transport, Linux worker integration, and capture coordination"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "versionfs-service"
+description = "Version FS object-store adapters, metadata authority, and service"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

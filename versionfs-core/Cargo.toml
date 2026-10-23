@@ -1,0 +1,13 @@
+[package]
+name = "versionfs-core"
+description = "Version FS formats, persistent maps, and backend-neutral protocols"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true

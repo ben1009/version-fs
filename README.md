@@ -25,4 +25,21 @@ Generation, branch, and checkpoint semantics apply across these views.
 The project is at the design stage. RFC-001 defines the architecture and core
 semantics; RFC-002 proposes the first implementation and release criteria. Both
 are drafts. The implementation plan translates RFC-002 into ordered work packages
-and completion evidence. This repository does not yet contain an implementation.
+and completion evidence. The Rust workspace and development tooling are in place;
+storage protocols, services, and device integration are not implemented yet.
+
+## Development
+
+Install [rustup](https://rustup.rs/), then run:
+
+```sh
+./dev             # List development tasks; bootstrap cargo-make if necessary
+./dev check       # Formatting, dependencies, Clippy, tests, docs, and spelling
+./dev build       # Build every workspace target
+./dev test-cov    # Generate HTML coverage when tests are available
+```
+
+The repository pins the same Rust toolchain and development tools as
+[toy-kv-engine](https://github.com/ben1009/toy-kv-engine). See the
+[development guide](docs/development.md) for CI, sanitizer commands, tool versions,
+and the changes made while porting them.

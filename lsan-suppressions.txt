@@ -1,0 +1,3 @@
+# LeakSanitizer suppressions carried over from toy-kv-engine.
+# Rust std thread spawning (pthread internals): intermittent 40-byte leak.
+leak:ThreadStartFunc

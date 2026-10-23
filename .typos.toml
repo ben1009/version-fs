@@ -1,0 +1,8 @@
+# Shared storage terminology from toy-kv-engine.
+[default.extend-words]
+"BA" = "BA"
+"datas" = "datas"
+"FPR" = "FPR"
+"RTO" = "RTO"
+
+[files]

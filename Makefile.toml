@@ -1,0 +1,144 @@
+[config]
+default_to_workspace = false
+skip_core_tasks = true
+skip_git_env_info = true
+skip_rust_env_info = true
+skip_crate_env_info = true
+min_version = "0.37.24"
+
+[tasks.install-nextest]
+category = "Tools"
+description = "Install cargo-nextest"
+install_crate = { crate_name = "cargo-nextest", version = "0.9.145", binary = "cargo", test_arg = ["nextest", "--help"] }
+
+[tasks.install-llvm-cov]
+category = "Tools"
+description = "Install cargo-llvm-cov"
+install_crate = { crate_name = "cargo-llvm-cov", version = "0.9.0", binary = "cargo", test_arg = ["llvm-cov", "--help"] }
+
+[tasks.clean]
+category = "Development"
+description = "Remove Cargo build output"
+command = "cargo"
+args = ["clean"]
+
+[tasks.build]
+category = "Development"
+description = "Build the workspace with all features"
+command = "cargo"
+args = ["build", "--locked", "--workspace", "--all-features", "--all-targets"]
+
+[tasks.fmt]
+category = "Development"
+description = "Format Rust sources"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.sort-deps]
+category = "Development"
+description = "Sort Cargo dependency declarations"
+install_crate = { crate_name = "cargo-sort", version = "2.1.4", binary = "cargo", test_arg = ["sort", "--help"] }
+command = "cargo"
+args = ["sort", "--workspace"]
+
+[tasks.check-fmt]
+category = "Checks"
+description = "Check Rust formatting without changing files"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.check-dep-sort]
+category = "Checks"
+description = "Check Cargo dependency ordering without changing files"
+install_crate = { crate_name = "cargo-sort", version = "2.1.4", binary = "cargo", test_arg = ["sort", "--help"] }
+command = "cargo"
+args = ["sort", "--workspace", "--check", "--check-format"]
+
+[tasks.check-clippy]
+category = "Checks"
+description = "Run Clippy with default and all features"
+script = '''
+#!/usr/bin/env bash
+set -euo pipefail
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+'''
+
+[tasks.check-machete]
+category = "Checks"
+description = "Check for unused dependencies"
+install_crate = { crate_name = "cargo-machete", version = "0.9.2", binary = "cargo", test_arg = ["machete", "--help"] }
+command = "cargo"
+args = ["machete"]
+
+[tasks.check-typos]
+category = "Checks"
+description = "Check spelling and propagate failures"
+install_crate = { crate_name = "typos-cli", version = "1.50.1", binary = "typos", test_arg = ["--help"] }
+command = "typos"
+
+[tasks.check-doc]
+category = "Checks"
+description = "Build Rust documentation with warnings denied"
+env = { RUSTDOCFLAGS = "-D warnings" }
+command = "cargo"
+args = ["doc", "--locked", "--workspace", "--all-features", "--no-deps"]
+
+[tasks.test]
+category = "Tests"
+description = "Run library, binary, and integration tests"
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "--locked", "--workspace", "--all-features", "--lib", "--bins", "--tests", "--no-tests=warn"]
+
+[tasks.test-all-targets]
+category = "Tests"
+description = "Run every test target, including serialized benchmarks"
+dependencies = ["install-nextest"]
+command = "cargo"
+args = ["nextest", "run", "--locked", "--workspace", "--all-features", "--all-targets", "--profile", "all-targets", "--no-tests=warn"]
+
+[tasks.test-doc]
+category = "Tests"
+description = "Run documentation tests (not executed by nextest)"
+command = "cargo"
+args = ["test", "--locked", "--workspace", "--all-features", "--doc"]
+
+[tasks.test-cov]
+category = "Tests"
+description = "Generate an HTML coverage report"
+dependencies = ["install-llvm-cov", "install-nextest"]
+command = "bash"
+args = ["scripts/coverage.sh", "--html"]
+
+[tasks.test-asan]
+category = "Tests"
+description = "Run tests under AddressSanitizer on Linux"
+env = { RUSTFLAGS = "-Zsanitizer=address", ASAN_OPTIONS = "detect_odr_violation=0:detect_leaks=0", CARGO_PROFILE_DEV_OPT_LEVEL = "1" }
+command = "cargo"
+args = ["test", "--locked", "--workspace", "--all-features", "--lib", "--tests", "--target", "x86_64-unknown-linux-gnu", "--", "--skip", "failpoint", "--test-threads=2"]
+
+[tasks.test-lsan]
+category = "Tests"
+description = "Run tests under LeakSanitizer on Linux"
+env = { RUSTFLAGS = "-Zsanitizer=leak", CARGO_PROFILE_DEV_OPT_LEVEL = "1" }
+script = '''
+#!/usr/bin/env bash
+set -euo pipefail
+export LSAN_OPTIONS="suppressions=$PWD/lsan-suppressions.txt"
+cargo test --locked --workspace --all-features --lib --tests --target x86_64-unknown-linux-gnu -- --skip failpoint --test-threads=2
+'''
+
+[tasks.check]
+category = "Checks"
+description = "Run all local checks"
+dependencies = [
+    "check-fmt",
+    "check-dep-sort",
+    "check-clippy",
+    "check-machete",
+    "test",
+    "test-doc",
+    "check-doc",
+    "check-typos",
+]
