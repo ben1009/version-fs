@@ -121,5 +121,4 @@ docker volume rm rustfs-data
 
 Keep the endpoint bound to loopback and use throwaway credentials. The test
 leaves its object in the bucket, so remove the disposable RustFS volume after
-the run. The RustFS lane has not been executed in the current development
-environment because Docker is unavailable there.
+the run.
