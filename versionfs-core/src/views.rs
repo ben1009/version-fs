@@ -51,7 +51,7 @@ impl VolumeExtentMap {
         root.geometry.validate_range(0, 0)?;
         Ok(Self {
             geometry: root.geometry,
-            map: PersistentBTree::from_root(root.extent_map_root)?,
+            map: from_typed_map_root(root.extent_map_root, ObjectType::VolumeMapNode)?,
         })
     }
 
@@ -178,7 +178,7 @@ impl LogSegmentIndex {
     /// Opens a segment index at an immutable root node.
     pub fn from_root(root: ObjectRef) -> Result<Self, ViewError> {
         Ok(Self {
-            map: PersistentBTree::from_root(root)?,
+            map: from_typed_map_root(root, ObjectType::LogSegmentIndexNode)?,
         })
     }
 
@@ -412,7 +412,7 @@ impl ArtifactChunkIndex {
     /// Opens an artifact-chunk index at its immutable root node.
     pub fn from_root(root: ObjectRef) -> Result<Self, ViewError> {
         Ok(Self {
-            map: PersistentBTree::from_root(root)?,
+            map: from_typed_map_root(root, ObjectType::ArtifactIndexNode)?,
         })
     }
 
@@ -504,6 +504,16 @@ fn store_encoded<S: MapObjectStore>(store: &mut S, bytes: Vec<u8>) -> Result<Obj
     Ok(reference)
 }
 
+fn from_typed_map_root(
+    root: ObjectRef,
+    expected_type: ObjectType,
+) -> Result<PersistentBTree, ViewError> {
+    if root.object_type != expected_type {
+        return Err(FormatError::ObjectReferenceMismatch.into());
+    }
+    Ok(PersistentBTree::from_root(root)?)
+}
+
 fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<Vec<u8>, ViewError> {
     let bytes = store
         .get(reference.object_id)
@@ -511,4 +521,70 @@ fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<V
         .ok_or(ViewError::MissingObject(reference.object_id))?;
     reference.verify(&bytes)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArtifactChunkIndex, LogSegmentIndex, ViewError, VolumeExtentMap};
+    use crate::format::{FormatError, VolumeGeometry, VolumeRoot};
+    use crate::identity::{ObjectId, ObjectStoreScopeId};
+    use crate::persistent_map::MapObjectStore;
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct MemoryStore(HashMap<ObjectId, Vec<u8>>);
+
+    impl MapObjectStore for MemoryStore {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            ObjectStoreScopeId::from_bytes([0x5A; 16])
+        }
+
+        fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.get(&id).cloned())
+        }
+
+        fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+            self.0.insert(id, bytes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn typed_map_roots_reject_a_different_persistent_map_type() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(4 * 1024 * 1024).unwrap();
+        let volume_root_ref = VolumeExtentMap::empty(geometry, &mut store)
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+        let volume_root = VolumeRoot::decode(
+            &store
+                .get(volume_root_ref.object_id)
+                .unwrap()
+                .expect("sealed volume root exists"),
+        )
+        .unwrap();
+        let log_index_root = LogSegmentIndex::empty(&mut store).unwrap().root();
+        let artifact_index_root = ArtifactChunkIndex::empty(&mut store).unwrap().root();
+
+        assert!(matches!(
+            VolumeExtentMap::from_root(VolumeRoot {
+                geometry,
+                extent_map_root: log_index_root,
+            }),
+            Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+        ));
+        assert!(matches!(
+            LogSegmentIndex::from_root(volume_root.extent_map_root),
+            Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+        ));
+        assert!(matches!(
+            ArtifactChunkIndex::from_root(volume_root.extent_map_root),
+            Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+        ));
+
+        assert!(VolumeExtentMap::from_root(volume_root).is_ok());
+        assert!(LogSegmentIndex::from_root(log_index_root).is_ok());
+        assert!(ArtifactChunkIndex::from_root(artifact_index_root).is_ok());
+    }
 }
