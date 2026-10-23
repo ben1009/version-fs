@@ -176,7 +176,6 @@ for _ in $(seq 1 100); do
     sleep 0.05
 done
 if [[ -e "/sys/block/$crash_device_name" ]]; then
-    "$server" --delete "$crash_device_id" >/dev/null 2>&1 || true
     fail "ublk device remained after abrupt server death"
 fi
 device_id=""
