@@ -11,11 +11,17 @@ complete workspace.
 Published state lives in durable storage. Compute nodes keep a mutable overlay
 and a disposable cache. Transactional databases remain separate systems.
 
+The proposed MVP exposes a versioned block volume through Linux ublk, with ext4
+as the reference filesystem consumer, alongside native ordered logs and artifacts.
+Generation, branch, and checkpoint semantics apply across these views.
+
 ## Design
 
 - [RFC-001: Version FS Architecture](rfcs/001-version-fs.md)
 - [RFC-002: Version FS MVP](rfcs/002-version-fs-mvp.md)
+- [MVP Implementation Plan](docs/mvp-implementation-plan.md)
 
 The project is at the design stage. RFC-001 defines the architecture and core
 semantics; RFC-002 proposes the first implementation and release criteria. Both
-are drafts. This repository does not yet contain an implementation.
+are drafts. The implementation plan translates RFC-002 into ordered work packages
+and completion evidence. This repository does not yet contain an implementation.
