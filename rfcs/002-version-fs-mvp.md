@@ -75,7 +75,7 @@ or achieved performance.
 | Artifacts | Named immutable payloads and explicit log attachments, sharing the object layer. |
 | Git | Preserve self-contained worktree and `.git` bytes inside the volume; no Git protocol or object translation. |
 | Recovery | Fresh-worker volume attachment and lazy extent reads; interrupted operations resolved from durable authority. |
-| Retention | Recent-Generation retention, explicit pins, protected workspace bases and readers. |
+| Retention | Recent-Generation retention, explicit pins, attachment-base protections and protected readers. |
 | GC report | Snapshot retained/protected roots, traverse reachability, and report observed unreachable objects without deleting bytes. |
 | Tooling | SDK and CLI for the workflow in Section 1; structural extent-range, log-view, and artifact diff. |
 
@@ -317,7 +317,10 @@ Generation IDs are opaque UUIDs allocated once per checkpoint. The descriptor
 is immutable and checksummed. Its volume, log, and artifact roots resolve
 complete declared state without an ancestor descriptor or replay journal.
 Filesystem and Git bytes reside inside the volume; no native namespace/Git
-index is inferred. Capture mode records the actual protocol used in Section 6.
+index is inferred. The persisted `capture.mode` is exactly one of `block_cut`,
+`filesystem_frozen`, or `filesystem_clean_unmount`, recording the actual protocol
+used in Section 6.4. Unknown modes are rejected; clean unmount is not an alias
+for filesystem freeze and cannot be serialized as `filesystem_frozen`.
 
 The authority catalog binds a Generation ID to its descriptor and publication
 result. Uploading a descriptor creates no visible Generation. A live durable
@@ -377,8 +380,8 @@ using a fresh authority-clock reading. The lease check and commit decision form
 one logical linearization point: if the lease is expired there, the complete
 transaction is rejected; a later durability acknowledgement does not invalidate
 a transaction that linearized while the lease was valid. The closure performs
-no S3 I/O, command execution, local file mutation, or allocation of a new
-logical operation ID on retry. Unknown commit outcomes cannot be retried as
+no S3 I/O, filesystem/device operation, other external side effect, or allocation
+of a new logical operation ID on retry. Unknown commit outcomes cannot be retried as
 fresh operations.
 Deleting a metadata key is unrelated to physical object deletion; v0 still
 issues no S3 DELETE.
@@ -648,7 +651,8 @@ replace them. Only retained Generations/pins provide that historical guarantee.
 | Mode | Captured boundary | Guarantee |
 | --- | --- | --- |
 | `block_cut` | Drain admitted block requests and durably flush one exact device cut. | Complete block state respecting acknowledged ordering; mounted filesystems/applications may need crash recovery. |
-| `filesystem_frozen` | Quiesce participating producers, successfully freeze the reference filesystem, drain/flush the device, then capture. A clean unmount is also an explicit supported filesystem boundary. | A stable filesystem image under the qualified freeze/unmount protocol; no automatic application transaction guarantee. |
+| `filesystem_frozen` | Quiesce participating producers, successfully freeze the reference filesystem, drain/flush the device, then capture while frozen. | A stable filesystem image under the qualified freeze protocol; no automatic application transaction guarantee. |
+| `filesystem_clean_unmount` | Quiesce participating producers, successfully cleanly unmount the reference filesystem, drain/flush the device, then capture while unmounted. | A stable filesystem image under the qualified clean-unmount protocol; no automatic application transaction guarantee. |
 
 The mounted ext4 CLI workflow uses `filesystem_frozen`. Freeze support follows
 [fsfreeze](https://man7.org/linux/man-pages/man8/fsfreeze.8.html); ext4's
@@ -665,10 +669,12 @@ and side effects are not captured.
 ### 6.5 Coordinating the common Generation boundary
 
 The trusted worker coordinator gates application commands, native log mutations,
-and named-artifact staging. After draining admitted producers, it reads the
-expected branch revision/live roots together from the authority, then registers
-the checkpoint's branch capture token/preparation against those exact preconditions.
-Completed drain-time appends and volume barriers are included in that tuple.
+and named-artifact staging. Before draining admitted producers, it records the
+expected branch revision/live roots together from the authority, then drains and
+registers the checkpoint's branch capture token/preparation against those exact
+preconditions. Any live-state change in that interval, including a legitimate
+drain-time append or volume barrier, causes an acquisition conflict. The MVP
+accepts that extra retry to detect external mutations throughout the drain window.
 The worker's original writer grant, attachment identity, and fencing epochs remain
 bound throughout; reading current roots must not adopt a replacement owner's identity.
 An acquisition conflict invalidates the drained boundary: the coordinator MUST restart
@@ -679,21 +685,28 @@ children until the capture is sealed.
 
 For `filesystem_frozen`, keep block I/O service running while calling freeze:
 freeze itself must be able to write back data/journal blocks and issue flushes.
-Closing the low-level device gate first would deadlock that operation. Once
-freeze succeeds, issue the final durable barrier, close/drain block mutation
+Closing the low-level device gate first would deadlock that operation. For
+`filesystem_clean_unmount`, keep the same service available while the coordinator
+establishes a successful normal clean unmount of the reference filesystem.
+All mounts of that volume must be cleanly unmounted, with other writers excluded.
+Lazy or forced unmount is not evidence of this mode. After the selected boundary
+succeeds, issue the final durable barrier, close/drain block mutation
 admission, and seal the resulting VolumeRoot, exact log-map root, staged
 artifacts, and resulting branch revision. Child flushes cannot continue after
 sealing. Unmanaged raw writers violate the capture contract.
 
-Hold mutation admission and the filesystem freeze through publication or a
-definite abort. Renew writer, attachment-base, and preparation protection on
-independent workers. On an unknown renewal, pause further uploads/publication
-and reconcile that same renewal ID. Preserve dirty bytes and the freeze intent.
+Hold mutation admission and the selected filesystem condition (frozen or cleanly
+unmounted) through publication or a definite abort. The clean-unmounted volume
+stays unmounted; a later remount is a separate action. Renew writer, attachment-base,
+and preparation protection on independent workers. On an unknown renewal, pause
+further uploads/publication and reconcile that same renewal ID. Preserve dirty
+bytes and the capture intent.
 
 A surviving coordinator/watchdog reconciles a lost publication reply using its
-recorded operation ID before thawing. On fencing, stop/unmount the old attachment
-rather than resuming it against another root. If the worker is gone, restore
-from durable authority on a new worker; do not infer an outcome from a local
+recorded operation ID before thawing or admitting a later remount. On fencing,
+stop/unmount the old attachment rather than resuming it against another root.
+If the worker is gone, restore from durable authority on a new worker; do not
+infer an outcome from a local
 freeze flag. A committed child flush stays committed if the later Generation
 capture aborts; abort never undoes an acknowledged durability barrier.
 
@@ -846,18 +859,18 @@ in v0. The parent Generation ID is not a required content edge.
 
 ### 8.2 Capture sequence and preparation lifetime
 
-1. Record the checkpoint ID/freeze intent outside the volume, close application/
-   log/artifact admission, and drain active producers. Then read the expected
-   branch revision/live roots together from the authority. Register the branch
-   capture token and protected preparation under those exact revision/root
+1. Record the checkpoint ID/capture intent outside the volume, close application/
+   log/artifact admission, record the expected branch revision/live roots together
+   from the authority, and then drain active producers. Register the branch
+   capture token and protected preparation under those exact pre-drain revision/root
    preconditions and the worker's original attachment/grant/fencing identities.
    A change of ownership fences this attempt; it must not refresh to a new owner.
    A definite acquisition conflict ends this attempt: restart Step 1 with a new
-   checkpoint operation ID, a fresh drain, and a new post-drain revision/root read;
-   never silently rebase the old drained cut. An unknown acquisition outcome must
-   first be reconciled with the original operation ID before deciding whether to
-   proceed or restart.
-2. Establish the requested Section 6 boundary. Keep the device serving freeze's
+   checkpoint operation ID, fresh pre-drain revision/root preconditions, and a
+   fresh drain; never silently rebase the old drained cut. An unknown acquisition
+   outcome must first be reconciled with the original operation ID before deciding
+   whether to proceed or restart.
+2. Establish the requested Section 6 boundary. Keep the device serving freeze/unmount
    I/O; permit only the capture's identified drain-flush children. Each child
    advances the live root/revision normally and records its own durable outcome.
 3. After the final durable barrier, stop/drain block mutations and seal one
@@ -867,7 +880,8 @@ in v0. The parent Generation ID is not a required content edge.
 4. Build/upload new artifact/index nodes and a complete Generation descriptor.
    The volume root and historical log segments are reused, not rescanned or recopied.
 5. Publish the sealed tuple in one authority transaction, then reconcile the
-   result and local baseline before thawing/reopening admission.
+   result and local baseline before thawing/reopening admission. Clean-unmount
+   capture leaves the filesystem unmounted; no implicit remount is required.
 
 Every protected preparation spanning remote object I/O has a renewable ten-minute
 inactivity deadline, with a new identified heartbeat every three minutes. This
@@ -947,6 +961,8 @@ for journal recovery instead of modifying a retained Generation.
 
 ### 9.3 Delete
 
+If durable live volume or log state differs from the head, deletion requires
+explicit `discard_live_state`; otherwise it rejects without changing the branch.
 Deletion validates current write authority/revision, revokes the attachment/writer,
 removes the live name and volume/log branch roots, and records the result atomically.
 Historical Generations, pins, readers, and unresolved operations retain their own
@@ -1114,7 +1130,7 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 | `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
 | `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |
 | `move_head` / `promote` | Stable source/destination identities and revisions, retained target/published source head, destination grant, explicit live-state discard policy. |
-| `delete_branch` | Operation ID, current stable ID/revision/write authority; revokes attachment and removes live refs. |
+| `delete_branch` | Operation ID, current stable ID/revision/write authority, explicit live-state discard policy; revokes attachment and removes live refs. |
 | `open_generation` / `renew_handle` / `close_handle` | Identified protected historical view lifecycle; replay does not renew rights. |
 | `read_blocks_at` / `attach_readonly` | Protected Generation and byte range, or immutable block attachment; writes fail. Filesystem replay requires a writable fork. |
 | `diff` | Two protected Generations; streams changed volume ranges, log-view changes, and native named-artifact changes. It returns no inferred filename diff. |
@@ -1152,7 +1168,7 @@ explicitly if the adapter cannot support them.
 | FLUSH/FUA fails or its reply is lost | Return no false successful I/O; reconcile the exact barrier ID. Keep dependent writes blocked or fail explicitly. |
 | Barrier commits before worker loss | Its live root survives independently of worker disk; a lost kernel reply does not undo the commit. |
 | Preflush fails | Do not execute/acknowledge its dependent data write as though the barrier succeeded. |
-| External mutation commits after the post-drain root read but before capture-token acquisition | Reject acquisition on the old revision; restart capture and drain with a new operation ID, never refresh roots and reuse the old cut. |
+| Any live mutation commits after the pre-drain root read but before capture-token acquisition | Reject acquisition on the old revision; restart capture and drain with a new operation ID, never refresh roots and reuse the old cut. |
 | Extent upload succeeds, metadata commit fails | Old live root remains authoritative; new objects are unreachable preparation data. |
 | Descriptor uploaded, publication not committed | No Generation is visible. |
 | Barrier/publication reply is lost after commit | Recover the original operation result even if live roots/head later moved. |
@@ -1161,6 +1177,7 @@ explicitly if the adapter cannot support them.
 | Unknown backend commit | Reconcile via authoritative outcome/recovery before admitting conflicting new mutations; do not infer abort. |
 | Writer/attachment fenced during upload | Reject root replacement/publication; fail persistence on the stale device and preserve salvageable local bytes. |
 | Freeze fails | Do not label the capture filesystem-frozen or publish that requested capture; resolve its preparation and preserve local state. |
+| Clean unmount fails or does not finish normally | Do not publish a `filesystem_clean_unmount` capture or silently substitute another mode. |
 | Coordinator dies while filesystem is frozen | Reconcile recorded freeze intent and operation before controlled thaw/stop; do not write local control state through the frozen volume. |
 | Child flush commits, parent checkpoint aborts | Preserve the acknowledged live root; no Generation is published and the flush is not rolled back. |
 | Preparation/base renewal reply is lost | Replay/query the exact renewal ID; do not extend twice or discard unresolved dependencies. |
@@ -1238,7 +1255,7 @@ Scenarios are separate experiments rather than one Cartesian product.
 | Filesystem workload | 1,000, 100,000, and 1,000,000 files, high fanout, rename/unlink, sparse files, mmap, and a self-contained Git worktree. |
 | Large content | 1 GiB and 100 GiB files; small overwrite versus append; compare application/device/dirty/uploaded bytes. |
 | Durability | Ordinary writes versus FLUSH/FUA and filesystem fsync; include barrier batching and remote-failure latency. |
-| Checkpoint modes | Raw block cut versus reference ext4 freeze/clean unmount; measure quiescence, freeze, upload, publication, and thaw separately. |
+| Checkpoint modes | Compare `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`; measure quiescence, freeze/unmount, upload, publication, and applicable thaw separately. |
 | History and fan-out | 10/100/1000 Generations and 1/10/100 branches; no-change checkpoint, independent writes, promote/reset. |
 | Logs/artifacts | 100,000 1 KiB records in batches of 1/100/1000; attachments, checkpoint root binding, fork, and trim. |
 | Recovery | Empty versus warm cache; first block/mount working set versus full-image export; journal recovery on writable fork. |
@@ -1271,9 +1288,10 @@ work packages under these phases.
    format/mount ext4, and use normal filesystem/Git operations. Include hard links,
    symlinks, permissions/xattrs, rename, sparse files, and mmap under the qualified
    profile. Native logs and artifacts remain separate Generation views.
-2. Checkpoint in both declared modes. Descriptor uploads and failed CAS are invisible;
-   attached/detached publication behaves as specified. Frozen mode records a successful
-   filesystem boundary; raw block cuts make no application-consistency claim.
+2. Checkpoint in all three declared modes. Descriptor uploads and failed CAS are
+   invisible; attached/detached publication behaves as specified. Persist and decode
+   the exact mode actually established. Freeze and clean-unmount captures remain
+   distinct; unsupported modes reject. No mode alone claims application consistency.
 3. Restore retained Generations on an empty worker without ancestor descriptor
    reads or full-image download. Native logs/artifacts resolve without ext4 mount.
    Replay a filesystem journal only on a writable fork, preserving the old root.
@@ -1284,8 +1302,9 @@ work packages under these phases.
    extent-range diff matches a complete comparison, including zero transitions and
    tree splits. Do not label those results as filename or semantic Git diffs.
 6. Fork/checkpoint/promote/rollback/delete and reuse branch names safely. Check
-   source/destination revisions, volume/stream epochs, live-state discard, and
-   rejection of old attachments. No mounted device is hot-rebased.
+   source/destination revisions, volume/stream epochs, explicit live-state discard
+   for reset and deletion, and rejection of old attachments. No mounted device
+   is hot-rebased.
 7. Validate atomic native append receipts, conditional tails, independent forked
    streams, exact checkpoint prefixes, cursor errors, and trim with historical
    pins and attachment bytes retained.
@@ -1331,16 +1350,13 @@ termination. Check API/kernel outcomes and persisted graph state, not only CLI e
   local-baseline update, and thaw; reconcile exact operation/freeze intent.
 - Freeze failure and raw writers outside the declared protocol: no false frozen
   checkpoint. Test clean-unmount and raw-cut recovery separately.
-- Complete an admitted append or fsync/FUA barrier during producer drain. The
-  post-drain read must include its revision/live roots, without forcing an
-  acquisition conflict merely because the producer completed while draining.
-  Handover before that read still fences the worker's original grant/attachment;
-  the coordinator must not adopt the new owner's identity.
-- Commit an external append or volume barrier after the post-drain root read
-  but before capture-token CAS. Acquisition must conflict; no stale-cut Generation
-  may be published. A new attempt must drain again and then read fresh preconditions,
-  rather than merely refreshing the revision/roots. Resolve lost acquisition
-  replies with the original ID before starting another attempt.
+- Complete an admitted append or fsync/FUA barrier, or commit an external live
+  mutation, after the pre-drain root read and before capture-token CAS. Acquisition
+  must conflict in every case. Restart with a new ID, fresh pre-drain preconditions,
+  and a fresh drain; never refresh roots and continue the old capture. The extra
+  retry for a legitimate producer completion is an accepted MVP tradeoff. Resolve
+  lost acquisition replies with the original ID before starting another attempt.
+  Handover still fences the original grant/attachment; never adopt the new owner.
 - Stale writer/device after handover, reset, deletion, or authority restart: cannot
   replace a live root, publish, append, trim, or resume a mounted device on another root.
 - Lease valid in an earlier transaction attempt but expired on retry/final decision:

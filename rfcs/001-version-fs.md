@@ -10,8 +10,8 @@
 ## 1. Summary
 
 Version FS is a durable state system for agents and other workloads that create
-many short-lived workspaces. Filesystem state, Git state, ordered logs, and
-artifacts participate in common version, checkpoint, fork, and retention
+many short-lived workspaces. Block volumes, filesystem state, Git state, ordered
+logs, and artifacts participate in common version, checkpoint, fork, and retention
 semantics.
 
 The fundamental abstraction is a **Generation**: an immutable, complete logical
@@ -23,11 +23,11 @@ other Generations.
                            Version FS
                        immutable Generation
                                 |
-              +-----------+-----+------+----------+
-              |           |            |          |
-              FS         Git      Ordered logs  Artifacts
-              |           |            |          |
-              +-----------+-----+------+----------+
+           +----------+---------+---------+------------+
+           |          |         |         |            |
+         Block        FS       Git    Ordered logs  Artifacts
+           |          |         |         |            |
+           +----------+---------+---------+------------+
                                 |
                      immutable object graph
                                 |
@@ -103,7 +103,8 @@ particular implementation mechanism.
 2. Unchanged data and metadata can be structurally shared.
 3. A checkpoint atomically publishes one coherent logical state.
 4. Fork and rollback primarily manipulate references rather than copy state.
-5. Published state survives loss of worker compute and local caches.
+5. Published state and acknowledged durable live state survive loss of worker
+   compute and local caches under their declared retention and durability contracts.
 6. Files, block volumes, Git, ordered logs, and artifacts share version, checkpoint,
    fork, and retention semantics.
 7. Storage state and application databases remain separate systems.
@@ -132,6 +133,12 @@ A block-volume view may host a filesystem or a block-aware engine. Filesystems
 are consumers of that interface; native ordered logs and artifacts remain
 independent first-class views. A release may realize filesystem access through
 such a consumer without implementing a native file-tree adapter.
+
+A Generation MUST declare the authoritative representation of each logical view.
+When filesystem or Git state is realized through a block volume, its consumer
+view does not automatically create a second independent authoritative root.
+Native representations and derived views must agree with that declaration;
+divergent representations cannot both claim authority for the same logical state.
 
 ### 3.3 Non-goals
 
@@ -170,9 +177,11 @@ ordering, and retention.
 | Root manifest | The entry point for one Generation's complete state graph. |
 | Generation | A published, immutable, independently readable logical state. |
 | Workspace | An authorized namespace of branches and retained Generations. |
-| Branch | A mutable named reference representing a line of history. |
+| Branch | A named, independently advancing authority domain with a published Generation head and optional durable live-view state. |
+| Branch head | The branch's movable reference to a published immutable Generation. |
+| Live view state | Authoritative durable view roots between Generations, recoverable independently of worker-local changes but not themselves a Generation. |
 | History (agent history) | A stable identity for one coordinated version lineage; forking a coordinated version creates a distinct descendant history identity. |
-| Overlay | Unpublished mutable changes above a base Generation. |
+| Overlay | Mutable worker-local changes above selected Generation or live-view state; acknowledgement and recovery guarantees are declared by the adapter. |
 | Block volume | A logical address space whose complete bytes are resolved by a versioned immutable root. |
 | Checkpoint | Capture and durable publication of a coherent state boundary. |
 | Publication | The authoritative transition making a prepared Generation visible. |
@@ -210,10 +219,11 @@ Different subsystems may store different kinds of objects and use separate
 physical engines. Every required edge in a published Generation must nevertheless
 resolve under that Generation's retention and authorization contract.
 
-The control plane determines authoritative branch heads, published Generations,
-write authority, and retention. Mutations that establish publication or replace
-an authoritative reference MUST have one atomic, durable outcome. Their related
-visibility and retention effects must agree with that outcome.
+The control plane determines authoritative branch heads and durable live-view
+roots, published Generations, write authority, and retention. Mutations that
+establish publication or replace an authoritative reference MUST have one atomic,
+durable outcome. Their related visibility and retention effects must agree with
+that outcome.
 
 The system requires both planes for recovery. Worker caches are disposable;
 authoritative reference and retention metadata are durable system state.
@@ -235,10 +245,10 @@ wire format:
 ```text
 Generation G102
     +-- parent_generation_id: G101    (lineage only)
-    +-- root
-          +-- filesystem state
-          +-- block volume state, when included
-          +-- Git state
+    +-- root (declares authoritative representations)
+          +-- block volume root, when included
+          |     +-- consumer filesystem / Git views, when represented here
+          +-- native filesystem / Git roots, when separately declared
           +-- exact log views
           +-- artifacts
 ```
@@ -316,11 +326,12 @@ The filesystem view exposes a namespace of files, directories, and declared
 metadata. An adapter must state its supported operations and metadata. It MUST
 NOT silently discard required semantics while claiming an exact checkpoint.
 
-Mutable working state may be represented as an overlay over a Generation:
+Mutable working state may be represented as an overlay over a selected
+Generation or the branch's durable live-view state:
 
 ```text
 read(path) -> overlay entry, including deletion
-           -> base Generation on overlay miss
+           -> selected Generation / live-view base on overlay miss
            -> verified local or remote object
 ```
 
@@ -388,9 +399,32 @@ that dependency so restore and collection preserve it.
 
 ## 10. Branches and write authority
 
-A branch is a movable reference to an immutable Generation. It represents an
-independently advancing history and does not require a complete physical copy
-of that history's data.
+A branch represents an independently advancing history without requiring a
+complete physical copy of its data. Its head references a published immutable
+Generation. It MAY also own authoritative durable live-view state between
+Generations, such as a block-volume root or a live log root newer than its head:
+
+```text
+branch
+    +-- head Generation: G10
+    +-- durable live volume root: V15
+    +-- durable live log root: L18
+
+worker-local mutations
+    -> acknowledged durable live-view boundary
+    -> coherent captured and published Generation
+```
+
+These are distinct durability and visibility boundaries. A durable live update
+does not by itself publish a Generation or promise a common cut across views.
+The branch head continues to select its published Generation until an explicit
+head update. Worker-local overlay state is not authoritative durable live state
+merely because its bytes exist on the worker.
+
+Current durable live roots and their required dependencies MUST remain protected
+and recoverable under their acknowledgement contract, even without a Generation
+capturing them. Replacing a live root does not automatically retain the previous
+live boundary as a historical version; retained Generations provide that guarantee.
 
 Authoritative updates must validate current write authority and the state on
 which the operation depends. A stale writer MUST NOT overwrite newer
@@ -453,24 +487,34 @@ Publishing one boundary must not discard writes outside that boundary. A
 failed or stale attempt must preserve unpublished work for explicit recovery
 under the adapter's contract.
 
+A failed Generation capture does not undo separately acknowledged durable live
+updates made during preparation. Publication and live-view durability have
+separate authoritative outcomes.
+
 ## 12. Fork, rollback, promotion, and deletion
 
 | Operation | Meaning |
 | --- | --- |
 | Fork | Create a new branch from a retained Generation, sharing existing state. |
-| Rollback | Move a branch reference to an earlier retained Generation. |
+| Rollback | Move the branch head to an earlier retained Generation. |
 | Promote | Conditionally select a source Generation as another branch's head. |
-| Delete branch | Remove its authoritative reference and release its retention interest. |
+| Delete branch | Remove its authoritative head/live references and release its retention interest under the declared live-state policy. |
 
 Rollback moves a reference; it does not rewrite history. Promotion must reject
 an update when the destination or other declared preconditions have changed.
 Selecting a speculative result does not imply a semantic merge of independent
 edits.
 
+Rollback, adoption, promotion, and deletion MUST define whether divergent durable
+live state is preserved, rejected, or explicitly discarded. They MUST NOT discard
+it implicitly. Promotion of a published source Generation does not implicitly
+promote that source's newer live state. A release must state how selected heads,
+live views, and worker-local state are reconciled.
+
 An external reference change does not automatically rewrite a running process's
-local directory. Its unpublished work must be reconciled before it can become
-authoritative. Deletion does not immediately erase shared content protected by
-other branches, retained Generations, pins, or readers.
+mounted volume or local namespace. Its unpublished work must be reconciled before
+it can become authoritative. Deletion does not immediately erase shared content
+protected by other branches, retained Generations, pins, or readers.
 
 A future merge may construct another complete Generation using rules specific
 to files, Git, logs, and artifacts.
@@ -511,6 +555,12 @@ A durable live log append and a coherent filesystem checkpoint are separate
 boundaries; surviving event records do not implicitly reconstruct filesystem
 changes.
 
+An adapter may also acknowledge durable live state newer than the branch head.
+Recovery of the current branch resumes from those authoritative live roots,
+whereas opening a retained Generation selects that Generation's exact roots.
+Losing a worker cannot silently roll acknowledged live state back to its last
+Generation; later authorized replacement or explicit discard follows Section 12.
+
 Restore resolves a retained Generation, obtains protection for access, opens its
 root graph, and fetches required content. It requires no prior worker disk and
 no replay of ancestor Generations. Optional recovery journals protect work
@@ -537,10 +587,10 @@ metadata traversal remain real costs.
 
 ## 16. Retention and garbage collection
 
-Retained Generations, branch references, pins, protected readers, and protected
-operations define liveness. Shared content remains live while any such reference
-can require it. Retention applies to all views, including log ranges and required
-artifact dependencies.
+Retained Generations, branch heads and current durable live roots, pins, protected
+readers, and protected operations define liveness. Shared content remains live
+while any such reference can require it. Retention applies to all views, including
+log ranges and required artifact dependencies.
 
 A retained coordinated version protects its Version FS Generation even when no
 branch points to it. Other participants protect their own captured state under
@@ -656,7 +706,7 @@ finalized version preserves its existing key and immutable binding.
           Process @ T      DB @ T     Version FS @ T
           snapshot M      snapshot D   Generation G
                                            |
-                                   FS / Git / Logs / Artifacts
+                               Block / FS / Git / Logs / Artifacts
 ```
 
 Within its timestamp domain and agent history, a checkpoint including all three
@@ -788,7 +838,7 @@ optional integration described in Section 18.
 | I6 | Shared content remains durable while any live retention root or protected operation can require it. |
 | I7 | A stale writer cannot mutate authoritative state after its authority has been replaced. |
 | I8 | Uploads and auxiliary markers alone cannot make partial state visible. |
-| I9 | Loss of worker compute or its cache cannot destroy successfully checkpointed state. |
+| I9 | Loss of worker compute or its cache cannot destroy retained Generations or current acknowledged durable live state under their declared contracts. |
 | I10 | Runtime and database integration use explicit participant contracts and preserve each system's capture and recovery responsibilities. |
 | I11 | A retry cannot silently apply the same identified logical operation twice. |
 | I12 | Content identity never grants authorization. |

@@ -1,7 +1,7 @@
 # Version FS
 
-Version FS is a proposed versioned storage substrate for files, Git state, logs,
-and artifacts produced by agents and other automated workloads.
+Version FS is a proposed versioned storage substrate for block volumes, files,
+Git state, logs, and artifacts produced by agents and other automated workloads.
 
 Its central abstraction is a **Generation**: an immutable, independently readable
 logical state. Generations share unchanged objects and metadata, allowing
