@@ -381,8 +381,8 @@ ABSENT -> PREPARING -> COMMITTED(result)
 ```
 
 The request fingerprint binds the operation kind, target identities, declared
-preconditions, and logical payload. Checkpoint preparation binds its capture
-request first; sealing records the final immutable root once, rejecting a
+preconditions, and logical payload. A protected preparation binds its request
+first; checkpoint sealing records the final immutable root once, rejecting a
 different root on retry. Matching retries return the recorded result or resume
 that preparation. Reusing an ID with another request is `OperationMismatch`.
 After matching the fingerprint, terminal-result lookup precedes checking the
@@ -395,12 +395,12 @@ executable again. Results include the created branch ID, writer grant,
 Generation, append range, pin, or resulting revision as applicable.
 
 This is a monotonically growing metadata class: every append and other
-authoritative mutation, including lease and protection renewals, keeps an
-idempotency record even after its log range is trimmed or its Generation
-expires. v0 provides replay-safe idempotency for the workspace lifetime at
-this storage cost. Bounded deduplication windows and safe result expiry are
-deferred; metadata capacity must be provisioned and exhaustion handled
-explicitly.
+authoritative mutation, including writer lease, base-protection, and preparation
+renewals, keeps an idempotency record even after its log range is trimmed or its
+Generation expires. v0 provides replay-safe idempotency for the workspace
+lifetime at this storage cost. Bounded deduplication windows and safe result
+expiry are deferred; metadata capacity must be provisioned and exhaustion
+handled explicitly.
 
 `get_operation(id)` reads authoritative state. A timeout means unknown outcome.
 Even `NotFound` does not prove the original request cannot arrive later: retry
@@ -446,7 +446,7 @@ forced handover advances the epoch before granting the replacement writer. Relea
 branch deletion, and head-reset operations revoke the old grant.
 
 The SDK serializes data/head mutations for one branch and permits one checkpoint
-or log append preparation at a time there. Writer/base-protection renewals,
+or log-mutation preparation at a time there. Writer/base-protection renewals,
 preparation heartbeats, and operation query/abort remain available during a
 long preparation or a closed workspace gate. Server-side CAS and fencing remain
 required even if clients violate this convention. Different branches proceed
@@ -656,6 +656,11 @@ append(stream_id, match_seq_num, append_id, records, attachments)
                        branch_revision }
 ```
 
+An append preparation follows the shared protected-preparation lifetime in
+Section 8.2. `append_id` is its prepared operation ID. This allows large
+attachment or segment uploads to last longer than ten minutes while the
+preparation remains renewed, without weakening the atomic tail replacement.
+
 1. Register the operation and a protected preparation against the current branch
    and live log root. Validate the writer grant, stream identity, and expected
    next sequence number.
@@ -700,7 +705,8 @@ segments reachable. There is no automatic time-based trim in the MVP.
 
 Log creation, trim, and deletion use the same protected preparation and
 conditional live-root replacement pattern as append. Deleting a live log
-removes its map entry; it cannot erase segments retained by another root.
+removes its map entry; it cannot erase segments retained by another root. These
+operations use the same Section 8.2 preparation deadline and renewal semantics.
 
 Rollback and promotion select one published log view; they do not merge logs or
 replay tool calls. Uncheckpointed live events remain separate from published
@@ -746,7 +752,7 @@ the final transaction. Immutable keys and the no-deletion backend preserve
 verified bytes; preparation protections track the dependencies until commit
 or a definite abort. No collection admission barrier is needed in v0.
 
-### 8.2 Capture sequence
+### 8.2 Capture sequence and preparation lifetime
 
 1. Record the operation ID and capture token locally. Close and drain the
    workspace gate while maintaining the existing base protection and writer
@@ -761,22 +767,33 @@ or a definite abort. No collection admission barrier is needed in v0.
    prepared root and upload its Generation descriptor.
 5. Request attached or detached publication using the recorded preparation.
 
-Preparation has a renewable ten-minute inactivity deadline. While a capture is
-active, the managed SDK sends `renew_preparation` every three minutes with a
-fresh operation ID, the checkpoint operation ID, and its exact writer grant.
-The authority extends the deadline only while the preparation is nonterminal
-and the grant, lease, branch epoch, and owner incarnation remain valid. Replaying
-one renewal ID returns its original expiry. Renewals cannot revive an aborted
-operation or a fenced writer.
+Every protected preparation that spans remote object I/O has a renewable
+ten-minute inactivity deadline. This shared contract covers checkpoint capture
+and log mutations, including append, create, trim, and delete. An operation may
+declare a shorter non-renewable lifetime; otherwise this default applies. The
+SDK sends `renew_preparation` every three minutes for renewable preparations,
+with a fresh renewal operation ID, the prepared operation ID, and its exact
+writer grant. Object upload traffic alone does not extend the deadline. For
+append, the prepared operation ID is `append_id`. The authority extends the
+deadline only while the preparation is nonterminal and the grant, lease, branch
+epoch, and owner incarnation remain valid. Replaying one renewal ID returns its
+original expiry. Renewals cannot revive an aborted operation or a fenced writer.
 
 If renewal has an unknown outcome, the SDK retries the same renewal ID or
-queries it before creating another renewal. It pauses scanning and upload while
-the outcome is unresolved, keeps the workspace gate closed, and preserves all
-preparation protections. A definite expiry, abort, or fencing result prevents
-publication; the SDK resolves the checkpoint operation and its protections
-before making the local directory available for explicit salvage. A deadline
-permits the authority to record an abort; it is not permission to guess the
-outcome of an unreachable metadata transaction or release unresolved protection.
+queries it before creating another renewal. It pauses further scan and object
+uploads and final publication/root replacement while the result is unresolved,
+and preserves all preparation protections. A checkpoint keeps the workspace
+gate closed; a log mutation keeps its branch admission and protected roots. A
+definite expiry, abort, or fencing result prevents the final authoritative
+mutation. The SDK resolves the prepared operation and its protections before
+release; a checkpoint preserves its local directory for explicit salvage, an
+append returns no receipt, and other log mutations return no updated live root.
+Newly uploaded objects not referenced by other state remain stored as
+preparation garbage. The authority orders expiry/abort and final publication in
+its metadata transactions: a committed result remains committed, while an
+aborted preparation cannot later publish or replace a live root. A deadline
+permits the authority to record an abort; it is not permission to guess an
+unknown transaction outcome or release unresolved protection.
 
 ### 8.3 Publication transaction
 
@@ -1010,7 +1027,7 @@ workspace ID is known; other operations use the workspace scope.
 | `import_directory` | Operation ID, branch ID/revision, grant, worker-local source directory, explicit quiescence acknowledgement; returns the managed local handle and protected base (Section 6.3). |
 | `renew_base_protection` / `close_workspace` | Operation ID and exact managed handle/protection ID; renewal returns the recorded expiry. Close quiesces the gate, resolves capture, and releases the protection. |
 | `checkpoint` | Operation ID, branch ID/revision, grant, managed capture, attached/detached mode; returns Generation and optional new branch revision. |
-| `renew_preparation` | Fresh renewal operation ID, checkpoint operation ID, exact writer grant; returns the recorded extended preparation deadline. |
+| `renew_preparation` | `renewal_operation_id`, `prepared_operation_id` (checkpoint operation ID, `append_id`, or log create/trim/delete operation ID), exact writer grant; returns the recorded extended preparation deadline. |
 | `move_head` | Operation ID, branch ID/revision, grant, retained target, discard policy; returns new revision/epoch. |
 | `promote` | Operation ID, source ID/revision, destination ID/revision/grant, discard policy; returns selected Generation and destination revision/epoch. |
 | `delete_branch` | Operation ID, branch ID/revision, grant; returns deletion result. |
@@ -1063,7 +1080,8 @@ are no fake mount or Git-server commands before those adapters exist.
 | Import setup is interrupted or its reply is lost | Reconcile the recorded base protection and local binding under the same ID; do not claim imported file bytes are remotely durable. |
 | Base-protection renewal reply is lost | Retry the same renewal ID or query it; preserve local files until the result is known. If the worker stops renewing, the five-minute protection expires and is removed; the old handle cannot checkpoint until explicitly rebound by a new import under current branch preconditions. |
 | Workspace closes with active capture | Quiesce the gate and resolve or definitively abort capture before releasing base protection; close does not publish or delete the branch. |
-| Preparation exceeds its inactivity deadline | Send three-minute heartbeats. An unknown renewal outcome pauses scan/upload and holds the gate and protections; definite expiry or fencing prevents publication and must be resolved before local salvage. |
+| Preparation renewal reply is lost | Retry the same renewal ID or query it. Pause further scan/uploads and final publication or live-root replacement; retain the operation's admission boundary and protections. A checkpoint keeps its workspace gate closed. |
+| Preparation expires or its writer is fenced | Authority orders expiry/abort against the final commit. Once aborted, publication or live-root replacement fails; late uploads cannot make the operation visible and new bytes remain GC-report candidates. Preserve checkpoint files for explicit salvage, and return no append receipt. |
 | Writer replaced during upload | Final commit rejects the old epoch. Local work is preserved; aborted staged bytes remain stored and can appear in a later report. |
 | Append commits, receipt is lost | Replay returns its exact original range without another append. |
 | Append races checkpoint gate | Its entire batch is captured before the cut, or it waits for the next interval. |
@@ -1241,10 +1259,16 @@ cases include:
 - Import setup interrupted after base protection is established but before
   local control installation; a retry reconciles the same binding or requires
   a new import if its worker/directory is lost.
-- Keep a checkpoint preparation alive beyond ten minutes with three-minute
-  heartbeats; lose a renewal reply and replay the exact operation ID without
-  extending twice. Expiry or fencing prevents publication, and protections are
-  not released while the outcome is unknown.
+- Keep checkpoint and log-mutation preparations alive beyond ten minutes with
+  three-minute heartbeats, including an append with a slow large attachment
+  upload. Lose renewal replies and replay the exact operation IDs without
+  extending twice. Expiry or fencing prevents Generation publication or live
+  log-root replacement, and protections are not released while the outcome is
+  unknown.
+- Stop heartbeats for an abandoned append after staging objects and advance the
+  injected clock past its deadline. Confirm the preparation is aborted, its
+  dependencies cease to be protected roots, no live log root or receipt is
+  created, and the mark-only report can list new unreferenced bytes.
 - Lose a base-protection renewal reply and replay its exact ID; stop the worker
   and advance the injected clock until the protection expires. The old handle
   cannot checkpoint or silently rebase, and an explicit close releases the
