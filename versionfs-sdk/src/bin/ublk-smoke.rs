@@ -116,14 +116,12 @@ mod linux {
         }
 
         let storage = Arc::new(Mutex::new(vec![0; DEVICE_BYTES]));
-        let ctrl = Arc::new(
-            UblkCtrlBuilder::default()
-                .name("versionfs-p0-smoke")
-                .nr_queues(1)
-                .depth(32)
-                .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
-                .build()?,
-        );
+        let ctrl = UblkCtrlBuilder::default()
+            .name("versionfs-p0-smoke")
+            .nr_queues(1)
+            .depth(32)
+            .dev_flags(UblkFlags::UBLK_DEV_F_ADD_DEV)
+            .build()?;
 
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         let shutdown_rx = Mutex::new(shutdown_rx);
@@ -143,14 +141,22 @@ mod linux {
             move |device_ctrl| {
                 println!("READY /dev/ublkb{}", device_ctrl.dev_info().dev_id);
                 let _ = std::io::stdout().flush();
-                let shutdown_received = shutdown_rx
-                    .lock()
-                    .ok()
-                    .is_some_and(|receiver| receiver.recv().is_ok());
-                if shutdown_received {
-                    if let Err(error) = device_ctrl.kill_dev() {
-                        eprintln!("failed to stop ublk device after signal: {error}");
+                let shutdown_received = match shutdown_rx.lock() {
+                    Ok(receiver) => receiver.recv().is_ok(),
+                    Err(error) => {
+                        eprintln!("failed to wait for shutdown signal: {error}");
+                        false
                     }
+                };
+                if !shutdown_received {
+                    eprintln!("shutdown signal channel closed unexpectedly");
+                }
+                if let Err(error) = device_ctrl.kill_dev() {
+                    eprintln!("failed to stop ublk device after signal: {error}");
+                    std::process::exit(1);
+                }
+                if !shutdown_received {
+                    std::process::exit(1);
                 }
             },
         )?;
