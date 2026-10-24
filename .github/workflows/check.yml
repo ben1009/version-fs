@@ -60,7 +60,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
       - name: Install cargo-sort from pinned source
         # The v2.1.4 prebuilt release archive fails its published checksum.
-        run: cargo install cargo-sort --version 2.1.4 --locked
+        run: cargo install cargo-sort --version 2.1.4 --locked --force
       - name: Install other checks
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
