@@ -1,5 +1,7 @@
 # Version FS
 
+[![Codecov](https://codecov.io/gh/ben1009/version-fs/branch/main/graph/badge.svg)](https://codecov.io/gh/ben1009/version-fs)
+
 Version FS is a proposed versioned storage substrate for block volumes, files,
 Git state, logs, and artifacts produced by agents and other automated workloads.
 
