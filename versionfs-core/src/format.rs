@@ -103,6 +103,12 @@ pub enum MetadataRecordType {
     OperationOutcome = 4,
     /// Retention and in-progress protection metadata.
     Protection = 5,
+    /// Durable metadata-authority owner incarnation.
+    AuthorityOwner = 6,
+    /// Branch-name to stable branch-ID binding.
+    BranchNameIndex = 7,
+    /// Explicit Generation pin metadata.
+    Pin = 8,
 }
 
 impl TryFrom<u16> for MetadataRecordType {
@@ -115,6 +121,9 @@ impl TryFrom<u16> for MetadataRecordType {
             3 => Ok(Self::Generation),
             4 => Ok(Self::OperationOutcome),
             5 => Ok(Self::Protection),
+            6 => Ok(Self::AuthorityOwner),
+            7 => Ok(Self::BranchNameIndex),
+            8 => Ok(Self::Pin),
             other => Err(FormatError::UnknownMetadataRecordType(other)),
         }
     }

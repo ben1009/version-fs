@@ -16,8 +16,10 @@ maps, typed volume/log/artifact roots, and complete Generation graph verificatio
 P4 adds the bounded local block overlay, verified workspace object cache,
 protected-root range reads, structural extent diff, and the opt-in single-queue
 ublk adapter. The adapter advertises a volatile cache and rejects FLUSH/FUA until
-P6 provides the remote durability path. Later control protocols remain
-unimplemented.
+P6 provides the remote durability path. P5 adds backend-neutral control records
+and toy-kv-backed integration tests for operation outcomes, grants, attachments,
+protections, and capture preparation. The service and SDK lifecycle that uses
+these protocols remains in progress.
 
 Workspace cache directories have one owner at a time; drop the prior cache
 handle before reopening its directory. An exclusive file lock also prevents

@@ -68,6 +68,31 @@ fixed_id!(
 );
 fixed_id!(LogId, 16, "An opaque identity for one native ordered log.");
 fixed_id!(
+    OperationId,
+    16,
+    "A stable identity for one logical metadata operation."
+);
+fixed_id!(
+    PrincipalId,
+    16,
+    "An identity used to scope caller-owned operation IDs."
+);
+fixed_id!(
+    AttachmentId,
+    16,
+    "A stable identity for one writable block-volume attachment."
+);
+fixed_id!(
+    ProtectionId,
+    16,
+    "A stable identity for one retention or in-progress protection."
+);
+fixed_id!(
+    PinId,
+    16,
+    "A stable identity for one explicit Generation pin."
+);
+fixed_id!(
     ArtifactId,
     16,
     "An opaque identity for one named artifact lineage."

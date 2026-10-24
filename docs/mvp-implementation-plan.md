@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0–P3 merged; P1 real-S3 run pending; P2 locally qualified; P4 implemented on this branch |
+| Status | P0–P4 merged; P1 real-S3 run pending; P2 locally qualified; P5 implemented on this branch |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -225,13 +225,13 @@ claiming reliable barriers until P6 is qualified.
 
 ### P5. Control schema and attachment authority
 
-- [ ] Implement operation fingerprints, durable terminal results, query/abort
+- [x] Implement operation fingerprints, durable terminal results, query/abort
   tombstones, fixed identities, branch-name indexes, and exact revision/epoch CAS.
-- [ ] Implement writer/attachment grants, owner incarnation restart fencing, and
+- [x] Implement writer/attachment grants, owner incarnation restart fencing, and
   one writable attachment per branch. Device numbers/filesystem UUIDs are not IDs.
-- [ ] Implement retention eligibility guards, pins, read/live-log protections,
+- [x] Implement retention eligibility guards, pins, read/live-log protections,
   attachment bases, and shared preparation/renewal state from the start.
-- [ ] Add checkpoint capture-token admission: block other head/live mutations,
+- [x] Add checkpoint capture-token admission: block other head/live mutations,
   allow only identified drain-flush children until sealing, and retain independent
   renew/query/abort paths. Definite expiry/fencing resolves token cleanup safely.
 
@@ -239,9 +239,14 @@ Use the RFC's lease/renewal defaults centrally. Every new heartbeat has an opera
 ID; replay returns its old deadline. Keep terminal fingerprints/results for the
 workspace lifetime and surface capacity exhaustion rather than forgetting IDs.
 
-**Exit evidence:** duplicate creates/acquisitions/renewals return original results;
-changed payloads reject replay; absent-key name claims yield one binding; delayed
-requests lose to abort tombstones; stale grants/devices cannot mutate authority.
+**Exit evidence:** six authority-backed integration tests pass against the toy-kv
+adapter. They exercise duplicate results and changed-payload rejection, concurrent
+absent-key branch-name claims, writer/attachment acquisition and restart fencing,
+prepared live-root commit and replay, capture-child admission/sealing/abort,
+preparation renewal and expiry cleanup, pin/read/live-log protection, and retention
+eligibility after close or expiry. This qualifies the backend-neutral P5 control
+protocol through the MVP adapter; it does not qualify live block-device durability,
+Generation publication, or device fencing integration, which remain in P6/P7/P9.
 
 ### P6. Durable barriers and live volume recovery
 

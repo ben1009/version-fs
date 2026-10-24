@@ -1,0 +1,645 @@
+//! Control-protocol integration tests against the toy-kv Metadata Authority.
+
+use std::{
+    env,
+    path::PathBuf,
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+};
+
+use versionfs_core::{
+    control::{
+        ControlError, GenerationSeed, LiveRoots, OperationState, PreparationKind,
+        PreparationRequest, WorkspaceControl, start_authority_owner,
+    },
+    fault::NoFailures,
+    format::{FormatError, ObjectRef, ObjectType, encode_object},
+    identity::{
+        AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
+        WorkspaceId,
+    },
+    time::{Clock, MonotonicTime},
+};
+use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("versionfs-control-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create control test directory");
+        Self(path)
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Default)]
+struct TestClock(AtomicU64);
+
+impl TestClock {
+    fn set(&self, nanos: u64) {
+        self.0.store(nanos, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_nanos(self.0.load(Ordering::SeqCst))
+    }
+}
+
+struct TestEnv {
+    _dir: TestDir,
+    clock: Arc<TestClock>,
+    authority: Arc<ToyKvMetadataAuthority>,
+    workspace_id: WorkspaceId,
+    principal_id: PrincipalId,
+    owner: versionfs_core::control::OwnerIncarnation,
+    control: WorkspaceControl<ToyKvMetadataAuthority>,
+}
+
+impl TestEnv {
+    fn new() -> Self {
+        let dir = TestDir::new();
+        let clock = Arc::new(TestClock::default());
+        let authority = Arc::new(
+            ToyKvMetadataAuthority::open_with(
+                &dir.0,
+                Arc::clone(&clock) as Arc<dyn Clock>,
+                Arc::new(NoFailures),
+            )
+            .expect("open toy-kv authority"),
+        );
+        let owner = start_authority_owner(authority.as_ref(), op(250)).expect("start owner");
+        assert_eq!(
+            start_authority_owner(authority.as_ref(), op(250)).expect("replay owner start"),
+            owner
+        );
+        let workspace_id = workspace(1);
+        let principal_id = principal(1);
+        let control = control_for(Arc::clone(&authority), workspace_id, principal_id, owner);
+        control
+            .create_workspace(op(1), branch(1), "main", 60_000, seed(1))
+            .expect("create initial workspace");
+        Self {
+            _dir: dir,
+            clock,
+            authority,
+            workspace_id,
+            principal_id,
+            owner,
+            control,
+        }
+    }
+
+    fn control_for_owner(
+        &self,
+        owner: versionfs_core::control::OwnerIncarnation,
+    ) -> WorkspaceControl<ToyKvMetadataAuthority> {
+        control_for(
+            Arc::clone(&self.authority),
+            self.workspace_id,
+            self.principal_id,
+            owner,
+        )
+    }
+
+    fn writer_and_attachment(&self) -> versionfs_core::control::WriterGrant {
+        let grant = self
+            .control
+            .acquire_writer(op(2), branch(1), 1, 0)
+            .expect("acquire writer");
+        self.control
+            .attach_volume(op(3), branch(1), 1, grant, attachment(1), protection(1))
+            .expect("attach volume");
+        grant
+    }
+}
+
+#[test]
+fn generation_catalog_rejects_mistyped_roots_before_persisting_an_operation() {
+    let env = TestEnv::new();
+    let mut bad_volume = seed(50);
+    bad_volume.roots.volume = object(ObjectType::LogMapRoot, 50);
+    assert_eq!(
+        env.control.register_generation(op(51), bad_volume),
+        Err(ControlError::Format(FormatError::ObjectReferenceMismatch))
+    );
+    assert_eq!(
+        env.control.get_operation(op(51)),
+        Err(ControlError::NotFound)
+    );
+
+    let mut bad_descriptor = seed(52);
+    bad_descriptor.descriptor = object(ObjectType::VolumeRoot, 52);
+    assert_eq!(
+        env.control.register_generation(op(53), bad_descriptor),
+        Err(ControlError::Format(FormatError::ObjectReferenceMismatch))
+    );
+    assert_eq!(
+        env.control.get_operation(op(53)),
+        Err(ControlError::NotFound)
+    );
+}
+
+fn control_for(
+    authority: Arc<ToyKvMetadataAuthority>,
+    workspace_id: WorkspaceId,
+    principal_id: PrincipalId,
+    owner: versionfs_core::control::OwnerIncarnation,
+) -> WorkspaceControl<ToyKvMetadataAuthority> {
+    WorkspaceControl::new(authority, workspace_id, principal_id, owner)
+}
+
+fn id<const N: usize>(byte: u8) -> [u8; N] {
+    [byte; N]
+}
+
+fn op(byte: u8) -> OperationId {
+    OperationId::from_bytes(id(byte))
+}
+
+fn workspace(byte: u8) -> WorkspaceId {
+    WorkspaceId::from_bytes(id(byte))
+}
+
+fn principal(byte: u8) -> PrincipalId {
+    PrincipalId::from_bytes(id(byte))
+}
+
+fn branch(byte: u8) -> BranchId {
+    BranchId::from_bytes(id(byte))
+}
+
+fn generation(byte: u8) -> GenerationId {
+    GenerationId::from_bytes(id(byte))
+}
+
+fn attachment(byte: u8) -> AttachmentId {
+    AttachmentId::from_bytes(id(byte))
+}
+
+fn protection(byte: u8) -> ProtectionId {
+    ProtectionId::from_bytes(id(byte))
+}
+
+fn pin(byte: u8) -> PinId {
+    PinId::from_bytes(id(byte))
+}
+
+fn object(kind: ObjectType, marker: u8) -> ObjectRef {
+    let bytes = encode_object(kind, &[marker]).expect("encode typed test object");
+    ObjectRef::from_encoded(&bytes).expect("reference encoded test object")
+}
+
+fn roots(marker: u8) -> LiveRoots {
+    LiveRoots {
+        volume: object(ObjectType::VolumeRoot, marker),
+        logs: object(ObjectType::LogMapRoot, marker),
+        artifacts: object(ObjectType::ArtifactMapRoot, marker),
+    }
+}
+
+fn seed(marker: u8) -> GenerationSeed {
+    GenerationSeed {
+        generation_id: generation(marker),
+        descriptor: object(ObjectType::GenerationDescriptor, marker),
+        roots: roots(marker),
+    }
+}
+
+#[test]
+fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() {
+    let env = TestEnv::new();
+    let created = env
+        .control
+        .create_branch(op(10), branch(2), "agent", generation(1))
+        .expect("create branch");
+    assert_eq!(
+        env.control
+            .create_branch(op(10), branch(2), "agent", generation(1))
+            .expect("replay branch create"),
+        created
+    );
+    assert_eq!(
+        env.control
+            .create_branch(op(10), branch(2), "renamed", generation(1)),
+        Err(ControlError::OperationMismatch)
+    );
+    assert_eq!(
+        env.control
+            .create_branch(op(11), branch(3), "agent", generation(1)),
+        Err(ControlError::Conflict)
+    );
+    assert_eq!(env.control.branch_by_name("agent").unwrap(), created);
+
+    let barrier = Arc::new(Barrier::new(3));
+    let racers = (0..2)
+        .map(|offset| {
+            let authority = Arc::clone(&env.authority);
+            let barrier = Arc::clone(&barrier);
+            let workspace_id = env.workspace_id;
+            let principal_id = env.principal_id;
+            let owner = env.owner;
+            thread::spawn(move || {
+                let control = control_for(authority, workspace_id, principal_id, owner);
+                barrier.wait();
+                control.create_branch(
+                    op(20 + offset),
+                    branch(20 + offset),
+                    "racing-name",
+                    generation(1),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let results = racers
+        .into_iter()
+        .map(|thread| thread.join().expect("branch claimant did not panic"))
+        .collect::<Vec<_>>();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(ControlError::Conflict)))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_protected() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    assert_eq!(
+        env.control
+            .acquire_writer(op(2), branch(1), 1, 0)
+            .expect("replay writer grant"),
+        grant
+    );
+    assert_eq!(
+        env.control.acquire_writer(op(4), branch(1), 1, 1),
+        Err(ControlError::Busy)
+    );
+
+    let next_roots = roots(9);
+    let preparation = env
+        .control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(5),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(2),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(next_roots),
+            dependencies: vec![],
+        })
+        .expect("register protected volume barrier");
+    assert!(matches!(preparation, OperationState::Preparing { .. }));
+    assert_eq!(
+        env.control
+            .begin_preparation(PreparationRequest {
+                operation_id: op(5),
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                protection_id: protection(2),
+                kind: PreparationKind::VolumeBarrier,
+                expected_roots: Some(next_roots),
+                dependencies: vec![],
+            })
+            .expect("replay preparation"),
+        preparation
+    );
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(5),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(2),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(10)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::OperationMismatch)
+    );
+
+    let committed = env
+        .control
+        .commit_live_roots(op(5), 1, grant, next_roots, None)
+        .expect("publish durable branch roots");
+    assert_eq!(committed.revision, 2);
+    assert_eq!(committed.volume_root, next_roots.volume);
+    assert_eq!(
+        env.control
+            .commit_live_roots(op(5), 1, grant, next_roots, None)
+            .expect("replay live-root commit"),
+        committed
+    );
+    assert_eq!(
+        env.control
+            .commit_live_roots(op(5), 1, grant, roots(10), None),
+        Err(ControlError::OperationMismatch)
+    );
+
+    env.clock.set(1);
+    let renewed = env
+        .control
+        .renew_attachment_base(op(6), branch(1), attachment(1), grant)
+        .expect("renew original Generation protection after live-root advance");
+    assert_eq!(renewed.base_generation, generation(1));
+    assert!(renewed.protection_expires_at > committed.attachment.unwrap().protection_expires_at);
+
+    let log_deadline = env
+        .control
+        .open_live_log(
+            op(8),
+            branch(1),
+            committed.revision,
+            next_roots.logs,
+            protection(6),
+        )
+        .expect("open protected live log root");
+    assert!(log_deadline > MonotonicTime::from_nanos(0));
+    assert_eq!(
+        env.control.open_live_log(
+            op(9),
+            branch(1),
+            committed.revision,
+            next_roots.logs,
+            protection(6)
+        ),
+        Err(ControlError::Conflict)
+    );
+    env.control
+        .close_protection(op(10), protection(6))
+        .expect("close live-log protection");
+
+    env.control
+        .detach_volume(op(11), branch(1), attachment(1), grant)
+        .expect("detach volume");
+    assert!(
+        env.control
+            .get_branch(branch(1))
+            .unwrap()
+            .attachment
+            .is_none()
+    );
+}
+
+#[test]
+fn capture_admits_only_identified_children_and_abort_releases_the_token() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let capture_request = || {
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(10),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(3),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+    };
+    let capture_state = capture_request().expect("begin checkpoint capture");
+    assert!(matches!(capture_state, OperationState::Preparing { .. }));
+    env.control
+        .authorize_capture_child(op(11), op(10), op(12), grant)
+        .expect("admit identified drain child");
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(13),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(4),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(11)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::Busy)
+    );
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(12),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(5),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(12)),
+            dependencies: vec![],
+        })
+        .expect("register admitted child preparation");
+    let after_child = env
+        .control
+        .commit_live_roots(op(12), 1, grant, roots(12), Some((op(10), op(12))))
+        .expect("commit admitted drain child");
+    assert_eq!(after_child.revision, 2);
+    let sealed = env
+        .control
+        .seal_capture(op(14), op(10), 2, grant)
+        .expect("seal exact final capture boundary");
+    assert!(sealed.sealed);
+    assert_eq!(sealed.sealed_revision, Some(2));
+    assert_eq!(sealed.sealed_roots, Some(roots(12)));
+
+    assert_eq!(
+        env.control
+            .abort_operation(op(10))
+            .expect("abort sealed capture"),
+        OperationState::Aborted
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(capture_request().unwrap(), capture_state);
+    assert_eq!(
+        env.control.get_operation(op(10)).unwrap(),
+        OperationState::Aborted
+    );
+
+    assert_eq!(
+        env.control
+            .abort_operation(op(30))
+            .expect("tombstone unseen request"),
+        OperationState::Aborted
+    );
+    assert_eq!(
+        env.control
+            .create_branch(op(30), branch(30), "delayed", generation(1)),
+        Err(ControlError::Aborted)
+    );
+    assert_eq!(
+        env.control.get_operation(op(30)).unwrap(),
+        OperationState::Aborted
+    );
+}
+
+#[test]
+fn owner_restart_fences_old_grants_and_expired_read_protections_release_retention() {
+    let env = TestEnv::new();
+    let old_grant = env.writer_and_attachment();
+    let next_owner = start_authority_owner(env.authority.as_ref(), op(251)).expect("restart owner");
+    assert!(next_owner > env.owner);
+    assert_eq!(
+        env.control.renew_writer(op(4), old_grant),
+        Err(ControlError::Fenced)
+    );
+
+    let next_control = env.control_for_owner(next_owner);
+    let new_grant = next_control
+        .acquire_writer(op(5), branch(1), 1, old_grant.writer_epoch)
+        .expect("new owner takes fenced branch");
+    assert!(new_grant.writer_epoch > old_grant.writer_epoch);
+    assert!(
+        next_control
+            .get_branch(branch(1))
+            .unwrap()
+            .attachment
+            .is_none()
+    );
+
+    next_control
+        .register_generation(op(6), seed(2))
+        .expect("register separately retained Generation");
+    let first_deadline = next_control
+        .open_generation(op(7), generation(2), protection(7))
+        .expect("open protected Generation");
+    assert_eq!(
+        next_control.mark_generation_unretained(op(8), generation(2)),
+        Err(ControlError::Busy)
+    );
+    env.clock.set(1);
+    let renewed_deadline = next_control
+        .renew_protection(op(9), protection(7))
+        .expect("renew reader protection");
+    assert!(renewed_deadline > first_deadline);
+    assert_eq!(
+        next_control
+            .renew_protection(op(9), protection(7))
+            .expect("replay protection renewal"),
+        renewed_deadline
+    );
+    next_control
+        .close_protection(op(10), protection(7))
+        .expect("close reader protection");
+    next_control
+        .mark_generation_unretained(op(11), generation(2))
+        .expect("release retention after final reader closes");
+    assert_eq!(
+        next_control.open_generation(op(12), generation(2), protection(8)),
+        Err(ControlError::GenerationExpired)
+    );
+
+    next_control
+        .register_generation(op(16), seed(3))
+        .expect("register Generation for expiry test");
+    let expiry_deadline = next_control
+        .open_generation(op(17), generation(3), protection(9))
+        .expect("open Generation with expiring protection");
+    env.clock.set(expiry_deadline.as_nanos());
+    assert_eq!(
+        next_control.renew_protection(op(18), protection(9)),
+        Err(ControlError::Expired)
+    );
+    next_control
+        .expire_protection(op(19), protection(9))
+        .expect("expire reader protection and release its retention count");
+    next_control
+        .mark_generation_unretained(op(20), generation(3))
+        .expect("mark Generation unretained after expiry cleanup");
+
+    next_control
+        .pin_generation(op(13), generation(1), pin(1))
+        .expect("pin retained Generation");
+    next_control
+        .unpin_generation(op(14), pin(1))
+        .expect("release Generation pin");
+    assert_eq!(
+        next_control.pin_generation(op(15), generation(1), pin(1)),
+        Err(ControlError::Conflict)
+    );
+}
+
+#[test]
+fn preparation_renewal_replays_and_expiry_clears_capture_admission() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let initial = env
+        .control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(10),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id: protection(10),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("begin capture preparation");
+    let OperationState::Preparing {
+        expires_at: initial_deadline,
+        ..
+    } = initial
+    else {
+        panic!("capture should remain in preparation");
+    };
+
+    env.clock.set(1);
+    let renewed_deadline = env
+        .control
+        .renew_preparation(op(11), op(10), grant)
+        .expect("renew protected capture");
+    assert!(renewed_deadline > initial_deadline);
+    assert_eq!(
+        env.control
+            .renew_preparation(op(11), op(10), grant)
+            .expect("replay preparation renewal"),
+        renewed_deadline
+    );
+    assert!(matches!(
+        env.control.expire_preparation(op(10)),
+        Err(ControlError::Busy)
+    ));
+
+    env.clock.set(renewed_deadline.as_nanos());
+    assert_eq!(
+        env.control
+            .expire_preparation(op(10))
+            .expect("expire abandoned capture"),
+        OperationState::Aborted
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control.get_operation(op(10)).unwrap(),
+        OperationState::Aborted
+    );
+    let new_grant = env
+        .control
+        .acquire_writer(op(12), branch(1), 1, grant.writer_epoch)
+        .expect("acquire after expired capture cleanup");
+    assert!(new_grant.writer_epoch > grant.writer_epoch);
+}
