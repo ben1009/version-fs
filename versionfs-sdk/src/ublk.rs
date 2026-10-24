@@ -131,11 +131,12 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
         }
     };
 
+    let callback_queue_errors = queue_errors.clone();
     queue.wait_and_handle_io(move |queue, tag, _context| {
         let mut queue_buffers = buffers.borrow_mut();
         let Some(io_buffer) = queue_buffers.get_mut(tag as usize) else {
             eprintln!("ublk returned out-of-range request tag {tag}");
-            let _ = queue_errors.send(());
+            let _ = callback_queue_errors.send(());
             return;
         };
         let buffer = io_buffer.as_mut_slice();
@@ -150,7 +151,7 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
             request.nr_sectors,
             buffer,
         );
-        complete(queue, tag, buffer, result, &queue_errors);
+        complete(queue, tag, buffer, result, &callback_queue_errors);
     });
 
     // The ublk library returns from this loop when its io_uring wait fails or
