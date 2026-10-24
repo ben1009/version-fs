@@ -303,6 +303,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(2),
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(next_roots),
@@ -318,6 +319,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
                 expected_revision: 1,
                 grant,
                 attachment_id: attachment(1),
+                volume_epoch: 1,
                 protection_id: protection(2),
                 kind: PreparationKind::VolumeBarrier,
                 expected_roots: Some(next_roots),
@@ -333,6 +335,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(2),
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(roots(10)),
@@ -377,7 +380,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             protection(6),
         )
         .expect("open protected live log root");
-    assert!(log_deadline > MonotonicTime::from_nanos(0));
+    assert!(log_deadline > env.clock.now());
     assert_eq!(
         env.control.open_live_log(
             op(9),
@@ -410,18 +413,51 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             branch(1),
             committed.revision,
             grant,
-            attachment(2),
+            attachment(1),
             protection(12),
         )
         .expect("reattach from the branch's durable live root");
     env.clock.set(2);
     let renewed_reattachment = env
         .control
-        .renew_attachment_base(op(13), branch(1), attachment(2), grant)
+        .renew_attachment_base(op(13), branch(1), attachment(1), grant)
         .expect("renew protection for a base whose live roots advanced");
     assert_eq!(reattached.base_generation, generation(1));
     assert_eq!(renewed_reattachment.base_generation, generation(1));
     assert!(renewed_reattachment.protection_expires_at > reattached.protection_expires_at);
+    assert_eq!(reattached.volume_epoch, 2);
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(14),
+            branch_id: branch(1),
+            expected_revision: committed.revision,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(14),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(14)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::Fenced)
+    );
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(15),
+            branch_id: branch(1),
+            expected_revision: committed.revision,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: reattached.volume_epoch,
+            protection_id: protection(15),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(15)),
+            dependencies: vec![],
+        })
+        .expect("accept the current attachment epoch");
+    env.control
+        .abort_operation(op(15))
+        .expect("close current-epoch preparation");
 }
 
 #[test]
@@ -435,6 +471,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(3),
             kind: PreparationKind::CheckpointCapture,
             expected_roots: None,
@@ -453,6 +490,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(4),
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(roots(11)),
@@ -467,6 +505,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(5),
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(roots(12)),
@@ -493,7 +532,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
         OperationState::Aborted
     );
     assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
-    assert_eq!(capture_request().unwrap(), capture_state);
+    assert_eq!(capture_request(), Ok(OperationState::Aborted));
     assert_eq!(
         env.control.get_operation(op(10)).unwrap(),
         OperationState::Aborted
@@ -517,6 +556,153 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
 }
 
 #[test]
+fn capture_waits_for_mutation_preparations_and_renewed_writer_can_finish_one() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let roots = roots(60);
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(60),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(60),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots),
+            dependencies: vec![],
+        })
+        .expect("begin mutation preparation");
+
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(61),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(61),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        }),
+        Err(ControlError::Busy)
+    );
+    assert_eq!(
+        env.control
+            .detach_volume(op(62), branch(1), attachment(1), grant),
+        Err(ControlError::Busy)
+    );
+
+    env.clock.set(1);
+    let renewed_grant = env
+        .control
+        .renew_writer(op(63), grant)
+        .expect("renew the active writer lease");
+    let committed = env
+        .control
+        .commit_live_roots(op(60), 1, renewed_grant, roots, None)
+        .expect("finish preparation under the renewed grant");
+    assert_eq!(committed.revision, 2);
+    assert_eq!(committed.pending_mutation_preparations, 0);
+
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(64),
+            branch_id: branch(1),
+            expected_revision: 2,
+            grant: renewed_grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(64),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("capture admission opens after mutation completion");
+    env.control
+        .abort_operation(op(64))
+        .expect("release capture token");
+}
+
+#[test]
+fn capture_child_cannot_be_used_for_log_mutation() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(70),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(70),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("begin capture");
+    env.control
+        .authorize_capture_child(op(71), op(70), op(72), grant)
+        .expect("authorize drain child");
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(72),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(72),
+            kind: PreparationKind::LogMutation,
+            expected_roots: Some(roots(72)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::Busy)
+    );
+    env.control
+        .abort_operation(op(70))
+        .expect("abort capture and retire unused child");
+    assert_eq!(
+        env.control.get_operation(op(72)),
+        Ok(OperationState::Aborted)
+    );
+}
+
+#[test]
+fn expired_attachment_protection_rejects_preparation_even_with_renewed_writer() {
+    let env = TestEnv::new();
+    let mut grant = env.writer_and_attachment();
+    for index in 0..10_u8 {
+        let now = u64::from(index + 1) * 29_000_000_000;
+        env.clock.set(now);
+        grant = env
+            .control
+            .renew_writer(op(80 + index), grant)
+            .expect("keep writer lease current");
+    }
+    env.clock.set(300_000_000_000);
+    assert_eq!(
+        env.control.begin_preparation(PreparationRequest {
+            operation_id: op(90),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(90),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(90)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::Expired)
+    );
+}
+
+#[test]
 fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
     let env = TestEnv::new();
     let grant = env.writer_and_attachment();
@@ -527,6 +713,7 @@ fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id,
             kind: PreparationKind::CheckpointCapture,
             expected_roots: None,
@@ -540,6 +727,7 @@ fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id,
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(roots(20)),
@@ -697,6 +885,7 @@ fn preparation_renewal_replays_and_expiry_clears_capture_admission() {
             expected_revision: 1,
             grant,
             attachment_id: attachment(1),
+            volume_epoch: 1,
             protection_id: protection(10),
             kind: PreparationKind::CheckpointCapture,
             expected_roots: None,

@@ -135,6 +135,9 @@ pub struct BranchState {
     pub head: GenerationId,
     /// Revision incremented by head and live-root changes.
     pub revision: u64,
+    /// Number of admitted non-capture mutations still in preparation.
+    /// Checkpoint capture waits for this count to reach zero.
+    pub pending_mutation_preparations: u64,
     /// Writer fencing epoch.
     pub writer_epoch: u64,
     /// Block-volume fencing epoch.
@@ -275,6 +278,8 @@ pub struct PreparationRequest {
     pub grant: WriterGrant,
     /// Writable attachment participating in the preparation.
     pub attachment_id: AttachmentId,
+    /// Exact block-volume epoch returned for this attachment.
+    pub volume_epoch: u64,
     /// Stable identity for the protection created with the preparation.
     pub protection_id: ProtectionId,
     /// Kind of remote-I/O preparation.
@@ -375,6 +380,10 @@ pub struct WorkspaceControl<A> {
 
 impl<A: MetadataAuthority> WorkspaceControl<A> {
     /// Creates a client for one workspace, caller scope, and owner epoch.
+    ///
+    /// This handle enforces protocol fencing, not user authorization. Callers
+    /// must authenticate and authorize the workspace and principal before
+    /// constructing it; its IDs are scope inputs, not credentials.
     pub fn new(
         authority: Arc<A>,
         workspace_id: WorkspaceId,
@@ -443,6 +452,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     name: main_name.to_owned(),
                     head: initial.generation_id,
                     revision: 1,
+                    pending_mutation_preparations: 0,
                     writer_epoch: 0,
                     volume_epoch: 1,
                     stream_epoch: 1,
@@ -535,6 +545,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 name: name.to_owned(),
                 head: base,
                 revision: 1,
+                pending_mutation_preparations: 0,
                 writer_epoch: 0,
                 volume_epoch: 1,
                 stream_epoch: 1,
@@ -666,7 +677,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let key = branch_key(self.workspace_id, grant.branch_id);
             let mut branch = read_branch(txn, &key)?;
             validate_grant_identity(&branch, grant, self.owner_incarnation)?;
-            if branch.capture.is_some() {
+            if branch.capture.is_some() || branch.pending_mutation_preparations != 0 {
                 return Err(reject("busy"));
             }
             fence_attachment(txn, self.workspace_id, &mut branch)?;
@@ -702,7 +713,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
-            if branch.attachment.is_some() || branch.capture.is_some() {
+            if branch.attachment.is_some()
+                || branch.capture.is_some()
+                || branch.pending_mutation_preparations != 0
+            {
                 return Err(reject("busy"));
             }
             let gen_key = generation_key(self.workspace_id, branch.head);
@@ -845,6 +859,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 .attachment
                 .is_none_or(|a| a.attachment_id != attachment_id)
                 || branch.capture.is_some()
+                || branch.pending_mutation_preparations != 0
             {
                 return Err(reject("busy"));
             }
@@ -1209,6 +1224,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             expected_revision,
             grant,
             attachment_id,
+            volume_epoch,
             protection_id,
             kind,
             expected_roots,
@@ -1225,6 +1241,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         payload.u64_le(expected_revision);
         encode_writer_grant(&mut payload, grant);
         payload.fixed(attachment_id.as_bytes());
+        payload.u64_le(volume_epoch);
         payload.fixed(protection_id.as_bytes());
         payload.u8(kind as u8);
         match expected_roots {
@@ -1254,15 +1271,16 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let fp = fingerprint(OP_BEGIN_PREPARATION, &request);
         let key = self.operation_key(operation_id);
         let outcome_key = self.transition_key(operation_id, TRANSITION_BEGIN);
-        if let Some(bytes) = reconcile_outcome(self.authority.as_ref(), &outcome_key)? {
-            let record = decode_operation(&bytes)?;
-            check_fingerprint(&record, OP_BEGIN_PREPARATION, fp)?;
-            return Ok(record.public_state(operation_id));
-        }
+        let begin_outcome = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
         if let Some(bytes) = self.authority.get(&key)? {
             let record = decode_operation(&bytes)?;
             check_fingerprint(&record, OP_BEGIN_PREPARATION, fp)?;
             return Ok(record.public_state(operation_id));
+        }
+        if begin_outcome.is_some() {
+            return Err(ControlError::CorruptRecord(
+                "committed preparation transition has no current operation record".into(),
+            ));
         }
         let committed = self.transact_with_outcome(&outcome_key, |txn| {
             if let Some(bytes) = txn.get(&key)? {
@@ -1277,16 +1295,26 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
-            if branch
-                .attachment
-                .is_none_or(|a| a.attachment_id != attachment_id)
-            {
-                return Err(reject("fenced"));
-            }
+            validate_attachment_protection(
+                txn,
+                self.workspace_id,
+                &branch,
+                attachment_id,
+                volume_epoch,
+                grant,
+                self.owner_incarnation,
+            )?;
+            let is_capture_child = branch.capture.is_some();
             match (&branch.capture, capture) {
-                (None, true) => {}
+                (None, true) => {
+                    if branch.pending_mutation_preparations != 0 {
+                        return Err(reject("busy"));
+                    }
+                }
                 (Some(token), false)
-                    if !token.sealed && token.pending_child == Some(operation_id) =>
+                    if !token.sealed
+                        && token.pending_child == Some(operation_id)
+                        && kind == PreparationKind::VolumeBarrier =>
                 {
                     validate_capture_preparation(
                         txn,
@@ -1297,7 +1325,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         self.owner_incarnation,
                     )?;
                 }
-                (None, false) => {}
+                (None, false) => {
+                    branch.pending_mutation_preparations =
+                        increment(branch.pending_mutation_preparations)?;
+                }
                 _ => return Err(reject("busy")),
             }
             let pkey = protection_key(self.workspace_id, protection_id);
@@ -1310,6 +1341,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 operation_id,
                 branch_id,
                 attachment_id,
+                volume_epoch,
                 grant,
                 owner_incarnation: self.owner_incarnation,
                 expires_at: expires,
@@ -1325,6 +1357,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     sealed_revision: None,
                     sealed_roots: None,
                 });
+            }
+            if capture || !is_capture_child {
                 txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
             }
             let record = StoredOperation {
@@ -1353,10 +1387,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         match committed {
             Ok(bytes) => Ok(decode_operation(&bytes)?.public_state(operation_id)),
             Err(ControlError::Conflict) => {
-                if let Some(bytes) = reconcile_outcome(self.authority.as_ref(), &outcome_key)? {
+                let outcome = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+                if let Some(bytes) = self.authority.get(&key)? {
                     let record = decode_operation(&bytes)?;
                     check_fingerprint(&record, OP_BEGIN_PREPARATION, fp)?;
                     Ok(record.public_state(operation_id))
+                } else if outcome.is_some() {
+                    Err(ControlError::CorruptRecord(
+                        "committed preparation transition has no current operation record".into(),
+                    ))
                 } else {
                     Err(ControlError::Conflict)
                 }
@@ -1417,7 +1456,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     }
                     StoredOperationStatus::Aborted => return Err(reject("aborted")),
                 };
-                if prep_grant != grant {
+                if !same_grant_identity(prep_grant, grant) {
                     return Err(reject("fenced"));
                 }
                 let branch = read_branch(txn, &branch_key(self.workspace_id, branch_id))?;
@@ -1446,15 +1485,27 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 match &mut protection {
                     ProtectionRecord::Preparation {
                         operation_id,
+                        attachment_id,
+                        volume_epoch,
                         grant: old_grant,
                         owner_incarnation,
                         expires_at,
                         ..
                     } if *operation_id == prepared_id
-                        && *old_grant == grant
+                        && same_grant_identity(*old_grant, grant)
                         && *owner_incarnation == self.owner_incarnation
                         && *expires_at > txn.now() =>
                     {
+                        validate_attachment_protection(
+                            txn,
+                            self.workspace_id,
+                            &branch,
+                            *attachment_id,
+                            *volume_epoch,
+                            grant,
+                            self.owner_incarnation,
+                        )?;
+                        *old_grant = grant;
                         *expires_at = expires;
                     }
                     _ => return Err(reject("expired")),
@@ -1570,75 +1621,86 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 .map(|bytes| decode_operation(&bytes).map_err(to_metadata_error))
                 .transpose()?;
             let record = prior.as_ref().ok_or_else(|| reject("invalid_transition"))?;
-            let prepared_attachment = match &record.status {
-                StoredOperationStatus::Committed(_) => {
-                    if record.commit_fingerprint != Some(fp) {
-                        return Err(reject("operation_mismatch"));
-                    }
-                    return encode_operation(record).map_err(to_metadata_error);
-                }
-                StoredOperationStatus::Aborted => return Err(reject("aborted")),
-                StoredOperationStatus::Preparing {
-                    branch_id,
-                    protection_id,
-                    grant: prepared_grant,
-                    expected_revision: prepared_revision,
-                    expected_roots,
-                    capture,
-                    ..
-                } => {
-                    if record.kind != OP_BEGIN_PREPARATION
-                        || *branch_id != grant.branch_id
-                        || *prepared_grant != grant
-                        || *prepared_revision != expected_revision
-                        || *capture
-                        || expected_roots.as_deref().copied() != Some(roots)
-                    {
-                        return Err(reject("operation_mismatch"));
-                    }
-                    let pkey = protection_key(self.workspace_id, *protection_id);
-                    let protection = txn.get(&pkey)?.ok_or_else(|| reject("expired"))?;
-                    match decode_protection(&protection).map_err(to_metadata_error)? {
-                        ProtectionRecord::Preparation {
-                            operation_id: prepared_id,
-                            branch_id,
-                            attachment_id,
-                            grant: protection_grant,
-                            owner_incarnation,
-                            expires_at,
-                            ..
-                        } if prepared_id == operation_id
-                            && branch_id == grant.branch_id
-                            && protection_grant == grant
-                            && owner_incarnation == self.owner_incarnation
-                            && expires_at > txn.now() =>
-                        {
-                            attachment_id
+            let (prepared_attachment_id, prepared_volume_epoch, prepared_kind) =
+                match &record.status {
+                    StoredOperationStatus::Committed(_) => {
+                        if record.commit_fingerprint != Some(fp) {
+                            return Err(reject("operation_mismatch"));
                         }
-                        _ => return Err(reject("expired")),
+                        return encode_operation(record).map_err(to_metadata_error);
                     }
-                }
-            };
+                    StoredOperationStatus::Aborted => return Err(reject("aborted")),
+                    StoredOperationStatus::Preparing {
+                        branch_id,
+                        protection_id,
+                        grant: prepared_grant,
+                        kind: prepared_kind,
+                        expected_revision: prepared_revision,
+                        expected_roots,
+                        capture,
+                        ..
+                    } => {
+                        if record.kind != OP_BEGIN_PREPARATION
+                            || *branch_id != grant.branch_id
+                            || !same_grant_identity(*prepared_grant, grant)
+                            || *prepared_revision != expected_revision
+                            || *capture
+                            || expected_roots.as_deref().copied() != Some(roots)
+                        {
+                            return Err(reject("operation_mismatch"));
+                        }
+                        let pkey = protection_key(self.workspace_id, *protection_id);
+                        let protection = txn.get(&pkey)?.ok_or_else(|| reject("expired"))?;
+                        match decode_protection(&protection).map_err(to_metadata_error)? {
+                            ProtectionRecord::Preparation {
+                                operation_id: prepared_id,
+                                branch_id,
+                                attachment_id,
+                                volume_epoch,
+                                grant: protection_grant,
+                                owner_incarnation,
+                                expires_at,
+                                ..
+                            } if prepared_id == operation_id
+                                && branch_id == grant.branch_id
+                                && protection_grant == *prepared_grant
+                                && same_grant_identity(*prepared_grant, grant)
+                                && owner_incarnation == self.owner_incarnation
+                                && expires_at > txn.now() =>
+                            {
+                                (attachment_id, volume_epoch, *prepared_kind)
+                            }
+                            _ => return Err(reject("expired")),
+                        }
+                    }
+                };
             self.require_current_owner(txn)?;
             let bkey = branch_key(self.workspace_id, grant.branch_id);
             let mut branch = read_branch(txn, &bkey)?;
             validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
-            if branch.attachment.is_none_or(|attachment| {
-                attachment.attachment_id != prepared_attachment
-                    || attachment.writer_epoch != grant.writer_epoch
-            }) {
-                return Err(reject("fenced"));
-            }
+            validate_attachment_protection(
+                txn,
+                self.workspace_id,
+                &branch,
+                prepared_attachment_id,
+                prepared_volume_epoch,
+                grant,
+                self.owner_incarnation,
+            )?;
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
             match (&mut branch.capture, capture_child) {
-                (None, None) => {}
+                (None, None) => {
+                    branch.pending_mutation_preparations =
+                        decrement(branch.pending_mutation_preparations)?;
+                }
                 (Some(capture), Some((capture_id, child_id)))
                     if capture.operation_id == capture_id
                         && !capture.sealed
                         && capture.pending_child == Some(child_id)
-                        && operation_id == child_id =>
+                        && operation_id == child_id
+                        && prepared_kind == PreparationKind::VolumeBarrier =>
                 {
                     validate_capture_preparation(
                         txn,
@@ -1744,22 +1806,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     /// Reads or reconciles an operation outcome after an uncertain response.
     pub fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         let key = self.operation_key(operation_id);
-        match self.authority.reconcile_unknown(MutationIdentity {
-            operation_id: &key,
-            outcome_key: &key,
-        }) {
-            Ok(_) => {}
-            Err(MetadataError::ReconciliationRequired {
-                operation_id: pending,
-            }) => {
-                self.authority.reconcile_unknown(MutationIdentity {
-                    operation_id: &pending,
-                    outcome_key: &pending,
-                })?;
-            }
-            Err(error) => return Err(map_metadata_error(error)),
-        }
-        let bytes = self.authority.get(&key)?.ok_or(ControlError::NotFound)?;
+        let bytes = match reconcile_outcome(self.authority.as_ref(), &key)? {
+            Some(bytes) => bytes,
+            None => self.authority.get(&key)?.ok_or(ControlError::NotFound)?,
+        };
         Ok(decode_operation(&bytes)?.public_state(operation_id))
     }
 
@@ -1826,10 +1876,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
                         }
                         branch.capture = None;
-                    } else if let Some(token) = &mut branch.capture
-                        && token.pending_child == Some(operation_id)
-                    {
-                        token.pending_child = None;
+                    } else if let Some(token) = &mut branch.capture {
+                        if token.pending_child == Some(operation_id) {
+                            token.pending_child = None;
+                        } else {
+                            return Err(reject("corrupt_record"));
+                        }
+                    } else {
+                        branch.pending_mutation_preparations =
+                            decrement(branch.pending_mutation_preparations)?;
                     }
                     txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
                     txn.delete(&pkey)?;
@@ -1884,23 +1939,24 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             };
             let pkey = protection_key(self.workspace_id, protection_id);
             let protection_bytes = txn.get(&pkey)?.ok_or_else(|| reject("expired"))?;
-            let attachment_id =
+            let (attachment_id, volume_epoch) =
                 match decode_protection(&protection_bytes).map_err(to_metadata_error)? {
                     ProtectionRecord::Preparation {
                         operation_id: prepared_id,
                         branch_id: protected_branch,
                         attachment_id,
+                        volume_epoch,
                         grant: protected_grant,
                         owner_incarnation,
                         expires_at,
                         ..
                     } if prepared_id == operation_id
                         && protected_branch == branch_id
-                        && protected_grant == grant
+                        && same_grant_identity(protected_grant, grant)
                         && owner_incarnation == grant.owner_incarnation
                         && expires_at == deadline =>
                     {
-                        attachment_id
+                        (attachment_id, volume_epoch)
                     }
                     _ => return Err(reject("expired")),
                 };
@@ -1908,11 +1964,14 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let mut branch = read_branch(txn, &bkey)?;
             let now = txn.now();
             let grant_current = grant.owner_incarnation == self.owner_incarnation
-                && branch.writer == Some(grant)
-                && grant.expires_at > now
+                && branch.writer.is_some_and(|current| {
+                    same_grant_identity(current, grant) && current.expires_at > now
+                })
                 && branch.attachment.is_some_and(|attachment| {
                     attachment.attachment_id == attachment_id
+                        && attachment.volume_epoch == volume_epoch
                         && attachment.writer_epoch == grant.writer_epoch
+                        && attachment.protection_expires_at > now
                 });
             if grant_current && deadline > now {
                 return Err(reject("busy"));
@@ -1929,10 +1988,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
                 }
                 branch.capture = None;
-            } else if let Some(token) = &mut branch.capture
-                && token.pending_child == Some(operation_id)
-            {
-                token.pending_child = None;
+            } else if let Some(token) = &mut branch.capture {
+                if token.pending_child == Some(operation_id) {
+                    token.pending_child = None;
+                } else {
+                    return Err(reject("corrupt_record"));
+                }
+            } else {
+                branch.pending_mutation_preparations =
+                    decrement(branch.pending_mutation_preparations)?;
             }
             txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
             txn.delete(&pkey)?;
@@ -1988,7 +2052,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 ..
             } if record.kind == OP_BEGIN_PREPARATION
                 && child_branch == branch_id
-                && child_grant == grant
+                && same_grant_identity(child_grant, grant)
                 && !capture =>
             {
                 Err(reject("busy"))
@@ -2103,7 +2167,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         kind: u16,
         request_fingerprint: [u8; 32],
     ) -> Result<Option<Vec<u8>>, ControlError> {
-        let bytes = reconcile_outcome(self.authority.as_ref(), key)?.or(self.authority.get(key)?);
+        let bytes = match reconcile_outcome(self.authority.as_ref(), key)? {
+            Some(bytes) => Some(bytes),
+            None => self.authority.get(key)?,
+        };
         let Some(bytes) = bytes else {
             return Ok(None);
         };
@@ -2250,6 +2317,7 @@ enum ProtectionRecord {
         operation_id: OperationId,
         branch_id: BranchId,
         attachment_id: AttachmentId,
+        volume_epoch: u64,
         grant: WriterGrant,
         owner_incarnation: OwnerIncarnation,
         expires_at: MonotonicTime,
@@ -2418,6 +2486,7 @@ fn encode_branch(branch: &BranchState) -> Result<Vec<u8>, FormatError> {
     e.bytes(branch.name.as_bytes())?;
     e.fixed(branch.head.as_bytes());
     e.u64_le(branch.revision);
+    e.u64_le(branch.pending_mutation_preparations);
     e.u64_le(branch.writer_epoch);
     e.u64_le(branch.volume_epoch);
     e.u64_le(branch.stream_epoch);
@@ -2464,6 +2533,7 @@ fn decode_branch(bytes: &[u8]) -> Result<BranchState, ControlError> {
         .to_owned();
     let head = GenerationId::from_bytes(d.fixed().map_err(corrupt)?);
     let revision = d.u64_le().map_err(corrupt)?;
+    let pending_mutation_preparations = d.u64_le().map_err(corrupt)?;
     let writer_epoch = d.u64_le().map_err(corrupt)?;
     let volume_epoch = d.u64_le().map_err(corrupt)?;
     let stream_epoch = d.u64_le().map_err(corrupt)?;
@@ -2503,6 +2573,7 @@ fn decode_branch(bytes: &[u8]) -> Result<BranchState, ControlError> {
         name,
         head,
         revision,
+        pending_mutation_preparations,
         writer_epoch,
         volume_epoch,
         stream_epoch,
@@ -2630,6 +2701,7 @@ fn encode_protection(record: &ProtectionRecord) -> Result<Vec<u8>, FormatError> 
             operation_id,
             branch_id,
             attachment_id,
+            volume_epoch,
             grant,
             owner_incarnation,
             expires_at,
@@ -2640,6 +2712,7 @@ fn encode_protection(record: &ProtectionRecord) -> Result<Vec<u8>, FormatError> 
             e.fixed(operation_id.as_bytes());
             e.fixed(branch_id.as_bytes());
             e.fixed(attachment_id.as_bytes());
+            e.u64_le(*volume_epoch);
             encode_writer_grant(&mut e, *grant);
             e.u64_le(owner_incarnation.get());
             e.u64_le(expires_at.as_nanos());
@@ -2687,6 +2760,7 @@ fn decode_protection(bytes: &[u8]) -> Result<ProtectionRecord, ControlError> {
             let operation_id = OperationId::from_bytes(d.fixed().map_err(corrupt)?);
             let branch_id = BranchId::from_bytes(d.fixed().map_err(corrupt)?);
             let attachment_id = AttachmentId::from_bytes(d.fixed().map_err(corrupt)?);
+            let volume_epoch = d.u64_le().map_err(corrupt)?;
             let grant = decode_writer_grant(&mut d).map_err(corrupt)?;
             let owner_incarnation = OwnerIncarnation(d.u64_le().map_err(corrupt)?);
             let expires_at = MonotonicTime::from_nanos(d.u64_le().map_err(corrupt)?);
@@ -2705,6 +2779,7 @@ fn decode_protection(bytes: &[u8]) -> Result<ProtectionRecord, ControlError> {
                 operation_id,
                 branch_id,
                 attachment_id,
+                volume_epoch,
                 grant,
                 owner_incarnation,
                 expires_at,
@@ -2995,10 +3070,34 @@ fn reconcile_outcome<A: MetadataAuthority>(
     authority: &A,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, ControlError> {
-    match authority.reconcile_unknown(MutationIdentity {
+    let outcome = match authority.reconcile_unknown(MutationIdentity {
         operation_id: key,
         outcome_key: key,
-    })? {
+    }) {
+        Ok(outcome) => outcome,
+        Err(MetadataError::ReconciliationRequired {
+            operation_id: pending,
+        }) => {
+            let pending_outcome = authority
+                .reconcile_unknown(MutationIdentity {
+                    operation_id: &pending,
+                    outcome_key: &pending,
+                })
+                .map_err(map_metadata_error)?;
+            if pending.as_slice() == key {
+                pending_outcome
+            } else {
+                authority
+                    .reconcile_unknown(MutationIdentity {
+                        operation_id: key,
+                        outcome_key: key,
+                    })
+                    .map_err(map_metadata_error)?
+            }
+        }
+        Err(error) => return Err(map_metadata_error(error)),
+    };
+    match outcome {
         ReconciledOutcome::Committed(bytes) => Ok(Some(bytes)),
         ReconciledOutcome::NotCommitted => Ok(None),
     }
@@ -3058,6 +3157,60 @@ fn validate_grant_identity(
         return Err(reject("fenced"));
     }
     Ok(())
+}
+
+fn same_grant_identity(left: WriterGrant, right: WriterGrant) -> bool {
+    left.branch_id == right.branch_id
+        && left.writer_epoch == right.writer_epoch
+        && left.owner_incarnation == right.owner_incarnation
+        && left.grant_id == right.grant_id
+}
+
+fn validate_attachment_protection(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch: &BranchState,
+    attachment_id: AttachmentId,
+    volume_epoch: u64,
+    grant: WriterGrant,
+    owner: OwnerIncarnation,
+) -> Result<(), MetadataError> {
+    let attachment = branch.attachment.ok_or_else(|| reject("fenced"))?;
+    if attachment.attachment_id != attachment_id
+        || attachment.volume_epoch != volume_epoch
+        || attachment.writer_epoch != grant.writer_epoch
+    {
+        return Err(reject("fenced"));
+    }
+    let pkey = protection_key(workspace, attachment.protection_id);
+    let bytes = txn.get(&pkey)?.ok_or_else(|| reject("expired"))?;
+    match decode_protection(&bytes).map_err(to_metadata_error)? {
+        ProtectionRecord::AttachmentBase {
+            branch_id,
+            attachment_id: protected_attachment,
+            generation_id,
+            owner_incarnation,
+            expires_at,
+            ..
+        } if branch_id == branch.branch_id
+            && protected_attachment == attachment_id
+            && generation_id == attachment.base_generation
+            && owner_incarnation == owner
+            && expires_at == attachment.protection_expires_at =>
+        {
+            if expires_at <= txn.now() {
+                return Err(reject("expired"));
+            }
+            let generation =
+                read_generation(txn, &generation_key(workspace, attachment.base_generation))?;
+            if generation.attachment_refs == 0 {
+                return Err(reject("corrupt_record"));
+            }
+            Ok(())
+        }
+        ProtectionRecord::AttachmentBase { .. } => Err(reject("corrupt_record")),
+        _ => Err(reject("fenced")),
+    }
 }
 
 fn validate_writer(
@@ -3213,7 +3366,7 @@ fn validate_capture_preparation(
             ..
         } if operation_id == capture_id
             && branch_id == grant.branch_id
-            && prepared_grant == grant
+            && same_grant_identity(prepared_grant, grant)
             && owner_incarnation == owner
             && expires_at > txn.now() =>
         {

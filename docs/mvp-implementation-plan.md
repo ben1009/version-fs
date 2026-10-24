@@ -232,21 +232,25 @@ claiming reliable barriers until P6 is qualified.
 - [x] Implement retention eligibility guards, pins, read/live-log protections,
   attachment bases, and shared preparation/renewal state from the start.
 - [x] Add checkpoint capture-token admission: block other head/live mutations,
-  allow only identified drain-flush children until sealing, and retain independent
-  renew/query/abort paths. Definite expiry/fencing resolves token cleanup safely.
+  wait for ordinary mutation preparations to resolve, allow only identified
+  VolumeBarrier drain-flush children, and retain independent renew/query/abort
+  paths. Preparations bind the exact volume epoch and live attachment-base
+  protection at admission and commit. Definite expiry/fencing resolves token
+  cleanup safely.
 
 Use the RFC's lease/renewal defaults centrally. Every new heartbeat has an operation
 ID; replay returns its old deadline. Keep terminal fingerprints/results for the
 workspace lifetime and surface capacity exhaustion rather than forgetting IDs.
 
-**Exit evidence:** six authority-backed integration tests pass against the toy-kv
+**Exit evidence:** authority-backed integration tests pass against the toy-kv
 adapter. They exercise duplicate results and changed-payload rejection, concurrent
 absent-key branch-name claims, writer/attachment acquisition and restart fencing,
-prepared live-root commit and replay, capture-child admission/sealing/abort,
-preparation renewal and expiry cleanup, pin/read/live-log protection, and retention
-eligibility after close or expiry. This qualifies the backend-neutral P5 control
-protocol through the MVP adapter; it does not qualify live block-device durability,
-Generation publication, or device fencing integration, which remain in P6/P7/P9.
+active-preparation renewal under a refreshed writer grant, exact attachment epochs
+and protection expiry, capture exclusion/admission/sealing/abort, preparation
+renewal and expiry cleanup, pin/read/live-log protection, and retention eligibility
+after close or expiry. This qualifies the backend-neutral P5 control protocol through
+the MVP adapter; it does not qualify live block-device durability, Generation
+publication, or device fencing integration, which remain in P6/P7/P9.
 
 ### P6. Durable barriers and live volume recovery
 

@@ -600,7 +600,11 @@ a filesystem workload, not a native Version FS database participant.
 attachment ID under its exact writer grant and volume epoch. One writable
 attachment is active per branch. A fork gets an independent writable identity;
 reset, detach/replacement, and ownership handover fence the previous attachment.
-Every durable root replacement validates that identity and the writer lease.
+Every protected preparation carries the exact volume epoch and validates the
+current attachment-base protection when it begins, renews, and commits. Reusing
+an attachment ID after detach cannot make a preparation from the prior epoch
+valid. Detach and writer release are rejected until ordinary mutation
+preparations commit, abort, or expire.
 
 The worker records the attachment, base root/protection, pending operation IDs,
 and capture/freeze intent outside the exported volume. Control files, block-server
@@ -885,6 +889,10 @@ in v0. The parent Generation ID is not a required content edge.
    from the authority, and then drain active producers. Register the branch
    capture token and protected preparation under those exact pre-drain revision/root
    preconditions and the worker's original attachment/grant/fencing identities.
+   Capture admission requires all ordinary mutation preparations to be resolved;
+   while the token is open, only a `VolumeBarrier` preparation may be admitted as
+   its identified drain-flush child. Log and artifact mutations cannot use that
+   child slot.
    A change of ownership fences this attempt; it must not refresh to a new owner.
    A definite acquisition conflict ends this attempt: restart Step 1 with a new
    checkpoint operation ID, fresh pre-drain revision/root preconditions, and a
