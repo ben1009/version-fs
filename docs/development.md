@@ -22,6 +22,10 @@ unimplemented.
 Workspace cache directories have one owner at a time; drop the prior cache
 handle before reopening its directory. An exclusive file lock also prevents
 another process from rebuilding or filling that same cache concurrently.
+Cache handles identify both their workspace and object-store scope. A cached
+map store requires its cache scope to match the backing store's `proof_scope`;
+reopening a directory for another scope removes the previous scope's clean
+objects before serving reads.
 
 Validated view handles seal without reading their map nodes. Imported volume
 handles can retain the result of `VolumeExtentMap::validate` to check metadata

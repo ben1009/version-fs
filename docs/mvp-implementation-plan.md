@@ -215,11 +215,13 @@ index path and requested extent, while range diff skips shared subtrees and neve
 fetches extent payloads. Dirty tracking requires no filesystem scan. Upload views
 borrow immutable sealed extent buffers. Verified-cache tests cover reopen,
 corruption, oversize entries, workspace isolation, concurrent fill coordination,
-exclusive directory ownership across processes, interrupted-fill recovery, and
-bounded LRU eviction. A privileged ublk regression injects a queue setup error
-and verifies that startup returns the original error without waiting for buffer
-registration. Do not mount a writable filesystem claiming reliable barriers
-until P6 is qualified.
+object-store namespace isolation, exclusive directory ownership across processes,
+interrupted-fill recovery, and bounded LRU eviction. Cached map stores reject a
+cache/backing namespace mismatch; reopening a cache for another namespace cannot
+prove objects that are absent from that backend. A privileged ublk regression
+injects a queue setup error and verifies that startup returns the original error
+without waiting for buffer registration. Do not mount a writable filesystem
+claiming reliable barriers until P6 is qualified.
 
 ### P5. Control schema and attachment authority
 

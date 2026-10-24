@@ -1,4 +1,4 @@
-//! Verified, workspace-scoped disk cache for immutable objects.
+//! Verified disk cache scoped to a workspace and immutable-object namespace.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use thiserror::Error;
 use versionfs_core::format::{FormatError, MAX_ENCODED_OBJECT_BYTES, ObjectRef};
-use versionfs_core::identity::{ObjectId, WorkspaceId};
+use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, WorkspaceId};
 use versionfs_core::persistent_map::MapObjectStore;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
@@ -35,6 +35,14 @@ pub enum CacheError {
     /// The cache's local coordination lock was poisoned.
     #[error("object cache lock is poisoned")]
     Poisoned,
+    /// The cache and backing store use different immutable-object namespaces.
+    #[error("object cache scope {cache_scope} does not match backing store scope {backing_scope}")]
+    ScopeMismatch {
+        /// Namespace selected when the cache was opened.
+        cache_scope: ObjectStoreScopeId,
+        /// Namespace declared by the backing store.
+        backing_scope: ObjectStoreScopeId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -82,6 +90,10 @@ enum SharedCacheError {
         message: Arc<str>,
     },
     Poisoned,
+    ScopeMismatch {
+        cache_scope: ObjectStoreScopeId,
+        backing_scope: ObjectStoreScopeId,
+    },
 }
 
 impl SharedCacheError {
@@ -95,6 +107,13 @@ impl SharedCacheError {
                 message: Arc::from(source.to_string()),
             },
             CacheError::Poisoned => Self::Poisoned,
+            CacheError::ScopeMismatch {
+                cache_scope,
+                backing_scope,
+            } => Self::ScopeMismatch {
+                cache_scope,
+                backing_scope,
+            },
         }
     }
 
@@ -111,6 +130,13 @@ impl SharedCacheError {
                 source: std::io::Error::new(kind, message.to_string()),
             },
             Self::Poisoned => CacheError::Poisoned,
+            Self::ScopeMismatch {
+                cache_scope,
+                backing_scope,
+            } => CacheError::ScopeMismatch {
+                cache_scope,
+                backing_scope,
+            },
         }
     }
 }
@@ -256,7 +282,7 @@ impl Drop for TemporaryPath {
     }
 }
 
-/// Bounded clean-object cache for one workspace.
+/// Bounded clean-object cache for one workspace and immutable-object namespace.
 ///
 /// Every fill is verified before atomic installation. Per-object in-flight
 /// coordination deduplicates concurrent misses while unrelated object reads
@@ -265,6 +291,7 @@ impl Drop for TemporaryPath {
 /// separate caller-owned storage.
 pub struct WorkspaceObjectCache {
     workspace_id: WorkspaceId,
+    store_scope: ObjectStoreScopeId,
     directory: PathBuf,
     capacity_bytes: u64,
     state: Mutex<CacheState>,
@@ -272,13 +299,15 @@ pub struct WorkspaceObjectCache {
 }
 
 impl WorkspaceObjectCache {
-    /// Opens a cache directory scoped to one workspace and indexes valid files.
+    /// Opens a cache for one workspace and immutable-object namespace.
     ///
     /// The directory is exclusively locked until this cache is dropped. Another
     /// handle or process opening the same directory receives an I/O error.
+    /// Reopening under another namespace removes the previous namespace's files.
     pub fn open(
         root: impl AsRef<Path>,
         workspace_id: WorkspaceId,
+        store_scope: ObjectStoreScopeId,
         capacity_bytes: u64,
     ) -> Result<Self, CacheError> {
         let directory = root.as_ref().join(workspace_id.to_string());
@@ -318,6 +347,7 @@ impl WorkspaceObjectCache {
 
         let mut cache = Self {
             workspace_id,
+            store_scope,
             directory,
             capacity_bytes,
             state: Mutex::new(CacheState::default()),
@@ -332,7 +362,14 @@ impl WorkspaceObjectCache {
         self.workspace_id
     }
 
+    /// Returns the immutable-object namespace that scopes this cache instance.
+    pub const fn store_scope(&self) -> ObjectStoreScopeId {
+        self.store_scope
+    }
+
     /// Returns a verified object, filling it from `fetch` on a cache miss.
+    ///
+    /// The fetcher must read from this cache's workspace and [`Self::store_scope`].
     pub fn get_or_fetch(
         &self,
         expected: ObjectRef,
@@ -595,7 +632,7 @@ impl WorkspaceObjectCache {
                 }
                 continue;
             }
-            let Some(object_id) = object_id_from_file_name(&path) else {
+            let Some(object_id) = object_id_from_file_name(&path, self.store_scope) else {
                 fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
                 continue;
             };
@@ -655,7 +692,8 @@ impl WorkspaceObjectCache {
     }
 
     fn object_path(&self, object_id: ObjectId) -> PathBuf {
-        self.directory.join(format!("{object_id}.obj"))
+        self.directory
+            .join(format!("{}-{object_id}.obj", self.store_scope))
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, CacheState>, CacheError> {
@@ -686,10 +724,22 @@ pub struct CachedMapStore<S> {
     cache: WorkspaceObjectCache,
 }
 
-impl<S> CachedMapStore<S> {
+impl<S: MapObjectStore> CachedMapStore<S> {
     /// Creates a map store combining a synchronous backend and workspace cache.
-    pub const fn new(backing: S, cache: WorkspaceObjectCache) -> Self {
-        Self { backing, cache }
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cache and backend declare different namespaces.
+    pub fn new(backing: S, cache: WorkspaceObjectCache) -> Result<Self, CacheError> {
+        let cache_scope = cache.store_scope();
+        let backing_scope = backing.proof_scope();
+        if cache_scope != backing_scope {
+            return Err(CacheError::ScopeMismatch {
+                cache_scope,
+                backing_scope,
+            });
+        }
+        Ok(Self { backing, cache })
     }
 
     /// Returns a reference to the immutable-object backend.
@@ -760,9 +810,12 @@ fn read_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     Ok(bytes)
 }
 
-fn object_id_from_file_name(path: &Path) -> Option<ObjectId> {
+fn object_id_from_file_name(path: &Path, store_scope: ObjectStoreScopeId) -> Option<ObjectId> {
     let name = path.file_name()?.to_str()?;
-    let digest = name.strip_suffix(".obj")?;
+    let (scope, digest) = name.strip_suffix(".obj")?.split_once('-')?;
+    if scope != store_scope.to_string() {
+        return None;
+    }
     if digest.len() != 64 {
         return None;
     }
@@ -789,6 +842,7 @@ mod tests {
     use versionfs_core::persistent_map::MapObjectStore;
 
     static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(1);
+    const STORE_SCOPE: ObjectStoreScopeId = ObjectStoreScopeId::from_bytes([0x38; 16]);
 
     struct TestDirectory(PathBuf);
 
@@ -830,18 +884,19 @@ mod tests {
     fn workspace_cache_directory_has_one_owner_until_drop() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x3F; 16]);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
 
         assert!(matches!(
-            WorkspaceObjectCache::open(&directory.0, workspace, 1024),
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024),
             Err(CacheError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::WouldBlock
         ));
 
         drop(cache);
-        let _reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let _reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         assert!(matches!(
-            WorkspaceObjectCache::open(&directory.0, workspace, 1024),
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024),
             Err(CacheError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::WouldBlock
         ));
@@ -853,7 +908,7 @@ mod tests {
         let workspace = WorkspaceId::from_bytes([0x40; 16]);
         if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
             assert!(matches!(
-                WorkspaceObjectCache::open(directory, workspace, 1024),
+                WorkspaceObjectCache::open(directory, workspace, STORE_SCOPE, 1024),
                 Err(CacheError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::WouldBlock
             ));
@@ -861,7 +916,8 @@ mod tests {
         }
 
         let directory = TestDirectory::new();
-        let _cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let _cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("object_cache::tests::workspace_cache_directory_lock_rejects_another_process")
@@ -876,7 +932,8 @@ mod tests {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x31; 16]);
         let (reference, bytes) = encoded_object(0xA1);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
+        assert_eq!(cache.store_scope(), STORE_SCOPE);
         let fetches = AtomicUsize::new(0);
 
         let first = cache
@@ -891,7 +948,8 @@ mod tests {
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
 
         drop(cache);
-        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         assert_eq!(fetch(&reopened, reference, &[]), bytes);
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
         let files: Vec<_> = fs::read_dir(directory.0.join(workspace.to_string()))
@@ -906,24 +964,47 @@ mod tests {
     }
 
     #[test]
+    fn reopening_with_another_scope_removes_other_scope_and_legacy_objects() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x42; 16]);
+        let (reference, bytes) = encoded_object(0xB4);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
+        fetch(&cache, reference, &bytes);
+        let scoped_path = cache.object_path(reference.object_id);
+        let legacy_path = cache.directory.join(format!("{}.obj", reference.object_id));
+        fs::copy(&scoped_path, &legacy_path).unwrap();
+        drop(cache);
+
+        let other_scope = ObjectStoreScopeId::from_bytes([0x43; 16]);
+        let reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, other_scope, 1024).unwrap();
+        assert!(!scoped_path.exists());
+        assert!(!legacy_path.exists());
+        assert!(reopened.lock_state().unwrap().entries.is_empty());
+        assert_eq!(fetch(&reopened, reference, &bytes), bytes);
+    }
+
+    #[test]
     fn corrupt_and_oversized_cache_entries_are_removed_before_refill() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x32; 16]);
         let (reference, bytes) = encoded_object(0xB2);
         let workspace_dir = directory.0.join(workspace.to_string());
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         fetch(&cache, reference, &bytes);
         drop(cache);
 
-        let object_path = workspace_dir.join(format!("{}.obj", reference.object_id));
+        let object_path = workspace_dir.join(format!("{STORE_SCOPE}-{}.obj", reference.object_id));
         fs::write(&object_path, [0xFF, 0x00]).unwrap();
-        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         assert_eq!(fetch(&reopened, reference, &bytes), bytes);
 
         drop(reopened);
         let file = OpenOptions::new().write(true).open(&object_path).unwrap();
         file.set_len(MAX_ENCODED_OBJECT_BYTES as u64 + 1).unwrap();
-        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         assert_eq!(fetch(&reopened, reference, &bytes), bytes);
         assert_eq!(
             fs::metadata(&object_path).unwrap().len(),
@@ -939,7 +1020,8 @@ mod tests {
         let (b_ref, b) = encoded_object(2);
         let (c_ref, c) = encoded_object(3);
         let capacity = (a.len() * 2) as u64;
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, capacity).unwrap();
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
         let fetches = AtomicUsize::new(0);
         let get = |reference, bytes: &[u8]| {
             cache
@@ -969,7 +1051,8 @@ mod tests {
         let (first_new_ref, _) = encoded_object(0xA3);
         let (second_new_ref, second_new_bytes) = encoded_object(0xA4);
         let capacity = (large_bytes.len() + small_bytes.len()) as u64;
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, capacity).unwrap();
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
         fetch(&cache, large_ref, &large_bytes);
         fetch(&cache, small_ref, &small_bytes);
 
@@ -1023,7 +1106,9 @@ mod tests {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x34; 16]);
         let (reference, bytes) = encoded_object(0xD4);
-        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let cache = Arc::new(
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap(),
+        );
         let fetches = Arc::new(AtomicUsize::new(0));
         let start = Arc::new(Barrier::new(8));
         let workers: Vec<_> = (0..8)
@@ -1056,7 +1141,9 @@ mod tests {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x41; 16]);
         let (reference, bytes) = encoded_object(0xA4);
-        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let cache = Arc::new(
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap(),
+        );
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (panic_tx, panic_rx) = std::sync::mpsc::channel();
         let leader_cache = Arc::clone(&cache);
@@ -1091,7 +1178,9 @@ mod tests {
         let workspace = WorkspaceId::from_bytes([0x3A; 16]);
         let (first_ref, first_bytes) = encoded_object(0xA3);
         let (second_ref, second_bytes) = encoded_object(0xB3);
-        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let cache = Arc::new(
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap(),
+        );
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
         let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
@@ -1141,7 +1230,7 @@ mod tests {
     fn local_cache_io_failures_do_not_fail_verified_reads_or_backing_writes() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x3B; 16]);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         let (read_ref, read_bytes) = encoded_object(0xC3);
         fs::create_dir(cache.object_path(read_ref.object_id)).unwrap();
 
@@ -1151,10 +1240,10 @@ mod tests {
         assert_eq!(read_result, read_bytes);
 
         let workspace = WorkspaceId::from_bytes([0x3C; 16]);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         let (write_ref, write_bytes) = encoded_object(0xD3);
         fs::create_dir(cache.object_path(write_ref.object_id)).unwrap();
-        let mut store = CachedMapStore::new(MemoryStore::default(), cache);
+        let mut store = CachedMapStore::new(MemoryStore::default(), cache).unwrap();
 
         assert!(
             store
@@ -1172,7 +1261,7 @@ mod tests {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x3D; 16]);
         let (reference, bytes) = encoded_object(0xE3);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
         fetch(&cache, reference, &bytes);
 
         let object_path = cache.object_path(reference.object_id);
@@ -1196,8 +1285,10 @@ mod tests {
         let first_workspace = WorkspaceId::from_bytes([0x35; 16]);
         let second_workspace = WorkspaceId::from_bytes([0x36; 16]);
         let (reference, bytes) = encoded_object(0xE5);
-        let first = WorkspaceObjectCache::open(&directory.0, first_workspace, 1024).unwrap();
-        let second = WorkspaceObjectCache::open(&directory.0, second_workspace, 1024).unwrap();
+        let first =
+            WorkspaceObjectCache::open(&directory.0, first_workspace, STORE_SCOPE, 1024).unwrap();
+        let second =
+            WorkspaceObjectCache::open(&directory.0, second_workspace, STORE_SCOPE, 1024).unwrap();
         fetch(&first, reference, &bytes);
 
         let second_fetches = AtomicUsize::new(0);
@@ -1218,7 +1309,7 @@ mod tests {
         let workspace = WorkspaceId::from_bytes([0x37; 16]);
         let (reference, _) = encoded_object(0xF7);
         let (_, wrong_bytes) = encoded_object(0xF8);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
 
         assert!(matches!(
             cache.get_or_fetch(reference, |_, _| Ok(wrong_bytes)),
@@ -1232,15 +1323,25 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
     struct MemoryStore {
+        scope: ObjectStoreScopeId,
         objects: HashMap<ObjectId, Vec<u8>>,
         gets: AtomicUsize,
     }
 
+    impl Default for MemoryStore {
+        fn default() -> Self {
+            Self {
+                scope: STORE_SCOPE,
+                objects: HashMap::new(),
+                gets: AtomicUsize::new(0),
+            }
+        }
+    }
+
     impl MapObjectStore for MemoryStore {
         fn proof_scope(&self) -> ObjectStoreScopeId {
-            ObjectStoreScopeId::from_bytes([0x38; 16])
+            self.scope
         }
 
         fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
@@ -1255,11 +1356,85 @@ mod tests {
     }
 
     #[test]
+    fn cached_map_store_rejects_a_mismatched_object_namespace() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x44; 16]);
+        let other_scope = ObjectStoreScopeId::from_bytes([0x45; 16]);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, other_scope, 1024).unwrap();
+        assert!(matches!(
+            CachedMapStore::new(MemoryStore::default(), cache),
+            Err(CacheError::ScopeMismatch { cache_scope, backing_scope })
+                if cache_scope == other_scope && backing_scope == STORE_SCOPE
+        ));
+    }
+
+    #[test]
+    fn another_scope_cannot_verify_a_generation_from_the_previous_scopes_cache() {
+        use versionfs_core::format::{CaptureMode, GenerationDescriptor, VolumeGeometry};
+        use versionfs_core::graph::{GraphError, verify_generation, verify_generation_with_reuse};
+        use versionfs_core::identity::{GenerationId, VolumeBoundaryId};
+        use versionfs_core::views::{ArtifactMap, LogMap, VolumeExtentMap};
+
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x46; 16]);
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 16 * 1024).unwrap();
+        let mut original = CachedMapStore::new(MemoryStore::default(), cache).unwrap();
+        let volume = VolumeExtentMap::empty(VolumeGeometry::new(64 * 1024).unwrap(), &mut original)
+            .unwrap()
+            .seal(&mut original)
+            .unwrap();
+        let logs = LogMap::empty(&mut original)
+            .unwrap()
+            .seal(&mut original)
+            .unwrap();
+        let artifacts = ArtifactMap::empty(&mut original)
+            .unwrap()
+            .seal(&mut original)
+            .unwrap();
+        let descriptor = GenerationDescriptor {
+            generation_id: GenerationId::from_bytes([0x47; 16]),
+            parent_generation_id: None,
+            volume_root: volume,
+            logs_root: logs,
+            artifacts_root: artifacts,
+            capture_mode: CaptureMode::BlockCut,
+            volume_boundary_id: VolumeBoundaryId::from_bytes([0x48; 16]),
+            created_at_unix_ms: 0,
+        }
+        .encode()
+        .unwrap();
+        let reference = ObjectRef::from_encoded(&descriptor).unwrap();
+        original.put(reference.object_id, descriptor).unwrap();
+        let original_proof = verify_generation(&original, reference).unwrap();
+        assert_eq!(original_proof.objects().len(), 7);
+        drop(original);
+
+        let other_scope = ObjectStoreScopeId::from_bytes([0x49; 16]);
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, other_scope, 16 * 1024).unwrap();
+        let empty = CachedMapStore::new(
+            MemoryStore {
+                scope: other_scope,
+                ..MemoryStore::default()
+            },
+            cache,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_generation(&empty, reference),
+            Err(GraphError::MissingObject(id)) if id == reference.object_id
+        ));
+        assert!(verify_generation_with_reuse(&empty, reference, &[&original_proof]).is_err());
+        assert!(empty.backing().objects.is_empty());
+    }
+
+    #[test]
     fn cached_map_store_seeds_verified_puts_and_preserves_missing_object_semantics() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x39; 16]);
-        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
-        let mut store = CachedMapStore::new(MemoryStore::default(), cache);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
+        let mut store = CachedMapStore::new(MemoryStore::default(), cache).unwrap();
         let (reference, bytes) = encoded_object(0xA9);
 
         store.put(reference.object_id, bytes.clone()).unwrap();
