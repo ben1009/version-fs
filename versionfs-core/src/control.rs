@@ -197,6 +197,8 @@ pub struct AttachmentState {
 pub struct CaptureState {
     /// Checkpoint operation that owns this token.
     pub operation_id: OperationId,
+    /// Authenticated caller scope that owns the capture and its children.
+    pub principal_id: PrincipalId,
     /// Protection record that keeps this capture's dependencies reachable.
     pub protection_id: ProtectionId,
     /// Exact branch revision captured before producer drain.
@@ -767,17 +769,21 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         decode_attachment_result(&result)
     }
 
-    /// Renews an attachment base before expiry, without changing branch revision.
+    /// Renews the exact attachment base before expiry, without changing branch revision.
     pub fn renew_attachment_base(
         &self,
         operation_id: OperationId,
         branch_id: BranchId,
         attachment_id: AttachmentId,
+        volume_epoch: u64,
+        protection_id: ProtectionId,
         grant: WriterGrant,
     ) -> Result<AttachmentState, ControlError> {
         let mut payload = CanonicalEncoder::new();
         payload.fixed(branch_id.as_bytes());
         payload.fixed(attachment_id.as_bytes());
+        payload.u64_le(volume_epoch);
+        payload.fixed(protection_id.as_bytes());
         encode_writer_grant(&mut payload, grant);
         let result =
             self.run_atomic(operation_id, OP_RENEW_ATTACHMENT, payload.finish(), |txn| {
@@ -787,6 +793,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 let mut attachment = branch.attachment.ok_or_else(|| reject("fenced"))?;
                 if attachment.attachment_id != attachment_id
+                    || attachment.volume_epoch != volume_epoch
+                    || attachment.protection_id != protection_id
                     || attachment.writer_epoch != grant.writer_epoch
                 {
                     return Err(reject("fenced"));
@@ -838,29 +846,35 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         decode_attachment_result(&result)
     }
 
-    /// Detaches a clean, drained attachment and releases its base protection.
+    /// Detaches the exact clean, drained attachment and releases its base protection.
     pub fn detach_volume(
         &self,
         operation_id: OperationId,
         branch_id: BranchId,
         attachment_id: AttachmentId,
+        volume_epoch: u64,
+        protection_id: ProtectionId,
         grant: WriterGrant,
     ) -> Result<(), ControlError> {
         let mut payload = CanonicalEncoder::new();
         payload.fixed(branch_id.as_bytes());
         payload.fixed(attachment_id.as_bytes());
+        payload.u64_le(volume_epoch);
+        payload.fixed(protection_id.as_bytes());
         encode_writer_grant(&mut payload, grant);
         self.run_atomic(operation_id, OP_DETACH, payload.finish(), |txn| {
             self.require_current_owner(txn)?;
             let key = branch_key(self.workspace_id, branch_id);
             let mut branch = read_branch(txn, &key)?;
             validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
-            if branch
-                .attachment
-                .is_none_or(|a| a.attachment_id != attachment_id)
-                || branch.capture.is_some()
-                || branch.pending_mutation_preparations != 0
-            {
+            if branch.attachment.is_none_or(|a| {
+                a.attachment_id != attachment_id
+                    || a.volume_epoch != volume_epoch
+                    || a.protection_id != protection_id
+            }) {
+                return Err(reject("fenced"));
+            }
+            if branch.capture.is_some() || branch.pending_mutation_preparations != 0 {
                 return Err(reject("busy"));
             }
             release_attachment(txn, self.workspace_id, &mut branch)?;
@@ -1305,8 +1319,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 self.owner_incarnation,
             )?;
             let is_capture_child = branch.capture.is_some();
+            if let Some(token) = &branch.capture {
+                validate_capture_principal(token, self.principal_id)?;
+            }
             match (&branch.capture, capture) {
                 (None, true) => {
+                    self.require_unreserved_operation(txn, operation_id)?;
                     if branch.pending_mutation_preparations != 0 {
                         return Err(reject("busy"));
                     }
@@ -1345,6 +1363,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     txn.delete(&reservation_key)?;
                 }
                 (None, false) => {
+                    self.require_unreserved_operation(txn, operation_id)?;
                     branch.pending_mutation_preparations =
                         increment(branch.pending_mutation_preparations)?;
                 }
@@ -1380,6 +1399,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if capture {
                 branch.capture = Some(CaptureState {
                     operation_id,
+                    principal_id: self.principal_id,
                     protection_id,
                     expected_revision,
                     sealed: false,
@@ -1493,6 +1513,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 if capture {
                     let token = branch.capture.as_ref().ok_or_else(|| reject("fenced"))?;
+                    validate_capture_principal(token, self.principal_id)?;
                     if token.operation_id != prepared_id || token.protection_id != protection_id {
                         return Err(reject("fenced"));
                     }
@@ -1590,6 +1611,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 let mut branch = read_branch(txn, &key)?;
                 validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 let capture = branch.capture.as_mut().ok_or_else(|| reject("not_found"))?;
+                validate_capture_principal(capture, self.principal_id)?;
                 if capture.operation_id != capture_id || capture.sealed {
                     return Err(reject("invalid_transition"));
                 }
@@ -1742,6 +1764,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 },
                 roots,
             )?;
+            if let Some(capture) = &branch.capture {
+                validate_capture_principal(capture, self.principal_id)?;
+            }
             match (&mut branch.capture, capture_child) {
                 (None, None) => {
                     branch.pending_mutation_preparations =
@@ -1822,6 +1847,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 return Err(MetadataError::Conflict);
             }
             let state = branch.capture.as_mut().ok_or_else(|| reject("not_found"))?;
+            validate_capture_principal(state, self.principal_id)?;
             if state.operation_id != capture_id || state.sealed {
                 return Err(reject("invalid_transition"));
             }
@@ -1894,6 +1920,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         .as_mut()
                         .ok_or_else(|| reject("corrupt_record"))?;
                     if capture.operation_id != reservation.capture_id
+                        || capture.principal_id != self.principal_id
                         || capture.pending_child != Some(operation_id)
                     {
                         return Err(reject("corrupt_record"));
@@ -1943,6 +1970,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             .as_ref()
                             .ok_or_else(|| reject("corrupt_record"))?;
                         if token.operation_id != operation_id
+                            || token.principal_id != self.principal_id
                             || token.protection_id != protection_id
                         {
                             return Err(reject("corrupt_record"));
@@ -1958,7 +1986,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         }
                         branch.capture = None;
                     } else if let Some(token) = &mut branch.capture {
-                        if token.pending_child == Some(operation_id) {
+                        if token.principal_id == self.principal_id
+                            && token.pending_child == Some(operation_id)
+                        {
                             token.pending_child = None;
                         } else {
                             return Err(reject("corrupt_record"));
@@ -2062,7 +2092,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     .capture
                     .as_ref()
                     .ok_or_else(|| reject("corrupt_record"))?;
-                if token.operation_id != operation_id || token.protection_id != protection_id {
+                if token.operation_id != operation_id
+                    || token.principal_id != self.principal_id
+                    || token.protection_id != protection_id
+                {
                     return Err(reject("corrupt_record"));
                 }
                 if let Some(child_id) = token.pending_child {
@@ -2076,7 +2109,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 }
                 branch.capture = None;
             } else if let Some(token) = &mut branch.capture {
-                if token.pending_child == Some(operation_id) {
+                if token.principal_id == self.principal_id
+                    && token.pending_child == Some(operation_id)
+                {
                     token.pending_child = None;
                 } else {
                     return Err(reject("corrupt_record"));
@@ -2107,6 +2142,18 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
 
     fn operation_key(&self, id: OperationId) -> Vec<u8> {
         scoped_operation_key(self.workspace_id, self.principal_id, id)
+    }
+
+    fn require_unreserved_operation(
+        &self,
+        txn: &mut dyn MetadataTxn,
+        operation_id: OperationId,
+    ) -> Result<(), MetadataError> {
+        let key = capture_child_reservation_key(self.workspace_id, self.principal_id, operation_id);
+        if txn.get(&key)?.is_some() {
+            return Err(reject("operation_mismatch"));
+        }
+        Ok(())
     }
 
     /// Retires a capture child that was authorized but never began preparation.
@@ -2244,6 +2291,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 };
             }
             self.require_current_owner(txn)?;
+            self.require_unreserved_operation(txn, operation_id)?;
             let result = action(txn)?;
             let record = StoredOperation::committed(kind, fp, result.clone());
             txn.put(
@@ -3052,6 +3100,7 @@ fn decode_attachment_fields(d: &mut CanonicalDecoder<'_>) -> Result<AttachmentSt
 
 fn encode_capture(e: &mut CanonicalEncoder, value: &CaptureState) {
     e.fixed(value.operation_id.as_bytes());
+    e.fixed(value.principal_id.as_bytes());
     e.fixed(value.protection_id.as_bytes());
     e.u64_le(value.expected_revision);
     e.u8(u8::from(value.sealed));
@@ -3093,6 +3142,7 @@ fn decode_capture_result(bytes: &[u8]) -> Result<CaptureState, ControlError> {
 
 fn decode_capture_fields(d: &mut CanonicalDecoder<'_>) -> Result<CaptureState, FormatError> {
     let operation_id = OperationId::from_bytes(d.fixed()?);
+    let principal_id = PrincipalId::from_bytes(d.fixed()?);
     let protection_id = ProtectionId::from_bytes(d.fixed()?);
     let expected_revision = d.u64_le()?;
     let sealed =
@@ -3124,6 +3174,7 @@ fn decode_capture_fields(d: &mut CanonicalDecoder<'_>) -> Result<CaptureState, F
     }
     Ok(CaptureState {
         operation_id,
+        principal_id,
         protection_id,
         expected_revision,
         sealed,
@@ -3325,6 +3376,16 @@ fn same_grant_identity(left: WriterGrant, right: WriterGrant) -> bool {
         && left.writer_epoch == right.writer_epoch
         && left.owner_incarnation == right.owner_incarnation
         && left.grant_id == right.grant_id
+}
+
+fn validate_capture_principal(
+    capture: &CaptureState,
+    principal_id: PrincipalId,
+) -> Result<(), MetadataError> {
+    if capture.principal_id != principal_id {
+        return Err(reject("fenced"));
+    }
+    Ok(())
 }
 
 fn validate_attachment_protection(

@@ -504,6 +504,11 @@ preconditions, and logical payload. A protected preparation binds its request
 first; checkpoint sealing records the final immutable root once, rejecting a
 different root on retry. Matching retries return the recorded result or resume
 that preparation. Reusing an ID with another request is `OperationMismatch`.
+Authorizing a capture child reserves its operation ID across all mutation kinds
+in the owning caller's namespace. An unrelated mutation or preparation on any
+branch cannot claim that ID while it is reserved, even before an operation
+record exists. Only the identified child preparation or its abort may consume
+the reservation.
 After matching the fingerprint, terminal-result lookup precedes checking the
 preconditions of a new mutation. A replay does not fail merely because the
 head, name, or grant has changed since its original success.
@@ -621,6 +626,11 @@ current attachment-base protection when it begins, renews, and commits. Reusing
 an attachment ID after detach cannot make a preparation from the prior epoch
 valid. Detach and writer release are rejected until ordinary mutation
 preparations commit, abort, or expire.
+
+Attachment-base renewal and detach bind the exact attachment ID, volume epoch,
+and protection ID in their request and fingerprint. A delayed request for an
+earlier attachment cannot renew or detach its replacement, including when the
+attachment ID and writer grant are reused.
 
 The worker records the attachment, base root/protection, pending operation IDs,
 and capture/freeze intent outside the exported volume. Control files, block-server
@@ -912,6 +922,10 @@ in v0. The parent Generation ID is not a required content edge.
    slot. Aborting an authorized child before it begins atomically clears the
    pending-child slot, consumes the reservation, and tombstones the child ID, so
    the capture can continue without allowing a delayed child start.
+   The token records the authenticated principal that owns the capture operation.
+   Child authorization/admission and sealing require that same principal, even
+   when another authorized caller holds the same writer grant. Abort/expiry
+   resolves child reservations and operation IDs in the owning principal's scope.
    A change of ownership fences this attempt; it must not refresh to a new owner.
    A definite acquisition conflict ends this attempt: restart Step 1 with a new
    checkpoint operation ID, fresh pre-drain revision/root preconditions, and a
@@ -1173,7 +1187,7 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 | `create_branch` / `get_branch` | Retained base and identified create, or stable ID/name lookup; returns head, live roots, revisions, epochs, and attachment state. |
 | `acquire_writer` / `renew_writer` / `release_writer` | Identified request and exact grant/epoch/handover policy; returns original grant/deadline or release result. |
 | `attach_volume` | Operation ID, branch ID/revision, exact grant; returns fenced attachment ID, protected base, live VolumeRoot/geometry, and device setup inputs. |
-| `renew_base_protection` / `detach_volume` | Operation ID and exact attachment/protection; detach requires unmounted/drained state, resolves pending barriers/capture, and releases protection. It must flush unless explicit discard is requested. |
+| `renew_base_protection` / `detach_volume` | Operation ID, exact attachment ID/volume epoch/protection ID, and writer grant; detach requires unmounted/drained state, resolves pending barriers/capture, and releases protection. It must flush unless explicit discard is requested. |
 | `flush_volume` | Internal operation ID, exact attachment/epoch/grant, covered I/O boundary, sealed dirty version, and expected live revision; returns durable volume boundary/root/revision. |
 | `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
 | `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |

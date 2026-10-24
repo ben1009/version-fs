@@ -280,12 +280,61 @@ fn core_protocol_replays_operations_and_rejects_stale_attachment_epochs() {
         .attach_volume(op(21), branch(1), 1, writer, attachment(1), protection(1))
         .expect("attach volume");
     control
-        .detach_volume(op(22), branch(1), attachment(1), writer)
+        .detach_volume(op(22), branch(1), attachment(1), 1, protection(1), writer)
         .expect("detach volume");
     let current = control
         .attach_volume(op(23), branch(1), 1, writer, attachment(1), protection(2))
         .expect("reattach same device identity");
     assert_eq!(current.volume_epoch, 2);
+    control
+        .detach_volume(op(22), branch(1), attachment(1), 1, protection(1), writer)
+        .expect("replay old detach without touching the replacement");
+    assert_eq!(
+        control.detach_volume(
+            op(22),
+            branch(1),
+            attachment(1),
+            current.volume_epoch,
+            current.protection_id,
+            writer,
+        ),
+        Err(ControlError::OperationMismatch)
+    );
+    for (marker, volume_epoch, protection_id) in [
+        (25, 1, protection(1)),
+        (27, current.volume_epoch, protection(1)),
+        (29, 1, current.protection_id),
+    ] {
+        assert_eq!(
+            control.renew_attachment_base(
+                op(marker),
+                branch(1),
+                attachment(1),
+                volume_epoch,
+                protection_id,
+                writer,
+            ),
+            Err(ControlError::Fenced)
+        );
+        assert_eq!(
+            control.detach_volume(
+                op(marker + 1),
+                branch(1),
+                attachment(1),
+                volume_epoch,
+                protection_id,
+                writer,
+            ),
+            Err(ControlError::Fenced)
+        );
+    }
+    assert_eq!(
+        control
+            .get_branch(branch(1))
+            .expect("read current attachment")
+            .attachment,
+        Some(current)
+    );
 
     let stale_request = PreparationRequest {
         operation_id: op(24),
@@ -434,4 +483,91 @@ fn core_protocol_limits_each_preparation_to_its_view_root() {
             .abort_operation(operation_id)
             .expect("abort root-scope preparation");
     }
+}
+
+#[test]
+fn core_protocol_reserves_capture_child_ids_against_unrelated_operations() {
+    let control = control();
+    let writer = control
+        .acquire_writer(op(50), branch(1), 1, 0)
+        .expect("acquire capture writer");
+    control
+        .attach_volume(op(51), branch(1), 1, writer, attachment(1), protection(1))
+        .expect("attach capture volume");
+    control
+        .create_branch(op(52), branch(2), "other", generation(1))
+        .expect("create independent branch");
+    let other_writer = control
+        .acquire_writer(op(53), branch(2), 1, 0)
+        .expect("acquire independent writer");
+    control
+        .attach_volume(
+            op(54),
+            branch(2),
+            1,
+            other_writer,
+            attachment(2),
+            protection(2),
+        )
+        .expect("attach independent volume");
+    control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(55),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant: writer,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(3),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("begin capture");
+    control
+        .authorize_capture_child(op(56), op(55), op(57), writer)
+        .expect("reserve drain child ID");
+
+    assert_eq!(
+        control.renew_writer(op(57), writer),
+        Err(ControlError::OperationMismatch)
+    );
+    for (kind, expected_roots) in [
+        (
+            PreparationKind::VolumeBarrier,
+            Some(replace_volume_root(roots(1), 3)),
+        ),
+        (PreparationKind::CheckpointCapture, None),
+    ] {
+        assert_eq!(
+            control.begin_preparation(PreparationRequest {
+                operation_id: op(57),
+                branch_id: branch(2),
+                expected_revision: 1,
+                grant: other_writer,
+                attachment_id: attachment(2),
+                volume_epoch: 1,
+                protection_id: protection(4),
+                kind,
+                expected_roots,
+                dependencies: vec![],
+            }),
+            Err(ControlError::OperationMismatch)
+        );
+    }
+    assert_eq!(control.get_operation(op(57)), Err(ControlError::NotFound));
+    let other = control
+        .get_branch(branch(2))
+        .expect("read independent branch");
+    assert_eq!(other.pending_mutation_preparations, 0);
+    assert!(other.capture.is_none());
+    assert_eq!(control.abort_operation(op(55)), Ok(OperationState::Aborted));
+    assert_eq!(control.get_operation(op(57)), Ok(OperationState::Aborted));
+    assert!(
+        control
+            .get_branch(branch(1))
+            .expect("read released capture")
+            .capture
+            .is_none()
+    );
 }

@@ -128,6 +128,103 @@ impl TestEnv {
 }
 
 #[test]
+fn capture_children_and_cleanup_keep_the_original_principal_scope() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let other = control_for(
+        Arc::clone(&env.authority),
+        env.workspace_id,
+        principal(2),
+        env.owner,
+    );
+
+    for (marker, expire) in [(100, false), (120, true)] {
+        let capture_id = op(marker);
+        let child_id = op(marker + 2);
+        let OperationState::Preparing { expires_at, .. } = env
+            .control
+            .begin_preparation(PreparationRequest {
+                operation_id: capture_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(marker),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![],
+            })
+            .expect("begin caller-scoped capture")
+        else {
+            panic!("capture must remain in preparation");
+        };
+        assert_eq!(
+            env.control
+                .get_branch(branch(1))
+                .unwrap()
+                .capture
+                .unwrap()
+                .principal_id,
+            env.principal_id
+        );
+        assert_eq!(
+            other.authorize_capture_child(op(marker + 1), capture_id, child_id, grant),
+            Err(ControlError::Fenced)
+        );
+        env.control
+            .authorize_capture_child(op(marker + 1), capture_id, child_id, grant)
+            .expect("owning caller reserves its child");
+        assert_eq!(
+            other.begin_preparation(PreparationRequest {
+                operation_id: child_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(marker + 3),
+                kind: PreparationKind::VolumeBarrier,
+                expected_roots: Some(replace_volume_root(roots(1), marker)),
+                dependencies: vec![],
+            }),
+            Err(ControlError::Fenced)
+        );
+        assert_eq!(
+            other.seal_capture(op(marker + 4), capture_id, 1, grant),
+            Err(ControlError::Fenced)
+        );
+
+        assert_eq!(other.abort_operation(child_id), Ok(OperationState::Aborted));
+        assert_eq!(
+            env.control.get_operation(child_id),
+            Err(ControlError::NotFound)
+        );
+        assert_eq!(
+            env.control
+                .get_branch(branch(1))
+                .unwrap()
+                .capture
+                .unwrap()
+                .pending_child,
+            Some(child_id)
+        );
+        let terminal = if expire {
+            env.clock.set(expires_at.as_nanos());
+            env.control.expire_preparation(capture_id)
+        } else {
+            env.control.abort_operation(capture_id)
+        };
+        assert_eq!(terminal, Ok(OperationState::Aborted));
+        assert_eq!(
+            env.control.get_operation(child_id),
+            Ok(OperationState::Aborted)
+        );
+        assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    }
+}
+
+#[test]
 fn generation_catalog_rejects_mistyped_roots_before_persisting_an_operation() {
     let env = TestEnv::new();
     let mut bad_volume = seed(50);
@@ -373,7 +470,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
     env.clock.set(1);
     let renewed = env
         .control
-        .renew_attachment_base(op(6), branch(1), attachment(1), grant)
+        .renew_attachment_base(op(6), branch(1), attachment(1), 1, protection(1), grant)
         .expect("renew original Generation protection after live-root advance");
     assert_eq!(renewed.base_generation, generation(1));
     assert!(renewed.protection_expires_at > committed.attachment.unwrap().protection_expires_at);
@@ -404,7 +501,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
         .expect("close live-log protection");
 
     env.control
-        .detach_volume(op(11), branch(1), attachment(1), grant)
+        .detach_volume(op(11), branch(1), attachment(1), 1, protection(1), grant)
         .expect("detach volume");
     assert!(
         env.control
@@ -428,12 +525,39 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
     env.clock.set(2);
     let renewed_reattachment = env
         .control
-        .renew_attachment_base(op(13), branch(1), attachment(1), grant)
+        .renew_attachment_base(
+            op(13),
+            branch(1),
+            attachment(1),
+            reattached.volume_epoch,
+            reattached.protection_id,
+            grant,
+        )
         .expect("renew protection for a base whose live roots advanced");
     assert_eq!(reattached.base_generation, generation(1));
     assert_eq!(renewed_reattachment.base_generation, generation(1));
     assert!(renewed_reattachment.protection_expires_at > reattached.protection_expires_at);
     assert_eq!(reattached.volume_epoch, 2);
+    assert_eq!(
+        env.control
+            .detach_volume(op(16), branch(1), attachment(1), 1, protection(1), grant),
+        Err(ControlError::Fenced)
+    );
+    assert_eq!(
+        env.control.renew_attachment_base(
+            op(17),
+            branch(1),
+            attachment(1),
+            1,
+            protection(1),
+            grant
+        ),
+        Err(ControlError::Fenced)
+    );
+    assert_eq!(
+        env.control.get_branch(branch(1)).unwrap().attachment,
+        Some(renewed_reattachment)
+    );
     assert_eq!(
         env.control.begin_preparation(PreparationRequest {
             operation_id: op(14),
@@ -606,7 +730,7 @@ fn capture_waits_for_mutation_preparations_and_renewed_writer_can_finish_one() {
     );
     assert_eq!(
         env.control
-            .detach_volume(op(62), branch(1), attachment(1), grant),
+            .detach_volume(op(62), branch(1), attachment(1), 1, protection(1), grant),
         Err(ControlError::Busy)
     );
 
@@ -753,6 +877,14 @@ fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
     env.control
         .authorize_capture_child(op(41), op(40), op(42), grant)
         .expect("authorize child before worker starts it");
+    assert_eq!(
+        env.control.renew_writer(op(42), grant),
+        Err(ControlError::OperationMismatch)
+    );
+    assert_eq!(
+        env.control.get_operation(op(42)),
+        Err(ControlError::NotFound)
+    );
     assert_eq!(
         env.control
             .abort_operation(op(42))

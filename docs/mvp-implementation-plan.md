@@ -229,6 +229,8 @@ claiming reliable barriers until P6 is qualified.
   tombstones, fixed identities, branch-name indexes, and exact revision/epoch CAS.
 - [x] Implement writer/attachment grants, owner incarnation restart fencing, and
   one writable attachment per branch. Device numbers/filesystem UUIDs are not IDs.
+  Renewal and detach validate the exact volume epoch and protection ID, so a
+  delayed request cannot target a replacement that reuses an attachment ID.
 - [x] Implement retention eligibility guards, pins, read/live-log protections,
   attachment bases, and shared preparation/renewal state from the start.
 - [x] Add checkpoint capture-token admission: block other head/live mutations,
@@ -240,6 +242,9 @@ claiming reliable barriers until P6 is qualified.
 - [x] Persist an exact capture-child reservation when authorizing a drain child.
   Direct abort of an unstarted child clears the pending slot and tombstones its
   ID atomically; parent abort/expiry retires the same reservation without scans.
+  All unrelated operation claims respect that reservation. Capture ownership
+  records its caller principal; child authorization/admission, sealing, and
+  cleanup retain that scope even if another caller shares the writer grant.
 - [x] Enforce preparation root scope at admission and commit: volume barriers
   replace only VolumeRoot, log mutations only the log root, and artifact
   mutations only the artifact root.
@@ -254,7 +259,8 @@ absent-key branch-name claims, writer/attachment acquisition and restart fencing
 active-preparation renewal under a refreshed writer grant, exact attachment epochs
 and protection expiry, capture exclusion/admission/sealing/abort, preparation
 renewal and expiry cleanup, direct abort and retry of an unstarted capture child,
-per-preparation root scope, pin/read/live-log protection, and retention eligibility
+reserved-ID conflicts, cross-principal capture rejection, per-preparation root
+scope, pin/read/live-log protection, and retention eligibility
 after close or expiry. This qualifies the backend-neutral P5 control protocol through
 the MVP adapter; it does not qualify live block-device durability, Generation
 publication, or device fencing integration, which remain in P6/P7/P9.
