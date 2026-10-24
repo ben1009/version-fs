@@ -46,7 +46,8 @@ pub struct PendingBarrier {
     pub branch_id: BranchId,
     /// Branch revision captured before preparation begins.
     pub expected_revision: u64,
-    /// Writer grant identity used to start the operation.
+    /// Initial writer grant, replayed exactly for capture-child authorization.
+    /// Its stable identity also fences recovery after a lease renewal.
     pub writer_grant: WriterGrant,
     /// Exact writable attachment identity.
     pub attachment_id: AttachmentId,
@@ -1158,6 +1159,13 @@ where
             }
             let staged = self.inner.stage_dirty()?.ok_or(BarrierError::Conflict)?;
             let branch = self.control.get_branch(self.branch_id)?;
+            self.writer_grant = validate_attachment(
+                &branch,
+                self.branch_id,
+                self.attachment_id,
+                self.volume_epoch,
+                self.writer_grant,
+            )?;
             let (ids, capture_id, capture_authorization_id) =
                 self.reserve_barrier_context(&branch)?;
             let next_roots = LiveRoots {
@@ -1268,6 +1276,29 @@ where
         Ok((ids, Some(capture_id), authorization_id))
     }
 
+    fn authorize_pending_capture_child(
+        &self,
+        authorization_id: OperationId,
+        capture_id: OperationId,
+        child_id: OperationId,
+        saved_grant: WriterGrant,
+    ) -> Result<(), ControlError> {
+        match self.control.get_operation(authorization_id) {
+            // Reconcile the stable outcome before replaying. This also supports
+            // older journal records whose authorization used a refreshed grant.
+            Ok(OperationState::Committed(_)) => Ok(()),
+            Ok(OperationState::Aborted) => Err(ControlError::Aborted),
+            Ok(OperationState::Preparing { .. }) => Err(ControlError::InProgress),
+            Err(ControlError::NotFound) => self.control.authorize_capture_child(
+                authorization_id,
+                capture_id,
+                child_id,
+                saved_grant,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
     fn resume_pending(&mut self) -> Result<(), BarrierError> {
         loop {
             self.ensure_pending_journaled()?;
@@ -1338,22 +1369,33 @@ where
                 if let (Some(capture_id), Some(authorization_id)) =
                     (capture_id, capture_authorization_id)
                 {
-                    match self.control.authorize_capture_child(
+                    match self.authorize_pending_capture_child(
                         authorization_id,
                         capture_id,
                         operation_id,
-                        current_grant,
+                        saved_grant,
                     ) {
                         Ok(()) => {}
-                        Err(
-                            ControlError::Conflict | ControlError::Busy | ControlError::NotFound,
-                        ) => {
-                            if self.abort_and_restage(operation_id)? {
-                                return Ok(());
+                        Err(error) => {
+                            let stale_lease =
+                                matches!(error, ControlError::Expired | ControlError::Fenced)
+                                    && saved_grant.expires_at < current_grant.expires_at;
+                            if stale_lease
+                                || matches!(
+                                    error,
+                                    ControlError::Conflict
+                                        | ControlError::Busy
+                                        | ControlError::NotFound
+                                        | ControlError::Aborted
+                                )
+                            {
+                                if self.abort_and_restage(operation_id)? {
+                                    return Ok(());
+                                }
+                                continue;
                             }
-                            continue;
+                            return Err(error.into());
                         }
-                        Err(error) => return Err(error.into()),
                     }
                 }
                 match self.control.begin_preparation(PreparationRequest {
@@ -1902,10 +1944,17 @@ mod tests {
     #[derive(Clone)]
     struct FakeControl(Arc<Mutex<FakeControlState>>);
 
+    #[derive(Clone, Copy)]
+    enum AuthorizationFailure {
+        BeforeCommit,
+        AfterCommit,
+    }
+
     struct FakeControlState {
         branch: BranchState,
         operations: HashMap<OperationId, OperationState>,
-        capture_authorizations: HashMap<OperationId, (OperationId, OperationId)>,
+        capture_authorizations: HashMap<OperationId, (OperationId, OperationId, WriterGrant)>,
+        fail_next_authorization: Option<AuthorizationFailure>,
         renewals: HashMap<OperationId, (MonotonicTime, WriterGrant)>,
         expire_next_renewal: bool,
         lose_next_commit_reply: bool,
@@ -1961,17 +2010,29 @@ mod tests {
             authorization_id: OperationId,
             capture_id: OperationId,
             child_id: OperationId,
-            _grant: WriterGrant,
+            grant: WriterGrant,
         ) -> Result<(), ControlError> {
             let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
-            if let Some((prior_capture_id, prior_child_id)) =
+            if let Some((prior_capture_id, prior_child_id, prior_grant)) =
                 state.capture_authorizations.get(&authorization_id)
             {
-                return if (*prior_capture_id, *prior_child_id) == (capture_id, child_id) {
+                return if (*prior_capture_id, *prior_child_id, *prior_grant)
+                    == (capture_id, child_id, grant)
+                {
                     Ok(())
                 } else {
                     Err(ControlError::OperationMismatch)
                 };
+            }
+            if state.branch.writer != Some(grant) {
+                return Err(ControlError::Fenced);
+            }
+            let failure = state.fail_next_authorization.take();
+            if matches!(failure, Some(AuthorizationFailure::BeforeCommit)) {
+                return Err(ControlError::Metadata(MetadataError::UnknownOutcome {
+                    operation_id: authorization_id.as_bytes().to_vec(),
+                    cause: "injected lost authorization before commit".to_owned(),
+                }));
             }
             let capture = state
                 .branch
@@ -1987,7 +2048,16 @@ mod tests {
             capture.pending_child = Some(child_id);
             state
                 .capture_authorizations
-                .insert(authorization_id, (capture_id, child_id));
+                .insert(authorization_id, (capture_id, child_id, grant));
+            state
+                .operations
+                .insert(authorization_id, OperationState::Committed(Vec::new()));
+            if matches!(failure, Some(AuthorizationFailure::AfterCommit)) {
+                return Err(ControlError::Metadata(MetadataError::UnknownOutcome {
+                    operation_id: authorization_id.as_bytes().to_vec(),
+                    cause: "injected lost authorization after commit".to_owned(),
+                }));
+            }
             Ok(())
         }
 
@@ -1999,7 +2069,7 @@ mod tests {
         ) -> Result<MonotonicTime, ControlError> {
             let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
             if let Some((deadline, original_grant)) = state.renewals.get(&renewal_id) {
-                if !same_grant_identity(*original_grant, grant) {
+                if *original_grant != grant {
                     return Err(ControlError::OperationMismatch);
                 }
                 return Ok(*deadline);
@@ -2166,6 +2236,7 @@ mod tests {
                 branch,
                 operations: HashMap::new(),
                 capture_authorizations: HashMap::new(),
+                fail_next_authorization: None,
                 renewals: HashMap::new(),
                 expire_next_renewal: false,
                 lose_next_commit_reply: false,
@@ -2581,6 +2652,80 @@ mod tests {
                 .pending_child,
             None
         );
+    }
+
+    #[test]
+    fn lost_capture_authorization_replies_recover_after_writer_heartbeat() {
+        for failure in [
+            AuthorizationFailure::AfterCommit,
+            AuthorizationFailure::BeforeCommit,
+        ] {
+            let environment = TestEnvironment::new();
+            let original_grant = WriterGrant {
+                expires_at: MonotonicTime::from_nanos(u64::MAX - 1),
+                ..environment.grant
+            };
+            {
+                let mut state = environment.control.0.lock().unwrap();
+                state.branch.writer = Some(original_grant);
+                state.branch.capture = Some(versionfs_core::control::CaptureState {
+                    operation_id: OperationId::from_bytes([30; 16]),
+                    principal_id: versionfs_core::identity::PrincipalId::from_bytes([31; 16]),
+                    protection_id: ProtectionId::from_bytes([32; 16]),
+                    expected_revision: 1,
+                    sealed: false,
+                    pending_child: None,
+                    sealed_revision: None,
+                    sealed_roots: None,
+                });
+                state.fail_next_authorization = Some(failure);
+            }
+            let mut worker = environment.open();
+            worker.inner.write(4096, &[0xA2; 4096]).unwrap();
+            assert!(matches!(
+                worker.flush(),
+                Err(BarrierError::Control(ControlError::Metadata(
+                    MetadataError::UnknownOutcome { .. }
+                )))
+            ));
+            let pending = worker.pending.as_ref().unwrap();
+            let original_child_id = pending.operation_id;
+            let original_authorization_id = pending.capture_authorization_id.unwrap();
+            drop(worker);
+
+            let renewed_grant = WriterGrant {
+                expires_at: MonotonicTime::from_nanos(u64::MAX),
+                ..original_grant
+            };
+            environment.control.0.lock().unwrap().branch.writer = Some(renewed_grant);
+            let replacement = environment.open();
+            assert_eq!(replacement.inner.dirty_extent_count(), 0);
+            assert_eq!(
+                replacement.inner.read(4096, 4096).unwrap(),
+                vec![0xA2; 4096]
+            );
+
+            let state = environment.control.0.lock().unwrap();
+            assert_eq!(state.commit_count, 1);
+            assert_eq!(state.branch.capture.as_ref().unwrap().pending_child, None);
+            let [(authorization_id, (_, child_id, request_grant))] =
+                state.capture_authorizations.iter().collect::<Vec<_>>()[..]
+            else {
+                panic!("one capture authorization must commit");
+            };
+            match failure {
+                AuthorizationFailure::AfterCommit => {
+                    assert_eq!(*authorization_id, original_authorization_id);
+                    assert_eq!(*child_id, original_child_id);
+                    assert_eq!(*request_grant, original_grant);
+                }
+                AuthorizationFailure::BeforeCommit => {
+                    assert_ne!(*authorization_id, original_authorization_id);
+                    assert_ne!(*child_id, original_child_id);
+                    assert_eq!(*request_grant, renewed_grant);
+                }
+            }
+        }
     }
 
     #[test]
