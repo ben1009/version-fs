@@ -108,8 +108,9 @@ jobs:
 
   coverage:
     runs-on: ubuntu-latest
-    env:
-      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
@@ -127,16 +128,19 @@ jobs:
           tool: nextest@0.9.145,cargo-llvm-cov@0.9.0
       - name: Generate coverage
         run: bash scripts/coverage.sh --lcov --output-path lcov.info
+      - name: Summarize coverage
+        if: hashFiles('lcov.info') != ''
+        run: python3 scripts/coverage_summary.py lcov.info | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Keep coverage report
         if: hashFiles('lcov.info') != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: lcov.info
-      - name: Upload coverage when Codecov is configured
-        if: env.CODECOV_TOKEN != '' && hashFiles('lcov.info') != ''
+      - name: Upload coverage to Codecov
+        if: hashFiles('lcov.info') != ''
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
-          token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+          use_oidc: true
+          fail_ci_if_error: false
