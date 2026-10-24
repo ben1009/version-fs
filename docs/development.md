@@ -39,6 +39,12 @@ handles can retain the result of `VolumeExtentMap::validate` to check metadata
 once before later mutations; named-map opens validate entries and retain counts.
 Tooling checks do not qualify any MVP durability gate.
 
+Durable barriers retain the validated candidate map returned by staging, so
+retries and completion reuse its metadata validation. Recovery validates the
+imported base once and reconstructs the candidate from journaled dirty extents;
+it checks that the reconstructed root matches the saved root before publishing.
+A different authoritative base root requires fresh metadata validation.
+
 ## Setup and tools
 
 Install Rust through rustup. `rust-toolchain.toml` selects the dated nightly and

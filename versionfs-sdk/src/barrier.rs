@@ -92,7 +92,7 @@ pub trait BarrierJournal {
     /// Reserves a never-reused barrier operation ID and preparation protection ID.
     fn reserve_barrier_ids(&mut self) -> Result<BarrierIds, String>;
 
-    /// Reserves a never-reused operation ID for one preparation renewal.
+    /// Reserves a never-reused operation ID for authorization or preparation renewal.
     fn reserve_operation_id(&mut self) -> Result<OperationId, String>;
 
     /// Loads the one pending barrier recorded for this writable attachment.
@@ -772,6 +772,7 @@ pub trait VolumeBarrierControl: Send + Sync {
     ) -> Result<OperationState, ControlError>;
 
     /// Reserves one volume-barrier operation as the active capture's drain child.
+    /// Replaying an ID must retain the exact original grant, including its expiry.
     fn authorize_capture_child(
         &self,
         authorization_id: OperationId,
@@ -1038,6 +1039,9 @@ pub struct DurableVolume<S, C, J> {
     live_roots: LiveRoots,
     revision: u64,
     pending: Option<PendingBarrier>,
+    // Retains the trusted builder's metadata validation across uploads/retries.
+    // Recovery reconstructs this handle from the validated base and dirty delta.
+    pending_map: Option<VolumeExtentMap>,
     pending_journaled: bool,
     last_renewal: Option<Instant>,
 }
@@ -1088,11 +1092,6 @@ where
                     )?;
                 }
                 Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {
-                    if branch.revision == barrier.expected_revision
-                        && roots(&branch) == barrier.previous_roots
-                    {
-                        inner.load_staged_map(barrier.next_roots.volume, &barrier.objects)?;
-                    }
                     inner.restore_pending_dirty(
                         barrier.dirty_revision,
                         &barrier.dirty_extent_refs,
@@ -1114,6 +1113,7 @@ where
             revision: branch.revision,
             pending_journaled: pending.is_some(),
             pending,
+            pending_map: None,
             last_renewal: None,
         };
         if volume.pending.is_some() {
@@ -1173,6 +1173,7 @@ where
                 logs: self.live_roots.logs,
                 artifacts: self.live_roots.artifacts,
             };
+            self.pending_map = Some(staged.map);
             let barrier = self.pending_from_stage(
                 ids,
                 next_roots,
@@ -1353,14 +1354,7 @@ where
                 }
                 continue;
             }
-            let staged_objects = self
-                .pending
-                .as_ref()
-                .ok_or(BarrierError::Conflict)?
-                .objects
-                .as_slice();
-            self.inner
-                .load_staged_map(next_roots.volume, staged_objects)?;
+            self.ensure_pending_map()?;
 
             if matches!(
                 self.control.get_operation(operation_id),
@@ -1511,7 +1505,10 @@ where
                 }
                 Err(error) => return Err(error.into()),
             };
-            let map = self.inner.load_map(committed.volume_root)?;
+            if committed.volume_root != next_roots.volume {
+                return Err(BarrierError::Conflict);
+            }
+            let map = self.pending_map.ok_or(BarrierError::Conflict)?;
             let dirty_revision = self
                 .pending
                 .as_ref()
@@ -1525,6 +1522,7 @@ where
                 .finish_pending(operation_id)
                 .map_err(BarrierError::Journal)?;
             self.pending = None;
+            self.pending_map = None;
             self.pending_journaled = false;
             self.last_renewal = None;
             return Ok(());
@@ -1541,6 +1539,29 @@ where
             .map_err(BarrierError::Journal)?;
         self.pending_journaled = true;
         Ok(())
+    }
+
+    fn ensure_pending_map(&mut self) -> Result<(), BarrierError> {
+        if self.pending_map.is_some() {
+            return Ok(());
+        }
+        // Reconstruct a recovered candidate from the validated base and its
+        // bounded dirty delta. The builder validates changed paths without
+        // walking immutable subtrees whose metadata was already checked.
+        let staged = self.inner.stage_dirty()?.ok_or(BarrierError::Conflict)?;
+        let pending = self.pending.as_mut().ok_or(BarrierError::Conflict)?;
+        if staged.volume_root != pending.next_roots.volume
+            || staged.dirty_revision != pending.dirty_revision
+            || staged.dirty_extent_refs != pending.dirty_extent_refs
+        {
+            return Err(BarrierError::Journal(
+                "reconstructed dirty state differs from the pending volume root".to_owned(),
+            ));
+        }
+        pending.objects = staged.objects;
+        self.pending_map = Some(staged.map);
+        self.pending_journaled = false;
+        self.ensure_pending_journaled()
     }
 
     fn renew_if_due(&mut self) -> Result<ResumeStep, BarrierError> {
@@ -1610,7 +1631,11 @@ where
             .as_ref()
             .ok_or(BarrierError::Conflict)?
             .operation_id;
-        let base = self.inner.load_map(branch.volume_root)?;
+        let base = if branch.volume_root == self.live_roots.volume {
+            self.inner.base_map()
+        } else {
+            self.inner.load_map(branch.volume_root)?
+        };
         self.inner.rebase_base(base);
         self.live_roots = roots(branch);
         self.revision = branch.revision;
@@ -1620,6 +1645,7 @@ where
                 .finish_pending(old_operation_id)
                 .map_err(BarrierError::Journal)?;
             self.pending = None;
+            self.pending_map = None;
             self.pending_journaled = false;
             self.last_renewal = None;
             return Ok(true);
@@ -1630,6 +1656,7 @@ where
             logs: self.live_roots.logs,
             artifacts: self.live_roots.artifacts,
         };
+        let map = staged.map;
         let replacement = self.pending_from_stage(
             ids,
             next_roots,
@@ -1641,6 +1668,7 @@ where
             .replace_pending(old_operation_id, &replacement)
             .map_err(BarrierError::Journal)?;
         self.pending = Some(replacement);
+        self.pending_map = Some(map);
         self.pending_journaled = true;
         self.last_renewal = None;
         Ok(false)
@@ -1722,7 +1750,16 @@ where
         let operation_id = pending.operation_id;
         let dirty_revision = pending.dirty_revision;
         let branch = self.control.get_branch(self.branch_id)?;
-        let map = self.inner.load_map(branch.volume_root)?;
+        let map = if branch.volume_root == self.live_roots.volume {
+            self.inner.base_map()
+        } else if branch.volume_root == pending.next_roots.volume {
+            match self.pending_map {
+                Some(map) => map,
+                None => self.inner.load_map(branch.volume_root)?,
+            }
+        } else {
+            self.inner.load_map(branch.volume_root)?
+        };
         if self.inner.dirty_extent_count() > 0 {
             self.inner.commit_durable_map(map, dirty_revision)?;
         } else {
@@ -1737,6 +1774,7 @@ where
             .finish_pending(operation_id)
             .map_err(BarrierError::Journal)?;
         self.pending = None;
+        self.pending_map = None;
         self.pending_journaled = false;
         self.last_renewal = None;
         Ok(())
@@ -1868,6 +1906,7 @@ mod tests {
     struct MemoryStore {
         objects: Arc<Mutex<HashMap<ObjectId, Vec<u8>>>>,
         fail_next_upload: Arc<AtomicBool>,
+        reads: Arc<AtomicU64>,
     }
 
     impl MapObjectStore for MemoryStore {
@@ -1876,6 +1915,7 @@ mod tests {
         }
 
         fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             self.objects
                 .lock()
                 .map(|objects| objects.get(&id).cloned())
@@ -2408,6 +2448,74 @@ mod tests {
                 .objects
                 .iter()
                 .any(|object| object.reference == staged.volume_root)
+        );
+    }
+
+    #[test]
+    fn flush_and_recovery_reuse_validated_unchanged_extent_subtrees() {
+        let environment = TestEnvironment::new();
+        let mut store = environment.store.clone();
+        let encoded = versionfs_core::format::encode_object(
+            ObjectType::Extent,
+            &vec![0xB4; EXTENT_BYTES as usize],
+        )
+        .unwrap();
+        let extent = ObjectRef::from_encoded(&encoded).unwrap();
+        store.put_durable(extent, &encoded).unwrap();
+        let geometry = VolumeGeometry::new(2049 * u64::from(EXTENT_BYTES)).unwrap();
+        let mut map = VolumeExtentMap::empty(geometry, &mut store).unwrap();
+        for number in 0..2048 {
+            map = map.insert_extent(&mut store, number, extent).unwrap();
+        }
+        let root = map.seal(&mut store).unwrap();
+        environment.control.0.lock().unwrap().branch.volume_root = root;
+        let mut worker = environment.open();
+
+        for number in [0, 2047] {
+            store.reads.store(0, Ordering::Relaxed);
+            worker
+                .dispatch(BlockRequest::Write {
+                    offset: number * u64::from(EXTENT_BYTES),
+                    data: &[0xC5; 4096],
+                    fua: true,
+                })
+                .unwrap();
+            let reads = store.reads.load(Ordering::Relaxed);
+            assert!(
+                reads <= 6,
+                "a one-extent FUA read {reads} objects, including unchanged map subtrees"
+            );
+        }
+
+        worker.inner.write(4096, &[0xD6; 4096]).unwrap();
+        store.fail_next_upload.store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        drop(worker);
+        let live_root = environment.control.0.lock().unwrap().branch.volume_root;
+        store.reads.store(0, Ordering::Relaxed);
+        load_map(&store, live_root).unwrap();
+        let imported_base_reads = store.reads.swap(0, Ordering::Relaxed);
+        let mut recovered = environment.open();
+        let recovery_reads = store.reads.load(Ordering::Relaxed);
+        assert!(
+            recovery_reads <= imported_base_reads + 6,
+            "recovery read {recovery_reads} objects for a base requiring {imported_base_reads} reads"
+        );
+        assert_eq!(recovered.inner.read(4096, 4096).unwrap(), vec![0xD6; 4096]);
+
+        recovered.inner.write(8192, &[0xE7; 4096]).unwrap();
+        environment.control.0.lock().unwrap().lose_next_commit_reply = true;
+        assert!(matches!(
+            recovered.flush(),
+            Err(BarrierError::Control(ControlError::Metadata(
+                MetadataError::UnknownOutcome { .. }
+            )))
+        ));
+        store.reads.store(0, Ordering::Relaxed);
+        recovered.flush().unwrap();
+        assert!(
+            store.reads.load(Ordering::Relaxed) <= 2,
+            "reconciling a known candidate must reuse its validated map"
         );
     }
 

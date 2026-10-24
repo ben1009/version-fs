@@ -265,19 +265,8 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         load_map_from_store(&self.store, volume_root)
     }
 
-    /// Validates a candidate map against base objects plus its sealed objects.
-    pub(crate) fn load_staged_map(
-        &self,
-        volume_root: ObjectRef,
-        objects: &[StagedObject],
-    ) -> Result<VolumeExtentMap, BlockError> {
-        let mut staged = StagingMapStore::new(&self.store);
-        for object in objects {
-            staged
-                .put(object.reference.object_id, object.encoded.clone())
-                .map_err(ViewError::Store)?;
-        }
-        load_map_from_store(&staged, volume_root)
+    pub(crate) const fn base_map(&self) -> VolumeExtentMap {
+        self.base
     }
 
     pub(crate) fn replace_base(&mut self, base: VolumeExtentMap) {
@@ -353,6 +342,7 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         }
         let objects = staging.into_objects_referenced(reachable)?;
         Ok(Some(StagedVolume {
+            map,
             volume_root,
             dirty_revision: self.revision,
             dirty_extent_refs,
@@ -455,6 +445,7 @@ pub struct StagedObject {
 
 /// A complete unpublished replacement for a dirty volume prefix.
 pub(crate) struct StagedVolume {
+    pub(crate) map: VolumeExtentMap,
     pub(crate) volume_root: ObjectRef,
     pub(crate) dirty_revision: u64,
     pub(crate) dirty_extent_refs: Vec<(u64, ObjectRef)>,
