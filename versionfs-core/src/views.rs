@@ -1,12 +1,12 @@
 //! Typed persistent maps and complete roots for Version FS native views.
 
 use crate::format::{
-    ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot, FormatError,
-    LogMapEntry, LogMapRoot, MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, SegmentIndexEntry,
-    VolumeGeometry, VolumeRoot, encode_object,
+    ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot, EXTENT_BYTES,
+    FormatError, LogMapEntry, LogMapRoot, MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType,
+    SegmentIndexEntry, VolumeGeometry, VolumeRoot, encode_object,
 };
 use crate::identity::ObjectId;
-use crate::persistent_map::{MapObjectStore, PersistentBTree, PersistentMapError};
+use crate::persistent_map::{MapChange, MapObjectStore, PersistentBTree, PersistentMapError};
 use thiserror::Error;
 
 /// Errors returned while constructing or reading a typed Version FS view.
@@ -41,6 +41,17 @@ impl PartialEq for VolumeExtentMap {
 }
 
 impl Eq for VolumeExtentMap {}
+
+/// One contiguous run of changed logical volume extents.
+///
+/// This is a block-range result. It carries no pathname or filesystem meaning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtentRange {
+    /// First changed extent number.
+    pub start_extent: u64,
+    /// Number of consecutive changed extents.
+    pub extent_count: u64,
+}
 
 impl VolumeExtentMap {
     /// Creates a complete empty sparse volume map.
@@ -155,6 +166,124 @@ impl VolumeExtentMap {
                 Ok((index, extent))
             })
             .collect()
+    }
+
+    /// Reads a checked logical block range from this protected immutable root.
+    ///
+    /// Unmapped extents are zero-filled. Allocated extents are fetched and fully
+    /// verified before any requested bytes are copied to the result. The caller
+    /// must keep this root protected from reclamation for the duration of reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unaligned or out-of-capacity range, a missing or
+    /// corrupt allocated extent, or an extent with an invalid payload size.
+    pub fn read_range<S: MapObjectStore>(
+        &self,
+        store: &S,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, ViewError> {
+        self.geometry.validate_range(offset, length)?;
+        let output_len = usize::try_from(length)
+            .map_err(|_| FormatError::InvalidGeometry("range does not fit memory"))?;
+        let mut output = vec![0; output_len];
+        let extent_bytes = u64::from(EXTENT_BYTES);
+        let mut position = offset;
+        let mut written = 0_usize;
+
+        while written < output.len() {
+            let extent_number = position / extent_bytes;
+            let in_extent = usize::try_from(position % extent_bytes)
+                .map_err(|_| FormatError::InvalidGeometry("extent offset does not fit memory"))?;
+            let chunk_len = (output.len() - written).min(EXTENT_BYTES as usize - in_extent);
+
+            if let Some(reference) = self.extent(store, extent_number)? {
+                let encoded = store
+                    .get(reference.object_id)
+                    .map_err(ViewError::Store)?
+                    .ok_or(ViewError::MissingObject(reference.object_id))?;
+                let object = reference.verify(&encoded)?;
+                if object.payload.len() != EXTENT_BYTES as usize {
+                    return Err(FormatError::InvalidGeometry(
+                        "allocated extent payload must be exactly 64 KiB",
+                    )
+                    .into());
+                }
+                output[written..written + chunk_len]
+                    .copy_from_slice(&object.payload[in_extent..in_extent + chunk_len]);
+            }
+
+            position = position
+                .checked_add(chunk_len as u64)
+                .ok_or(FormatError::InvalidGeometry("range overflow"))?;
+            written += chunk_len;
+        }
+
+        Ok(output)
+    }
+
+    /// Returns contiguous changed extent runs between two roots.
+    ///
+    /// Structural sharing lets the persistent-map diff skip identical subtrees.
+    /// The result describes block extents only and does not imply file changes.
+    /// The caller must keep both roots protected for the duration of the diff.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when geometries differ or either map contains malformed
+    /// extent metadata.
+    pub fn diff_extents<S: MapObjectStore>(
+        &self,
+        newer: &Self,
+        store: &S,
+    ) -> Result<Vec<ExtentRange>, ViewError> {
+        if self.geometry != newer.geometry {
+            return Err(FormatError::InvalidGeometry(
+                "cannot diff volumes with different geometry",
+            )
+            .into());
+        }
+
+        let changes = self.map.diff(&newer.map, store)?;
+        let mut ranges: Vec<ExtentRange> = Vec::new();
+        for change in changes {
+            let key = match &change {
+                MapChange::Added { key, .. }
+                | MapChange::Removed { key, .. }
+                | MapChange::Updated { key, .. } => key,
+            };
+            let extent_number = decode_u64_key(key)?;
+            self.check_extent_number(extent_number)?;
+            match change {
+                MapChange::Added { value, .. } | MapChange::Removed { value, .. } => {
+                    decode_extent_ref(&value)?;
+                }
+                MapChange::Updated { before, after, .. } => {
+                    decode_extent_ref(&before)?;
+                    decode_extent_ref(&after)?;
+                }
+            }
+
+            if let Some(last) = ranges.last_mut() {
+                let next_extent = last
+                    .start_extent
+                    .checked_add(last.extent_count)
+                    .ok_or(FormatError::InvalidGeometry("extent range overflow"))?;
+                if next_extent == extent_number {
+                    last.extent_count = last
+                        .extent_count
+                        .checked_add(1)
+                        .ok_or(FormatError::InvalidGeometry("extent range overflow"))?;
+                    continue;
+                }
+            }
+            ranges.push(ExtentRange {
+                start_extent: extent_number,
+                extent_count: 1,
+            });
+        }
+        Ok(ranges)
     }
 
     /// Stores a complete volume root for this immutable extent-map version.
@@ -598,16 +727,18 @@ fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactChunkIndex, ArtifactMap, LogMap, LogSegmentIndex, ViewError, VolumeExtentMap,
-        encode_ref, store_encoded,
+        ArtifactChunkIndex, ArtifactMap, ExtentRange, LogMap, LogSegmentIndex, ViewError,
+        VolumeExtentMap, encode_ref, store_encoded,
     };
     use crate::format::{
         ArtifactDescriptor, ArtifactMapRoot, FormatError, LogMapEntry, LogMapRoot,
         MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
+        encode_object,
     };
     use crate::identity::{ArtifactId, LogId, ObjectId, ObjectStoreScopeId};
     use crate::persistent_map::{MapObjectStore, PersistentBTree};
-    use std::collections::HashMap;
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
 
     #[derive(Default)]
     struct MemoryStore(HashMap<ObjectId, Vec<u8>>);
@@ -624,6 +755,26 @@ mod tests {
         fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
             self.0.insert(id, bytes);
             Ok(())
+        }
+    }
+
+    struct ReadTrackingStore<'a> {
+        inner: &'a MemoryStore,
+        reads: RefCell<HashSet<ObjectId>>,
+    }
+
+    impl MapObjectStore for ReadTrackingStore<'_> {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            self.inner.proof_scope()
+        }
+
+        fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            self.reads.borrow_mut().insert(id);
+            self.inner.get(id)
+        }
+
+        fn put(&mut self, _id: ObjectId, _bytes: Vec<u8>) -> Result<(), String> {
+            Err("read tracking store is read-only".to_owned())
         }
     }
 
@@ -897,6 +1048,209 @@ mod tests {
             assert!(changed.validate(&store).is_err());
             assert!(changed.seal(&mut store).is_err());
         }
+    }
+
+    #[test]
+    fn volume_range_reads_verify_allocated_extents_and_zero_fill_holes() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(4 * u64::from(crate::format::EXTENT_BYTES)).unwrap();
+        let first = store_encoded(
+            &mut store,
+            encode_object(
+                ObjectType::Extent,
+                &vec![0x31; crate::format::EXTENT_BYTES as usize],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let third = store_encoded(
+            &mut store,
+            encode_object(
+                ObjectType::Extent,
+                &vec![0x73; crate::format::EXTENT_BYTES as usize],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let map = VolumeExtentMap::empty(geometry, &mut store)
+            .unwrap()
+            .insert_extent(&mut store, 0, first)
+            .unwrap()
+            .insert_extent(&mut store, 2, third)
+            .unwrap();
+
+        assert_eq!(map.read_range(&store, 0, 4096).unwrap(), vec![0x31; 4096]);
+        assert_eq!(
+            map.read_range(&store, u64::from(crate::format::EXTENT_BYTES), 8192)
+                .unwrap(),
+            vec![0; 8192]
+        );
+        let crossing = map
+            .read_range(&store, u64::from(crate::format::EXTENT_BYTES) - 4096, 8192)
+            .unwrap();
+        assert_eq!(&crossing[..4096], &[0x31; 4096]);
+        assert_eq!(&crossing[4096..], &[0; 4096]);
+
+        store
+            .0
+            .insert(first.object_id, vec![0; first.encoded_len as usize]);
+        assert!(matches!(
+            map.read_range(&store, 0, 4096),
+            Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+        ));
+    }
+
+    #[test]
+    fn volume_diff_coalesces_extent_ranges_and_tracks_zero_transitions() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(8 * u64::from(crate::format::EXTENT_BYTES)).unwrap();
+        let extent = |store: &mut MemoryStore, byte| {
+            store_encoded(
+                store,
+                encode_object(
+                    ObjectType::Extent,
+                    &vec![byte; crate::format::EXTENT_BYTES as usize],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let a = extent(&mut store, 0x11);
+        let b = extent(&mut store, 0x22);
+        let c = extent(&mut store, 0x33);
+        let d = extent(&mut store, 0x44);
+        let before = VolumeExtentMap::empty(geometry, &mut store)
+            .unwrap()
+            .insert_extent(&mut store, 0, a)
+            .unwrap()
+            .insert_extent(&mut store, 2, b)
+            .unwrap()
+            .insert_extent(&mut store, 3, c)
+            .unwrap();
+        let after = before
+            .remove_extent(&mut store, 0)
+            .unwrap()
+            .insert_extent(&mut store, 2, d)
+            .unwrap()
+            .insert_extent(&mut store, 5, a)
+            .unwrap()
+            .insert_extent(&mut store, 6, b)
+            .unwrap();
+
+        assert_eq!(
+            before.diff_extents(&after, &store).unwrap(),
+            vec![
+                super::ExtentRange {
+                    start_extent: 0,
+                    extent_count: 1,
+                },
+                super::ExtentRange {
+                    start_extent: 2,
+                    extent_count: 1,
+                },
+                super::ExtentRange {
+                    start_extent: 5,
+                    extent_count: 2,
+                },
+            ]
+        );
+        let other_geometry = VolumeExtentMap::empty(
+            VolumeGeometry::new(4 * u64::from(crate::format::EXTENT_BYTES)).unwrap(),
+            &mut store,
+        )
+        .unwrap();
+        assert!(before.diff_extents(&other_geometry, &store).is_err());
+    }
+
+    #[test]
+    fn cold_volume_read_fetches_only_its_index_path_and_requested_extent() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(2048 * u64::from(crate::format::EXTENT_BYTES)).unwrap();
+        let make_extent = |store: &mut MemoryStore, fill| {
+            store_encoded(
+                store,
+                encode_object(
+                    ObjectType::Extent,
+                    &vec![fill; crate::format::EXTENT_BYTES as usize],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let common = make_extent(&mut store, 0x18);
+        let selected = make_extent(&mut store, 0x29);
+        let unrelated = make_extent(&mut store, 0x3A);
+        let mut map = VolumeExtentMap::empty(geometry, &mut store).unwrap();
+        for extent_number in 0..1500 {
+            let reference = match extent_number {
+                700 => selected,
+                1200 => unrelated,
+                _ => common,
+            };
+            map = map
+                .insert_extent(&mut store, extent_number, reference)
+                .unwrap();
+        }
+
+        let tracking = ReadTrackingStore {
+            inner: &store,
+            reads: RefCell::new(HashSet::new()),
+        };
+        let bytes = map
+            .read_range(
+                &tracking,
+                700 * u64::from(crate::format::EXTENT_BYTES),
+                4096,
+            )
+            .unwrap();
+        assert_eq!(bytes, vec![0x29; 4096]);
+        let reads = tracking.reads.into_inner();
+        assert!(reads.contains(&selected.object_id));
+        assert!(!reads.contains(&common.object_id));
+        assert!(!reads.contains(&unrelated.object_id));
+        assert!(reads.len() < 16, "range read fetched unrelated index data");
+    }
+
+    #[test]
+    fn extent_diff_skips_shared_subtrees_and_never_fetches_extent_payloads() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(2048 * u64::from(crate::format::EXTENT_BYTES)).unwrap();
+        let make_extent = |store: &mut MemoryStore, fill| {
+            store_encoded(
+                store,
+                encode_object(
+                    ObjectType::Extent,
+                    &vec![fill; crate::format::EXTENT_BYTES as usize],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let common = make_extent(&mut store, 0x48);
+        let changed = make_extent(&mut store, 0x59);
+        let mut before = VolumeExtentMap::empty(geometry, &mut store).unwrap();
+        for extent_number in 0..1500 {
+            before = before
+                .insert_extent(&mut store, extent_number, common)
+                .unwrap();
+        }
+        let after = before.insert_extent(&mut store, 731, changed).unwrap();
+
+        let tracking = ReadTrackingStore {
+            inner: &store,
+            reads: RefCell::new(HashSet::new()),
+        };
+        assert_eq!(
+            before.diff_extents(&after, &tracking).unwrap(),
+            vec![ExtentRange {
+                start_extent: 731,
+                extent_count: 1,
+            }]
+        );
+        let reads = tracking.reads.into_inner();
+        assert!(!reads.contains(&common.object_id));
+        assert!(!reads.contains(&changed.object_id));
+        assert!(reads.len() < 32, "diff walked the complete persistent map");
     }
 
     #[test]

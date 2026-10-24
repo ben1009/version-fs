@@ -27,8 +27,13 @@ implementation and release criteria. Both are drafts. The implementation plan
 translates RFC-002 into ordered work packages and completion evidence. P0's
 canonical formats, shared golden vectors, and opt-in ublk/ext4 feasibility harness
 are merged. P1 adds a workspace-scoped immutable S3 object layer and deterministic
-tests; its real-S3 test is opt-in and uses a dedicated conformance bucket. Higher
-storage protocols, the service daemon, and user-facing commands are still in progress.
+tests; its real-S3 test is opt-in and uses a dedicated conformance bucket. P2
+qualifies the MetadataAuthority contract with toy-kv, and P3 provides persistent
+volume roots and native indexes. P4 adds the bounded local block path, verified
+workspace cache, extent readers/diff, and an opt-in single-queue ublk adapter.
+Durable FLUSH/FUA barriers remain in P6; the current ublk adapter reports the
+volatile cache and rejects those barriers. The service daemon and user-facing
+commands are still in progress.
 
 ## Development
 

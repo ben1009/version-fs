@@ -1,0 +1,694 @@
+//! Verified, workspace-scoped disk cache for immutable objects.
+
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use thiserror::Error;
+use versionfs_core::format::{FormatError, MAX_ENCODED_OBJECT_BYTES, ObjectRef};
+use versionfs_core::identity::{ObjectId, WorkspaceId};
+use versionfs_core::persistent_map::MapObjectStore;
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Errors returned by the verified local object cache.
+#[derive(Debug, Error)]
+pub enum CacheError {
+    /// An encoded object did not match its requested immutable identity.
+    #[error(transparent)]
+    Format(#[from] FormatError),
+    /// The remote object fetch failed.
+    #[error("object fetch failed: {0}")]
+    Fetch(String),
+    /// A local cache operation failed.
+    #[error("cache I/O at {path}: {source}")]
+    Io {
+        /// Path involved in the failed operation.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The cache's local coordination lock was poisoned.
+    #[error("object cache lock is poisoned")]
+    Poisoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CacheKey(ObjectId);
+
+#[derive(Clone, Copy, Debug)]
+struct CacheEntry {
+    encoded_len: u64,
+    last_access: u64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<CacheKey, CacheEntry>,
+    encoded_bytes: u64,
+    access_clock: u64,
+}
+
+struct TemporaryPath(PathBuf);
+
+impl Drop for TemporaryPath {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Bounded clean-object cache for one workspace.
+///
+/// Every fill is verified before atomic installation. A single local lock
+/// coordinates misses so concurrent readers do not fetch the same object twice.
+/// The cache stores immutable objects only; dirty block and control state use
+/// separate caller-owned storage.
+pub struct WorkspaceObjectCache {
+    workspace_id: WorkspaceId,
+    directory: PathBuf,
+    capacity_bytes: u64,
+    state: Mutex<CacheState>,
+}
+
+impl WorkspaceObjectCache {
+    /// Opens a cache directory scoped to one workspace and indexes valid files.
+    pub fn open(
+        root: impl AsRef<Path>,
+        workspace_id: WorkspaceId,
+        capacity_bytes: u64,
+    ) -> Result<Self, CacheError> {
+        let directory = root.as_ref().join(workspace_id.to_string());
+        fs::create_dir_all(&directory).map_err(|source| CacheError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        let metadata = fs::symlink_metadata(&directory).map_err(|source| CacheError::Io {
+            path: directory.clone(),
+            source,
+        })?;
+        if !metadata.file_type().is_dir() {
+            return Err(CacheError::Io {
+                path: directory,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "workspace cache path must be a directory",
+                ),
+            });
+        }
+
+        let mut cache = Self {
+            workspace_id,
+            directory,
+            capacity_bytes,
+            state: Mutex::new(CacheState::default()),
+        };
+        cache.rebuild_index()?;
+        Ok(cache)
+    }
+
+    /// Returns the workspace that scopes this cache instance.
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    /// Returns a verified object, filling it from `fetch` on a cache miss.
+    pub fn get_or_fetch(
+        &self,
+        expected: ObjectRef,
+        fetch: impl FnOnce(WorkspaceId, ObjectRef) -> Result<Vec<u8>, String>,
+    ) -> Result<Vec<u8>, CacheError> {
+        self.get_or_fetch_id(expected.object_id, |_| {
+            fetch(self.workspace_id, expected).map(Some)
+        })
+        .and_then(|bytes| {
+            let bytes = bytes.ok_or_else(|| {
+                CacheError::Fetch("immutable object fetch returned no object".to_owned())
+            })?;
+            expected.verify(&bytes)?;
+            Ok(bytes)
+        })
+    }
+
+    fn get_or_fetch_id(
+        &self,
+        object_id: ObjectId,
+        fetch: impl FnOnce(ObjectId) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Option<Vec<u8>>, CacheError> {
+        let key = CacheKey(object_id);
+        let mut state = self.lock_state()?;
+        let path = self.object_path(object_id);
+
+        if state.entries.contains_key(&key) {
+            match read_file(&path) {
+                Ok(bytes)
+                    if ObjectRef::from_encoded(&bytes).is_ok_and(|r| r.object_id == object_id) =>
+                {
+                    touch(&mut state, key);
+                    return Ok(Some(bytes));
+                }
+                Ok(_) => self.remove_entry(&mut state, key, &path)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.remove_entry(&mut state, key, &path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    self.remove_entry(&mut state, key, &path)?;
+                }
+                Err(source) => {
+                    return Err(CacheError::Io { path, source });
+                }
+            }
+        }
+
+        let Some(bytes) = fetch(object_id).map_err(CacheError::Fetch)? else {
+            return Ok(None);
+        };
+        let reference = ObjectRef::from_encoded(&bytes)?;
+        if reference.object_id != object_id {
+            return Err(FormatError::ObjectReferenceMismatch.into());
+        }
+        if reference.encoded_len <= self.capacity_bytes {
+            self.install(&mut state, reference.object_id, &bytes)?;
+        }
+        Ok(Some(bytes))
+    }
+
+    fn install(
+        &self,
+        state: &mut CacheState,
+        object_id: ObjectId,
+        bytes: &[u8],
+    ) -> Result<(), CacheError> {
+        let path = self.object_path(object_id);
+        let encoded_len = bytes.len() as u64;
+        self.evict_to_fit(state, encoded_len, object_id)?;
+
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let temp_path = self
+            .directory
+            .join(format!(".tmp-{}-{temp_id}", std::process::id()));
+        let _temp_path_guard = TemporaryPath(temp_path.clone());
+        let mut temp = create_new_file(&temp_path)?;
+        temp.write_all(bytes).map_err(|source| CacheError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+        temp.sync_all().map_err(|source| CacheError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+        drop(temp);
+        fs::rename(&temp_path, &path).map_err(|source| CacheError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        let key = CacheKey(object_id);
+        if let Some(previous) = state.entries.remove(&key) {
+            state.encoded_bytes = state.encoded_bytes.saturating_sub(previous.encoded_len);
+        }
+        state.encoded_bytes = state.encoded_bytes.saturating_add(encoded_len);
+        let access = next_access(state);
+        state.entries.insert(
+            key,
+            CacheEntry {
+                encoded_len,
+                last_access: access,
+            },
+        );
+        Ok(())
+    }
+
+    fn evict_to_fit(
+        &self,
+        state: &mut CacheState,
+        incoming_bytes: u64,
+        protected_id: ObjectId,
+    ) -> Result<(), CacheError> {
+        while state.encoded_bytes.saturating_add(incoming_bytes) > self.capacity_bytes {
+            let Some((key, _)) = state
+                .entries
+                .iter()
+                .filter(|(key, _)| key.0 != protected_id)
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, entry)| (*key, *entry))
+            else {
+                break;
+            };
+            self.remove_entry(state, key, &self.object_path(key.0))?;
+        }
+        Ok(())
+    }
+
+    fn remove_entry(
+        &self,
+        state: &mut CacheState,
+        key: CacheKey,
+        path: &Path,
+    ) -> Result<(), CacheError> {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CacheError::Io {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+        }
+        if let Some(entry) = state.entries.remove(&key) {
+            state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_len);
+        }
+        Ok(())
+    }
+
+    fn rebuild_index(&mut self) -> Result<(), CacheError> {
+        let mut state = self.lock_state()?;
+        for item in fs::read_dir(&self.directory).map_err(|source| CacheError::Io {
+            path: self.directory.clone(),
+            source,
+        })? {
+            let item = item.map_err(|source| CacheError::Io {
+                path: self.directory.clone(),
+                source,
+            })?;
+            let path = item.path();
+            let kind = item.file_type().map_err(|source| CacheError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !kind.is_file() {
+                if kind.is_symlink() {
+                    fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
+                }
+                continue;
+            }
+            let Some(object_id) = object_id_from_file_name(&path) else {
+                fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
+                continue;
+            };
+            let bytes = match read_file(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
+                    continue;
+                }
+                Err(source) => {
+                    return Err(CacheError::Io {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            };
+            let Ok(reference) = ObjectRef::from_encoded(&bytes) else {
+                fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
+                continue;
+            };
+            if reference.object_id != object_id || reference.encoded_len > self.capacity_bytes {
+                fs::remove_file(&path).map_err(|source| CacheError::Io { path, source })?;
+                continue;
+            }
+            state.access_clock = state.access_clock.saturating_add(1);
+            let access = state.access_clock;
+            state.encoded_bytes = state.encoded_bytes.saturating_add(reference.encoded_len);
+            state.entries.insert(
+                CacheKey(object_id),
+                CacheEntry {
+                    encoded_len: reference.encoded_len,
+                    last_access: access,
+                },
+            );
+        }
+        while state.encoded_bytes > self.capacity_bytes {
+            let Some(key) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.remove_entry(&mut state, key, &self.object_path(key.0))?;
+        }
+        Ok(())
+    }
+
+    fn object_path(&self, object_id: ObjectId) -> PathBuf {
+        self.directory.join(format!("{object_id}.obj"))
+    }
+
+    fn lock_state(&self) -> Result<MutexGuard<'_, CacheState>, CacheError> {
+        self.state.lock().map_err(|_| CacheError::Poisoned)
+    }
+}
+
+/// A cache-backed synchronous map store used by the persistent-map reader.
+///
+/// Writes go to the backing store before entering the clean cache; dirty volume
+/// sectors are managed separately by [`crate::volume::DirtyVolume`].
+pub struct CachedMapStore<S> {
+    backing: S,
+    cache: WorkspaceObjectCache,
+}
+
+impl<S> CachedMapStore<S> {
+    /// Creates a map store combining a synchronous backend and workspace cache.
+    pub const fn new(backing: S, cache: WorkspaceObjectCache) -> Self {
+        Self { backing, cache }
+    }
+
+    /// Returns a reference to the immutable-object backend.
+    pub const fn backing(&self) -> &S {
+        &self.backing
+    }
+}
+
+impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
+    fn proof_scope(&self) -> versionfs_core::identity::ObjectStoreScopeId {
+        self.backing.proof_scope()
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        self.cache
+            .get_or_fetch_id(id, |object_id| self.backing.get(object_id))
+            .map_err(|error| error.to_string())
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        let reference = ObjectRef::from_encoded(&bytes).map_err(|error| error.to_string())?;
+        if reference.object_id != id {
+            return Err(FormatError::ObjectReferenceMismatch.to_string());
+        }
+        self.backing.put(id, bytes.clone())?;
+        self.cache
+            .get_or_fetch_id(id, |_| Ok(Some(bytes)))
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn touch(state: &mut CacheState, key: CacheKey) {
+    let access = next_access(state);
+    if let Some(entry) = state.entries.get_mut(&key) {
+        entry.last_access = access;
+    }
+}
+
+fn next_access(state: &mut CacheState) -> u64 {
+    state.access_clock = state.access_clock.saturating_add(1);
+    state.access_clock
+}
+
+fn create_new_file(path: &Path) -> Result<File, CacheError> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| CacheError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
+    let file = File::open(path)?;
+    let capacity = file.metadata()?.len().min(MAX_ENCODED_OBJECT_BYTES as u64) as usize;
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take(MAX_ENCODED_OBJECT_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_ENCODED_OBJECT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "cached object exceeds the maximum encoded object size",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn object_id_from_file_name(path: &Path) -> Option<ObjectId> {
+    let name = path.file_name()?.to_str()?;
+    let digest = name.strip_suffix(".obj")?;
+    if digest.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0_u8; 32];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let start = index.checked_mul(2)?;
+        *byte = u8::from_str_radix(digest.get(start..start + 2)?, 16).ok()?;
+    }
+    Some(ObjectId::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheError, CachedMapStore, WorkspaceObjectCache};
+    use std::collections::HashMap;
+    use std::fs::{self, OpenOptions};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+    use versionfs_core::format::{MAX_ENCODED_OBJECT_BYTES, ObjectRef, ObjectType, encode_object};
+    use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, WorkspaceId};
+    use versionfs_core::persistent_map::MapObjectStore;
+
+    static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(1);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "versionfs-object-cache-{}-{id}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn encoded_object(fill: u8) -> (ObjectRef, Vec<u8>) {
+        let bytes = encode_object(ObjectType::ArtifactBlob, &[fill; 256]).unwrap();
+        let reference = ObjectRef::from_encoded(&bytes).unwrap();
+        (reference, bytes)
+    }
+
+    fn fetch(cache: &WorkspaceObjectCache, reference: ObjectRef, bytes: &[u8]) -> Vec<u8> {
+        cache
+            .get_or_fetch(reference, |workspace, requested| {
+                assert_eq!(workspace, cache.workspace_id());
+                assert_eq!(requested, reference);
+                Ok(bytes.to_vec())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn verified_cache_fill_is_reused_after_reopen() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x31; 16]);
+        let (reference, bytes) = encoded_object(0xA1);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let fetches = AtomicUsize::new(0);
+
+        let first = cache
+            .get_or_fetch(reference, |scope, requested| {
+                assert_eq!(scope, workspace);
+                assert_eq!(requested, reference);
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        assert_eq!(first, bytes);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+
+        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        assert_eq!(fetch(&reopened, reference, &[]), bytes);
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        let files: Vec<_> = fs::read_dir(directory.0.join(workspace.to_string()))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            files.len(),
+            1,
+            "successful fills leave no partial temp file"
+        );
+    }
+
+    #[test]
+    fn corrupt_and_oversized_cache_entries_are_removed_before_refill() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x32; 16]);
+        let (reference, bytes) = encoded_object(0xB2);
+        let workspace_dir = directory.0.join(workspace.to_string());
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        fetch(&cache, reference, &bytes);
+        drop(cache);
+
+        let object_path = workspace_dir.join(format!("{}.obj", reference.object_id));
+        fs::write(&object_path, [0xFF, 0x00]).unwrap();
+        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        assert_eq!(fetch(&reopened, reference, &bytes), bytes);
+
+        drop(reopened);
+        let file = OpenOptions::new().write(true).open(&object_path).unwrap();
+        file.set_len(MAX_ENCODED_OBJECT_BYTES as u64 + 1).unwrap();
+        let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        assert_eq!(fetch(&reopened, reference, &bytes), bytes);
+        assert_eq!(
+            fs::metadata(&object_path).unwrap().len(),
+            bytes.len() as u64
+        );
+    }
+
+    #[test]
+    fn cache_capacity_evicts_the_least_recently_used_clean_object() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x33; 16]);
+        let (a_ref, a) = encoded_object(1);
+        let (b_ref, b) = encoded_object(2);
+        let (c_ref, c) = encoded_object(3);
+        let capacity = (a.len() * 2) as u64;
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, capacity).unwrap();
+        let fetches = AtomicUsize::new(0);
+        let get = |reference, bytes: &[u8]| {
+            cache
+                .get_or_fetch(reference, |_, _| {
+                    fetches.fetch_add(1, Ordering::SeqCst);
+                    Ok(bytes.to_vec())
+                })
+                .unwrap()
+        };
+
+        assert_eq!(get(a_ref, &a), a);
+        assert_eq!(get(b_ref, &b), b);
+        assert_eq!(get(a_ref, &[]), a); // Refresh A's LRU position.
+        assert_eq!(get(c_ref, &c), c); // Evicts B.
+        assert_eq!(get(a_ref, &[]), a);
+        assert_eq!(get(b_ref, &b), b);
+        assert_eq!(fetches.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn cache_fill_coordination_fetches_an_object_once_for_concurrent_readers() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x34; 16]);
+        let (reference, bytes) = encoded_object(0xD4);
+        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let fetches = Arc::clone(&fetches);
+                let start = Arc::clone(&start);
+                let bytes = bytes.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    cache
+                        .get_or_fetch(reference, |_, _| {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            thread::sleep(Duration::from_millis(10));
+                            Ok(bytes)
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), bytes);
+        }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn workspace_caches_do_not_share_local_objects_or_authorization_scope() {
+        let directory = TestDirectory::new();
+        let first_workspace = WorkspaceId::from_bytes([0x35; 16]);
+        let second_workspace = WorkspaceId::from_bytes([0x36; 16]);
+        let (reference, bytes) = encoded_object(0xE5);
+        let first = WorkspaceObjectCache::open(&directory.0, first_workspace, 1024).unwrap();
+        let second = WorkspaceObjectCache::open(&directory.0, second_workspace, 1024).unwrap();
+        fetch(&first, reference, &bytes);
+
+        let second_fetches = AtomicUsize::new(0);
+        second
+            .get_or_fetch(reference, |workspace, _| {
+                assert_eq!(workspace, second_workspace);
+                second_fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        assert_eq!(second_fetches.load(Ordering::SeqCst), 1);
+        assert_ne!(first_workspace.to_string(), second_workspace.to_string());
+    }
+
+    #[test]
+    fn fetched_bytes_must_match_the_requested_immutable_identity() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x37; 16]);
+        let (reference, _) = encoded_object(0xF7);
+        let (_, wrong_bytes) = encoded_object(0xF8);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+
+        assert!(matches!(
+            cache.get_or_fetch(reference, |_, _| Ok(wrong_bytes)),
+            Err(CacheError::Format(_))
+        ));
+        assert_eq!(
+            fs::read_dir(directory.0.join(workspace.to_string()))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[derive(Default)]
+    struct MemoryStore {
+        objects: HashMap<ObjectId, Vec<u8>>,
+        gets: AtomicUsize,
+    }
+
+    impl MapObjectStore for MemoryStore {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            ObjectStoreScopeId::from_bytes([0x38; 16])
+        }
+
+        fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            Ok(self.objects.get(&id).cloned())
+        }
+
+        fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+            self.objects.insert(id, bytes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cached_map_store_seeds_verified_puts_and_preserves_missing_object_semantics() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x39; 16]);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let mut store = CachedMapStore::new(MemoryStore::default(), cache);
+        let (reference, bytes) = encoded_object(0xA9);
+
+        store.put(reference.object_id, bytes.clone()).unwrap();
+        assert_eq!(store.get(reference.object_id).unwrap(), Some(bytes));
+        assert_eq!(store.backing().gets.load(Ordering::SeqCst), 0);
+        assert_eq!(store.get(ObjectId::from_bytes([0; 32])).unwrap(), None);
+        assert_eq!(store.backing().gets.load(Ordering::SeqCst), 1);
+    }
+}

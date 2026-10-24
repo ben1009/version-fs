@@ -1,3 +1,7 @@
 //! Version FS client transport, Linux worker integration, and capture coordination.
-//!
-//! Workspace foundation only; client and block-device integration are not implemented yet.
+
+pub mod object_cache;
+pub mod volume;
+
+#[cfg(all(target_os = "linux", feature = "ublk-adapter"))]
+pub mod ublk;
