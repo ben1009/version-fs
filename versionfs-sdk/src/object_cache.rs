@@ -1,6 +1,6 @@
 //! Verified, workspace-scoped disk cache for immutable objects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -58,9 +58,11 @@ type SharedResult = Result<Option<Arc<[u8]>>, SharedCacheError>;
 struct CacheState {
     entries: HashMap<CacheKey, CacheEntry>,
     encoded_bytes: u64,
+    pending_delete_bytes: u64,
     reserved_bytes: u64,
     access_clock: u64,
     in_flight: HashMap<CacheKey, Arc<InFlight>>,
+    evicting_keys: HashSet<CacheKey>,
 }
 
 #[derive(Default)]
@@ -149,10 +151,11 @@ impl CapacityReservation<'_> {
         let Some(victim) = self.victims[index].as_ref() else {
             return Ok(());
         };
+        let victim = victim.clone();
         match fs::remove_file(&victim.path) {
-            Ok(()) => self.victims[index] = None,
+            Ok(()) => self.finish_victim_deletion(index, &victim),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.victims[index] = None;
+                self.finish_victim_deletion(index, &victim);
             }
             Err(source) => {
                 return Err(CacheError::Io {
@@ -162,6 +165,19 @@ impl CapacityReservation<'_> {
             }
         }
         Ok(())
+    }
+
+    fn finish_victim_deletion(&mut self, index: usize, victim: &CacheVictim) {
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_delete_bytes = state
+            .pending_delete_bytes
+            .saturating_sub(victim.entry.encoded_len);
+        state.evicting_keys.remove(&victim.key);
+        self.victims[index] = None;
     }
 
     fn commit(mut self, object_id: ObjectId, encoded_len: u64) -> Result<(), CacheError> {
@@ -192,6 +208,10 @@ impl Drop for CapacityReservation<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for victim in self.victims.iter().flatten() {
+            state.pending_delete_bytes = state
+                .pending_delete_bytes
+                .saturating_sub(victim.entry.encoded_len);
+            state.evicting_keys.remove(&victim.key);
             if !state.entries.contains_key(&victim.key) {
                 state.encoded_bytes = state.encoded_bytes.saturating_add(victim.entry.encoded_len);
                 state.entries.insert(victim.key, victim.entry);
@@ -418,11 +438,15 @@ impl WorkspaceObjectCache {
         incoming_bytes: u64,
     ) -> Result<Option<CapacityReservation<'_>>, CacheError> {
         let mut state = self.lock_state()?;
+        if state.evicting_keys.contains(&CacheKey(protected_id)) {
+            return Ok(None);
+        }
         if incoming_bytes.saturating_add(state.reserved_bytes) > self.capacity_bytes {
             return Ok(None);
         }
         let required_bytes = state
             .encoded_bytes
+            .saturating_add(state.pending_delete_bytes)
             .saturating_add(state.reserved_bytes)
             .saturating_add(incoming_bytes)
             .saturating_sub(self.capacity_bytes);
@@ -437,10 +461,13 @@ impl WorkspaceObjectCache {
         }
 
         let mut victims: Vec<Option<CacheVictim>> = Vec::new();
+        let mut planned_reclaim_bytes = 0_u64;
         while state
             .encoded_bytes
+            .saturating_add(state.pending_delete_bytes)
             .saturating_add(state.reserved_bytes)
             .saturating_add(incoming_bytes)
+            .saturating_sub(planned_reclaim_bytes)
             > self.capacity_bytes
         {
             let Some(key) = state
@@ -451,6 +478,10 @@ impl WorkspaceObjectCache {
                 .map(|(key, _)| *key)
             else {
                 for victim in victims.into_iter().flatten() {
+                    state.pending_delete_bytes = state
+                        .pending_delete_bytes
+                        .saturating_sub(victim.entry.encoded_len);
+                    state.evicting_keys.remove(&victim.key);
                     state.encoded_bytes =
                         state.encoded_bytes.saturating_add(victim.entry.encoded_len);
                     state.entries.insert(victim.key, victim.entry);
@@ -459,6 +490,10 @@ impl WorkspaceObjectCache {
             };
             if let Some(entry) = state.entries.remove(&key) {
                 state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_len);
+                state.pending_delete_bytes =
+                    state.pending_delete_bytes.saturating_add(entry.encoded_len);
+                state.evicting_keys.insert(key);
+                planned_reclaim_bytes = planned_reclaim_bytes.saturating_add(entry.encoded_len);
                 victims.push(Some(CacheVictim {
                     key,
                     entry,
@@ -820,6 +855,65 @@ mod tests {
         assert_eq!(get(a_ref, &[]), a);
         assert_eq!(get(b_ref, &b), b);
         assert_eq!(fetches.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn pending_eviction_cannot_be_reused_if_deletion_fails() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x3E; 16]);
+        let large_bytes = encode_object(ObjectType::ArtifactBlob, &[0xA1; 1024]).unwrap();
+        let large_ref = ObjectRef::from_encoded(&large_bytes).unwrap();
+        let (small_ref, small_bytes) = encoded_object(0xA2);
+        let (first_new_ref, _) = encoded_object(0xA3);
+        let (second_new_ref, second_new_bytes) = encoded_object(0xA4);
+        let capacity = (large_bytes.len() + small_bytes.len()) as u64;
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, capacity).unwrap();
+        fetch(&cache, large_ref, &large_bytes);
+        fetch(&cache, small_ref, &small_bytes);
+
+        // The first install plans to evict the larger object, freeing more than
+        // its own reservation needs. A concurrent install must not consume that
+        // provisional space until the deletion has actually completed.
+        let mut first_reservation = cache
+            .reserve_install(first_new_ref.object_id, small_bytes.len() as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_reservation.victims.len(), 1);
+        assert_eq!(
+            first_reservation.victims[0].as_ref().unwrap().key,
+            super::CacheKey(large_ref.object_id)
+        );
+        assert!(
+            cache
+                .reserve_install(second_new_ref.object_id, second_new_bytes.len() as u64)
+                .unwrap()
+                .is_none()
+        );
+
+        let victim_path = cache.object_path(large_ref.object_id);
+        let saved_victim_path = directory.0.join("saved-victim.obj");
+        fs::rename(&victim_path, &saved_victim_path).unwrap();
+        fs::create_dir(&victim_path).unwrap();
+        assert!(first_reservation.delete_victim(0).is_err());
+        drop(first_reservation);
+        fs::remove_dir(&victim_path).unwrap();
+        fs::rename(saved_victim_path, &victim_path).unwrap();
+
+        {
+            let state = cache.lock_state().unwrap();
+            assert_eq!(state.encoded_bytes, capacity);
+            assert_eq!(state.pending_delete_bytes, 0);
+            assert_eq!(state.reserved_bytes, 0);
+            assert!(state.evicting_keys.is_empty());
+        }
+
+        cache
+            .install(second_new_ref.object_id, &second_new_bytes)
+            .unwrap();
+        let state = cache.lock_state().unwrap();
+        assert!(state.encoded_bytes <= capacity);
+        assert_eq!(state.pending_delete_bytes, 0);
+        assert_eq!(state.reserved_bytes, 0);
     }
 
     #[test]
