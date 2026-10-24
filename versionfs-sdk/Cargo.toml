@@ -20,7 +20,7 @@ ublk-smoke = ["dep:ctrlc", "dep:libc", "dep:libublk"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ctrlc = { version = "=3.5.2", features = ["termination"], optional = true }
-libc = { version = "=0.2.189", optional = true }
+libc = { version = "=0.2.191", optional = true }
 libublk = { version = "=0.4.8", optional = true }
 
 [lints]
