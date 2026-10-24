@@ -175,8 +175,8 @@ struct FillLeader<'a> {
 
 impl FillLeader<'_> {
     fn complete(mut self, result: SharedResult) {
-        self.flight.complete(result);
         self.cache.release_flight(self.key, &self.flight);
+        self.flight.complete(result);
         self.completed = true;
     }
 }
@@ -184,10 +184,10 @@ impl FillLeader<'_> {
 impl Drop for FillLeader<'_> {
     fn drop(&mut self) {
         if !self.completed {
+            self.cache.release_flight(self.key, &self.flight);
             self.flight.complete(Err(SharedCacheError::Fetch(Arc::from(
                 "object cache fill was interrupted",
             ))));
-            self.cache.release_flight(self.key, &self.flight);
         }
     }
 }
@@ -829,14 +829,16 @@ fn object_id_from_file_name(path: &Path, store_scope: ObjectStoreScopeId) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheError, CacheKey, CachedMapStore, SharedCacheError, WorkspaceObjectCache};
+    use super::{
+        CacheError, CacheKey, CachedMapStore, FillLeader, SharedCacheError, WorkspaceObjectCache,
+    };
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use versionfs_core::format::{MAX_ENCODED_OBJECT_BYTES, ObjectRef, ObjectType, encode_object};
     use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, WorkspaceId};
     use versionfs_core::persistent_map::MapObjectStore;
@@ -1170,6 +1172,74 @@ mod tests {
         ));
         follower.join().unwrap();
         assert_eq!(fetch(&cache, reference, &bytes), bytes);
+    }
+
+    #[test]
+    fn completed_and_interrupted_fills_retire_before_publishing_results() {
+        for interrupted in [false, true] {
+            let directory = TestDirectory::new();
+            let workspace = WorkspaceId::from_bytes([0x4A; 16]);
+            let cache =
+                WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, 1024).unwrap();
+            let (reference, _) = encoded_object(0xA5);
+            let key = CacheKey(reference.object_id);
+            let (flight, is_leader) = cache.acquire_flight(key).unwrap();
+            assert!(is_leader);
+            let (follower_flight, is_leader) = cache.acquire_flight(key).unwrap();
+            assert!(!is_leader);
+
+            // Block publication so retirement and replacement can be observed
+            // independently of which thread runs immediately after notification.
+            let publication = flight.result.lock().unwrap();
+            thread::scope(|scope| {
+                let follower = scope.spawn(move || follower_flight.wait());
+                let leader = scope.spawn(|| {
+                    let leader = FillLeader {
+                        cache: &cache,
+                        key,
+                        flight: Arc::clone(&flight),
+                        completed: false,
+                    };
+                    if interrupted {
+                        drop(leader);
+                    } else {
+                        leader.complete(Err(SharedCacheError::Fetch(Arc::from(
+                            "injected fetch failure",
+                        ))));
+                    }
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let replacement = loop {
+                    match cache.acquire_flight(key) {
+                        Ok((flight, true)) => break Some(flight),
+                        Ok(_) if Instant::now() < deadline => thread::yield_now(),
+                        Ok(_) | Err(_) => break None,
+                    }
+                };
+
+                // Release publication and join both threads before asserting,
+                // including when the old ordering prevents a replacement.
+                drop(publication);
+                let leader_result = leader.join();
+                let follower_result = follower.join();
+                leader_result.unwrap();
+                let expected_error = if interrupted {
+                    "object cache fill was interrupted"
+                } else {
+                    "injected fetch failure"
+                };
+                assert!(matches!(
+                    follower_result.unwrap(),
+                    Err(SharedCacheError::Fetch(message)) if message.as_ref() == expected_error
+                ));
+                let replacement = replacement.expect("finished fills must permit a new attempt");
+                let (current, is_leader) = cache.acquire_flight(key).unwrap();
+                assert!(!is_leader);
+                assert!(Arc::ptr_eq(&current, &replacement));
+                assert!(!Arc::ptr_eq(&current, &flight));
+                cache.release_flight(key, &replacement);
+            });
+        }
     }
 
     #[test]

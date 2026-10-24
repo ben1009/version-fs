@@ -129,6 +129,7 @@ jobs:
         run: bash scripts/coverage.sh --lcov --output-path lcov.info
       - name: Summarize coverage
         if: hashFiles('lcov.info') != ''
+        shell: bash
         run: python3 scripts/coverage_summary.py lcov.info | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Explain skipped Codecov upload
         if: hashFiles('lcov.info') != '' && env.CODECOV_TOKEN == ''
