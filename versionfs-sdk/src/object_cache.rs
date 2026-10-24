@@ -484,8 +484,15 @@ impl WorkspaceObjectCache {
             return Some(bytes);
         }
 
-        self.remove_entry_index(key);
-        let _ = fs::remove_file(path);
+        match fs::remove_file(path) {
+            Ok(()) => self.remove_entry_index(key),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.remove_entry_index(key);
+            }
+            // Keep undeleted files charged even when a verified backend read
+            // can still succeed. A later cleanup or eviction may remove them.
+            Err(_) => {}
+        }
         None
     }
 
@@ -528,7 +535,12 @@ impl WorkspaceObjectCache {
         incoming_bytes: u64,
     ) -> Result<Option<CapacityReservation<'_>>, CacheError> {
         let mut state = self.lock_state()?;
-        if state.evicting_keys.contains(&CacheKey(protected_id)) {
+        let protected_key = CacheKey(protected_id);
+        // A failed cleanup can leave this object indexed. Avoid replacing its
+        // file and charging it again if local access recovered during the fetch.
+        if state.entries.contains_key(&protected_key)
+            || state.evicting_keys.contains(&protected_key)
+        {
             return Ok(None);
         }
         if incoming_bytes.saturating_add(state.reserved_bytes) > self.capacity_bytes {
@@ -1099,6 +1111,117 @@ mod tests {
             .unwrap();
         let state = cache.lock_state().unwrap();
         assert!(state.encoded_bytes <= capacity);
+        assert_eq!(state.pending_delete_bytes, 0);
+        assert_eq!(state.reserved_bytes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_cache_io_failure_keeps_undeleted_files_within_capacity() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct RestorePermissions(PathBuf, fs::Permissions);
+
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x4B; 16]);
+        let (first_ref, first_bytes) = encoded_object(0xB1);
+        let (second_ref, second_bytes) = encoded_object(0xB2);
+        let capacity = first_bytes.len() as u64;
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
+        fetch(&cache, first_ref, &first_bytes);
+
+        let restore = RestorePermissions(
+            cache.directory.clone(),
+            fs::metadata(&cache.directory).unwrap().permissions(),
+        );
+        fs::set_permissions(&cache.directory, fs::Permissions::from_mode(0o0)).unwrap();
+        if fs::read(cache.object_path(first_ref.object_id)).is_ok() {
+            eprintln!("skipping permission denial: this process bypasses directory permissions");
+            return;
+        }
+        let fallback = cache.get_or_fetch(first_ref, |_, _| Ok(first_bytes.clone()));
+        drop(restore);
+        assert_eq!(fallback.unwrap(), first_bytes);
+        assert_eq!(fetch(&cache, second_ref, &second_bytes), second_bytes);
+
+        let object_bytes: u64 = fs::read_dir(&cache.directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "obj"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert_eq!(object_bytes, capacity);
+        assert!(!cache.object_path(first_ref.object_id).exists());
+        assert_eq!(cache.lock_state().unwrap().encoded_bytes, capacity);
+    }
+
+    #[test]
+    fn failed_unlink_retains_charge_through_eviction_rollback_and_same_key_refill() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x4C; 16]);
+        let (reference, bytes) = encoded_object(0xB3);
+        let capacity = (bytes.len() * 2) as u64;
+        let replacement = encode_object(ObjectType::ArtifactBlob, &[0xB4; 528]).unwrap();
+        let replacement_ref = ObjectRef::from_encoded(&replacement).unwrap();
+        assert_eq!(replacement.len() as u64, capacity);
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
+        fetch(&cache, reference, &bytes);
+        let object_path = cache.object_path(reference.object_id);
+        fs::remove_file(&object_path).unwrap();
+        fs::create_dir(&object_path).unwrap();
+
+        let result = cache
+            .get_or_fetch(reference, |_, _| {
+                // A directory obstructs both reading and unlinking, even as root.
+                assert_eq!(
+                    cache.lock_state().unwrap().encoded_bytes,
+                    bytes.len() as u64
+                );
+                let mut eviction = cache
+                    .reserve_install(replacement_ref.object_id, capacity)
+                    .unwrap()
+                    .unwrap();
+                {
+                    let state = cache.lock_state().unwrap();
+                    assert_eq!(state.encoded_bytes, 0);
+                    assert_eq!(state.pending_delete_bytes, bytes.len() as u64);
+                    assert_eq!(state.reserved_bytes, capacity);
+                }
+                assert!(
+                    cache
+                        .reserve_install(reference.object_id, bytes.len() as u64)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(eviction.delete_victim(0).is_err());
+                drop(eviction);
+                {
+                    let state = cache.lock_state().unwrap();
+                    assert_eq!(state.encoded_bytes, bytes.len() as u64);
+                    assert_eq!(state.pending_delete_bytes, 0);
+                    assert_eq!(state.reserved_bytes, 0);
+                    assert!(state.evicting_keys.is_empty());
+                }
+
+                // Recover local access before the fill installs its result. The
+                // retained indexed object must not receive a second byte charge.
+                fs::remove_dir(&object_path).unwrap();
+                fs::write(&object_path, &bytes).unwrap();
+                Ok(bytes.clone())
+            })
+            .unwrap();
+        assert_eq!(result, bytes);
+        let state = cache.lock_state().unwrap();
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.encoded_bytes, bytes.len() as u64);
         assert_eq!(state.pending_delete_bytes, 0);
         assert_eq!(state.reserved_bytes, 0);
     }
