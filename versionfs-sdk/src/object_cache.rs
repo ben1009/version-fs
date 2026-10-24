@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use thiserror::Error;
 use versionfs_core::format::{FormatError, MAX_ENCODED_OBJECT_BYTES, ObjectRef};
 use versionfs_core::identity::{ObjectId, WorkspaceId};
@@ -45,11 +45,160 @@ struct CacheEntry {
     last_access: u64,
 }
 
+#[derive(Clone)]
+struct CacheVictim {
+    key: CacheKey,
+    entry: CacheEntry,
+    path: PathBuf,
+}
+
+type SharedResult = Result<Option<Arc<[u8]>>, SharedCacheError>;
+
 #[derive(Default)]
 struct CacheState {
     entries: HashMap<CacheKey, CacheEntry>,
     encoded_bytes: u64,
+    reserved_bytes: u64,
     access_clock: u64,
+    in_flight: HashMap<CacheKey, Arc<InFlight>>,
+}
+
+#[derive(Default)]
+struct InFlight {
+    result: Mutex<Option<SharedResult>>,
+    ready: Condvar,
+}
+
+#[derive(Clone)]
+enum SharedCacheError {
+    Format(FormatError),
+    Fetch(Arc<str>),
+    Io {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: Arc<str>,
+    },
+    Poisoned,
+}
+
+impl SharedCacheError {
+    fn from_cache_error(error: CacheError) -> Self {
+        match error {
+            CacheError::Format(error) => Self::Format(error),
+            CacheError::Fetch(message) => Self::Fetch(Arc::from(message)),
+            CacheError::Io { path, source } => Self::Io {
+                path,
+                kind: source.kind(),
+                message: Arc::from(source.to_string()),
+            },
+            CacheError::Poisoned => Self::Poisoned,
+        }
+    }
+
+    fn into_cache_error(self) -> CacheError {
+        match self {
+            Self::Format(error) => CacheError::Format(error),
+            Self::Fetch(message) => CacheError::Fetch(message.to_string()),
+            Self::Io {
+                path,
+                kind,
+                message,
+            } => CacheError::Io {
+                path,
+                source: std::io::Error::new(kind, message.to_string()),
+            },
+            Self::Poisoned => CacheError::Poisoned,
+        }
+    }
+}
+
+impl InFlight {
+    fn wait(&self) -> SharedResult {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while result.is_none() {
+            result = self
+                .ready
+                .wait(result)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        result.as_ref().expect("result was checked above").clone()
+    }
+
+    fn complete(&self, result: SharedResult) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(result);
+        self.ready.notify_all();
+    }
+}
+
+struct CapacityReservation<'a> {
+    cache: &'a WorkspaceObjectCache,
+    bytes: u64,
+    victims: Vec<Option<CacheVictim>>,
+    active: bool,
+}
+
+impl CapacityReservation<'_> {
+    fn delete_victim(&mut self, index: usize) -> Result<(), CacheError> {
+        let Some(victim) = self.victims[index].as_ref() else {
+            return Ok(());
+        };
+        match fs::remove_file(&victim.path) {
+            Ok(()) => self.victims[index] = None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.victims[index] = None;
+            }
+            Err(source) => {
+                return Err(CacheError::Io {
+                    path: victim.path.clone(),
+                    source,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(mut self, object_id: ObjectId, encoded_len: u64) -> Result<(), CacheError> {
+        let mut state = self.cache.lock_state()?;
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+        state.encoded_bytes = state.encoded_bytes.saturating_add(encoded_len);
+        let access = next_access(&mut state);
+        state.entries.insert(
+            CacheKey(object_id),
+            CacheEntry {
+                encoded_len,
+                last_access: access,
+            },
+        );
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for CapacityReservation<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for victim in self.victims.iter().flatten() {
+            if !state.entries.contains_key(&victim.key) {
+                state.encoded_bytes = state.encoded_bytes.saturating_add(victim.entry.encoded_len);
+                state.entries.insert(victim.key, victim.entry);
+            }
+        }
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+    }
 }
 
 struct TemporaryPath(PathBuf);
@@ -62,9 +211,10 @@ impl Drop for TemporaryPath {
 
 /// Bounded clean-object cache for one workspace.
 ///
-/// Every fill is verified before atomic installation. A single local lock
-/// coordinates misses so concurrent readers do not fetch the same object twice.
-/// The cache stores immutable objects only; dirty block and control state use
+/// Every fill is verified before atomic installation. Per-object in-flight
+/// coordination deduplicates concurrent misses while unrelated object reads
+/// proceed independently. Cache I/O never holds the shared index lock. The
+/// cache stores immutable objects only; dirty block and control state use
 /// separate caller-owned storage.
 pub struct WorkspaceObjectCache {
     workspace_id: WorkspaceId,
@@ -138,53 +288,108 @@ impl WorkspaceObjectCache {
         fetch: impl FnOnce(ObjectId) -> Result<Option<Vec<u8>>, String>,
     ) -> Result<Option<Vec<u8>>, CacheError> {
         let key = CacheKey(object_id);
-        let mut state = self.lock_state()?;
-        let path = self.object_path(object_id);
-
-        if state.entries.contains_key(&key) {
-            match read_file(&path) {
-                Ok(bytes)
-                    if ObjectRef::from_encoded(&bytes).is_ok_and(|r| r.object_id == object_id) =>
-                {
-                    touch(&mut state, key);
-                    return Ok(Some(bytes));
-                }
-                Ok(_) => self.remove_entry(&mut state, key, &path)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    self.remove_entry(&mut state, key, &path)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                    self.remove_entry(&mut state, key, &path)?;
-                }
-                Err(source) => {
-                    return Err(CacheError::Io { path, source });
-                }
-            }
+        let (flight, is_leader) = match self.acquire_flight(key) {
+            Ok(flight) => flight,
+            Err(CacheError::Poisoned) => return fetch_verified(object_id, fetch),
+            Err(error) => return Err(error),
+        };
+        if !is_leader {
+            return flight
+                .wait()
+                .map(|result| result.map(|bytes| bytes.to_vec()))
+                .map_err(SharedCacheError::into_cache_error);
         }
 
-        let Some(bytes) = fetch(object_id).map_err(CacheError::Fetch)? else {
+        let result = self.read_cached_or_fetch(key, fetch);
+        let shared_result = result
+            .map(|result| result.map(Arc::<[u8]>::from))
+            .map_err(SharedCacheError::from_cache_error);
+        flight.complete(shared_result.clone());
+        self.release_flight(key, &flight);
+        shared_result
+            .map(|result| result.map(|bytes| bytes.to_vec()))
+            .map_err(SharedCacheError::into_cache_error)
+    }
+
+    fn acquire_flight(&self, key: CacheKey) -> Result<(Arc<InFlight>, bool), CacheError> {
+        let mut state = self.lock_state()?;
+        if let Some(flight) = state.in_flight.get(&key) {
+            return Ok((Arc::clone(flight), false));
+        }
+        let flight = Arc::new(InFlight::default());
+        state.in_flight.insert(key, Arc::clone(&flight));
+        Ok((flight, true))
+    }
+
+    fn release_flight(&self, key: CacheKey, flight: &Arc<InFlight>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .in_flight
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            state.in_flight.remove(&key);
+        }
+    }
+
+    fn read_cached_or_fetch(
+        &self,
+        key: CacheKey,
+        fetch: impl FnOnce(ObjectId) -> Result<Option<Vec<u8>>, String>,
+    ) -> Result<Option<Vec<u8>>, CacheError> {
+        if let Some(bytes) = self.read_cached(key) {
+            return Ok(Some(bytes));
+        }
+
+        let Some(bytes) = fetch_verified(key.0, fetch)? else {
             return Ok(None);
         };
         let reference = ObjectRef::from_encoded(&bytes)?;
-        if reference.object_id != object_id {
-            return Err(FormatError::ObjectReferenceMismatch.into());
-        }
         if reference.encoded_len <= self.capacity_bytes {
-            self.install(&mut state, reference.object_id, &bytes)?;
+            // A local cache fill is optional; the verified backing bytes remain usable.
+            let _ = self.install(reference.object_id, &bytes);
         }
         Ok(Some(bytes))
     }
 
-    fn install(
-        &self,
-        state: &mut CacheState,
-        object_id: ObjectId,
-        bytes: &[u8],
-    ) -> Result<(), CacheError> {
-        let path = self.object_path(object_id);
-        let encoded_len = bytes.len() as u64;
-        self.evict_to_fit(state, encoded_len, object_id)?;
+    fn read_cached(&self, key: CacheKey) -> Option<Vec<u8>> {
+        let is_indexed = self
+            .lock_state()
+            .is_ok_and(|state| state.entries.contains_key(&key));
+        if !is_indexed {
+            return None;
+        }
 
+        let path = self.object_path(key.0);
+        let bytes = read_file(&path).ok().filter(|bytes| {
+            ObjectRef::from_encoded(bytes).is_ok_and(|reference| reference.object_id == key.0)
+        });
+        if let Some(bytes) = bytes {
+            if let Ok(mut state) = self.lock_state() {
+                touch(&mut state, key);
+            }
+            return Some(bytes);
+        }
+
+        self.remove_entry_index(key);
+        let _ = fs::remove_file(path);
+        None
+    }
+
+    fn install(&self, object_id: ObjectId, bytes: &[u8]) -> Result<(), CacheError> {
+        let encoded_len = bytes.len() as u64;
+        let Some(reservation) = self.reserve_install(object_id, encoded_len)? else {
+            return Ok(());
+        };
+        let mut reservation = reservation;
+        for index in 0..reservation.victims.len() {
+            reservation.delete_victim(index)?;
+        }
+
+        let path = self.object_path(object_id);
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let temp_path = self
             .directory
@@ -204,68 +409,82 @@ impl WorkspaceObjectCache {
             path: path.clone(),
             source,
         })?;
-
-        let key = CacheKey(object_id);
-        if let Some(previous) = state.entries.remove(&key) {
-            state.encoded_bytes = state.encoded_bytes.saturating_sub(previous.encoded_len);
-        }
-        state.encoded_bytes = state.encoded_bytes.saturating_add(encoded_len);
-        let access = next_access(state);
-        state.entries.insert(
-            key,
-            CacheEntry {
-                encoded_len,
-                last_access: access,
-            },
-        );
-        Ok(())
+        reservation.commit(object_id, encoded_len)
     }
 
-    fn evict_to_fit(
+    fn reserve_install(
         &self,
-        state: &mut CacheState,
-        incoming_bytes: u64,
         protected_id: ObjectId,
-    ) -> Result<(), CacheError> {
-        while state.encoded_bytes.saturating_add(incoming_bytes) > self.capacity_bytes {
-            let Some((key, _)) = state
+        incoming_bytes: u64,
+    ) -> Result<Option<CapacityReservation<'_>>, CacheError> {
+        let mut state = self.lock_state()?;
+        if incoming_bytes.saturating_add(state.reserved_bytes) > self.capacity_bytes {
+            return Ok(None);
+        }
+        let required_bytes = state
+            .encoded_bytes
+            .saturating_add(state.reserved_bytes)
+            .saturating_add(incoming_bytes)
+            .saturating_sub(self.capacity_bytes);
+        let reclaimable_bytes = state
+            .entries
+            .iter()
+            .filter(|(key, _)| key.0 != protected_id)
+            .map(|(_, entry)| entry.encoded_len)
+            .fold(0_u64, u64::saturating_add);
+        if reclaimable_bytes < required_bytes {
+            return Ok(None);
+        }
+
+        let mut victims: Vec<Option<CacheVictim>> = Vec::new();
+        while state
+            .encoded_bytes
+            .saturating_add(state.reserved_bytes)
+            .saturating_add(incoming_bytes)
+            > self.capacity_bytes
+        {
+            let Some(key) = state
                 .entries
                 .iter()
                 .filter(|(key, _)| key.0 != protected_id)
                 .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(key, entry)| (*key, *entry))
+                .map(|(key, _)| *key)
             else {
-                break;
+                for victim in victims.into_iter().flatten() {
+                    state.encoded_bytes =
+                        state.encoded_bytes.saturating_add(victim.entry.encoded_len);
+                    state.entries.insert(victim.key, victim.entry);
+                }
+                return Ok(None);
             };
-            self.remove_entry(state, key, &self.object_path(key.0))?;
-        }
-        Ok(())
-    }
-
-    fn remove_entry(
-        &self,
-        state: &mut CacheState,
-        key: CacheKey,
-        path: &Path,
-    ) -> Result<(), CacheError> {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(CacheError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
+            if let Some(entry) = state.entries.remove(&key) {
+                state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_len);
+                victims.push(Some(CacheVictim {
+                    key,
+                    entry,
+                    path: self.object_path(key.0),
+                }));
             }
         }
-        if let Some(entry) = state.entries.remove(&key) {
+        state.reserved_bytes = state.reserved_bytes.saturating_add(incoming_bytes);
+        Ok(Some(CapacityReservation {
+            cache: self,
+            bytes: incoming_bytes,
+            victims,
+            active: true,
+        }))
+    }
+
+    fn remove_entry_index(&self, key: CacheKey) {
+        if let Ok(mut state) = self.lock_state()
+            && let Some(entry) = state.entries.remove(&key)
+        {
             state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_len);
         }
-        Ok(())
     }
 
     fn rebuild_index(&mut self) -> Result<(), CacheError> {
-        let mut state = self.lock_state()?;
+        let mut state = CacheState::default();
         for item in fs::read_dir(&self.directory).map_err(|source| CacheError::Io {
             path: self.directory.clone(),
             source,
@@ -330,8 +549,17 @@ impl WorkspaceObjectCache {
             else {
                 break;
             };
-            self.remove_entry(&mut state, key, &self.object_path(key.0))?;
+            let path = self.object_path(key.0);
+            if let Some(entry) = state.entries.remove(&key) {
+                state.encoded_bytes = state.encoded_bytes.saturating_sub(entry.encoded_len);
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(CacheError::Io { path, source }),
+            }
         }
+        *self.state.get_mut().map_err(|_| CacheError::Poisoned)? = state;
         Ok(())
     }
 
@@ -342,6 +570,20 @@ impl WorkspaceObjectCache {
     fn lock_state(&self) -> Result<MutexGuard<'_, CacheState>, CacheError> {
         self.state.lock().map_err(|_| CacheError::Poisoned)
     }
+}
+
+fn fetch_verified(
+    object_id: ObjectId,
+    fetch: impl FnOnce(ObjectId) -> Result<Option<Vec<u8>>, String>,
+) -> Result<Option<Vec<u8>>, CacheError> {
+    let Some(bytes) = fetch(object_id).map_err(CacheError::Fetch)? else {
+        return Ok(None);
+    };
+    let reference = ObjectRef::from_encoded(&bytes)?;
+    if reference.object_id != object_id {
+        return Err(FormatError::ObjectReferenceMismatch.into());
+    }
+    Ok(Some(bytes))
 }
 
 /// A cache-backed synchronous map store used by the persistent-map reader.
@@ -382,10 +624,10 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
             return Err(FormatError::ObjectReferenceMismatch.to_string());
         }
         self.backing.put(id, bytes.clone())?;
-        self.cache
-            .get_or_fetch_id(id, |_| Ok(Some(bytes)))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        match self.cache.get_or_fetch_id(id, |_| Ok(Some(bytes))) {
+            Ok(_) | Err(CacheError::Io { .. } | CacheError::Poisoned) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 }
 
@@ -610,6 +852,111 @@ mod tests {
         for worker in workers {
             assert_eq!(worker.join().unwrap(), bytes);
         }
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn different_object_misses_fetch_concurrently() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x3A; 16]);
+        let (first_ref, first_bytes) = encoded_object(0xA3);
+        let (second_ref, second_bytes) = encoded_object(0xB3);
+        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let (release_second_tx, release_second_rx) = std::sync::mpsc::channel();
+
+        let first_cache = Arc::clone(&cache);
+        let first_entered = entered_tx.clone();
+        let first = thread::spawn(move || {
+            first_cache
+                .get_or_fetch(first_ref, |_, _| {
+                    first_entered.send(()).unwrap();
+                    release_first_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                    Ok(first_bytes)
+                })
+                .unwrap()
+        });
+
+        let second_cache = Arc::clone(&cache);
+        let second = thread::spawn(move || {
+            second_cache
+                .get_or_fetch(second_ref, |_, _| {
+                    entered_tx.send(()).unwrap();
+                    release_second_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap();
+                    Ok(second_bytes)
+                })
+                .unwrap()
+        });
+
+        let first_entered = entered_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let second_entered =
+            first_entered && entered_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+        release_first_tx.send(()).unwrap();
+        release_second_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap().len(), 272);
+        assert_eq!(second.join().unwrap().len(), 272);
+        assert!(
+            first_entered && second_entered,
+            "unrelated object fetches must not serialize behind one cache lock"
+        );
+    }
+
+    #[test]
+    fn local_cache_io_failures_do_not_fail_verified_reads_or_backing_writes() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x3B; 16]);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let (read_ref, read_bytes) = encoded_object(0xC3);
+        fs::create_dir(cache.object_path(read_ref.object_id)).unwrap();
+
+        let read_result = cache
+            .get_or_fetch(read_ref, |_, _| Ok(read_bytes.clone()))
+            .unwrap();
+        assert_eq!(read_result, read_bytes);
+
+        let workspace = WorkspaceId::from_bytes([0x3C; 16]);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let (write_ref, write_bytes) = encoded_object(0xD3);
+        fs::create_dir(cache.object_path(write_ref.object_id)).unwrap();
+        let mut store = CachedMapStore::new(MemoryStore::default(), cache);
+
+        assert!(
+            store
+                .put(ObjectId::from_bytes([0; 32]), write_bytes.clone())
+                .is_err()
+        );
+        assert!(store.backing().objects.is_empty());
+        store.put(write_ref.object_id, write_bytes.clone()).unwrap();
+        assert_eq!(store.get(write_ref.object_id).unwrap(), Some(write_bytes));
+        assert_eq!(store.backing().gets.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unreadable_cached_file_falls_back_to_the_verified_backend() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x3D; 16]);
+        let (reference, bytes) = encoded_object(0xE3);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        fetch(&cache, reference, &bytes);
+
+        let object_path = cache.object_path(reference.object_id);
+        fs::remove_file(&object_path).unwrap();
+        fs::create_dir(&object_path).unwrap();
+        let fetches = AtomicUsize::new(0);
+        let result = cache
+            .get_or_fetch(reference, |_, _| {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(bytes.clone())
+            })
+            .unwrap();
+
+        assert_eq!(result, bytes);
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
     }
 

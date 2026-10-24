@@ -152,6 +152,11 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
         );
         complete(queue, tag, buffer, result, &queue_errors);
     });
+
+    // The ublk library returns from this loop when its io_uring wait fails or
+    // the device queue stops. Notify the control loop so an unexpected exit
+    // cannot leave `run_device` waiting indefinitely for explicit shutdown.
+    let _ = queue_errors.send(());
 }
 
 fn dispatch_request<S: MapObjectStore + Send>(
