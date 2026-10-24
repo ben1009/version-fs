@@ -117,7 +117,11 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         let output_len = usize::try_from(length).map_err(|_| {
             versionfs_core::format::FormatError::InvalidGeometry("range does not fit memory")
         })?;
-        let mut output = vec![0; output_len];
+        let mut output = Vec::new();
+        output.try_reserve_exact(output_len).map_err(|_| {
+            versionfs_core::format::FormatError::InvalidGeometry("range does not fit memory")
+        })?;
+        output.resize(output_len, 0);
         let extent_bytes = u64::from(EXTENT_BYTES);
         let mut position = offset;
         let mut copied = 0_usize;
@@ -277,7 +281,9 @@ mod tests {
     use super::{BlockError, BlockRequest, BlockResponse, DirtyVolume};
     use crate::volume::EXTENT_SIZE;
     use std::collections::HashMap;
-    use versionfs_core::format::{ObjectRef, ObjectType, VolumeGeometry, encode_object};
+    use versionfs_core::format::{
+        FormatError, ObjectRef, ObjectType, VolumeGeometry, encode_object,
+    };
     use versionfs_core::identity::{ObjectId, ObjectStoreScopeId};
     use versionfs_core::persistent_map::MapObjectStore;
     use versionfs_core::views::VolumeExtentMap;
@@ -341,6 +347,21 @@ mod tests {
         assert_eq!(volume.read(0, model.len() as u64).unwrap(), model);
         assert_eq!(volume.dirty_extent_count(), 3);
         assert_eq!(volume.dirty_bytes(), 3 * EXTENT_SIZE);
+    }
+
+    #[test]
+    fn dirty_volume_reads_reject_ranges_too_large_for_memory() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(1_u64 << 63).unwrap();
+        let base = VolumeExtentMap::empty(geometry, &mut store).unwrap();
+        let volume = DirtyVolume::new(store, base, EXTENT_SIZE).unwrap();
+
+        assert!(matches!(
+            volume.read(0, 1_u64 << 63),
+            Err(BlockError::Format(FormatError::InvalidGeometry(
+                "range does not fit memory"
+            )))
+        ));
     }
 
     #[test]

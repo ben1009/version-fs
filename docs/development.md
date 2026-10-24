@@ -18,6 +18,11 @@ protected-root range reads, structural extent diff, and the opt-in single-queue
 ublk adapter. The adapter advertises a volatile cache and rejects FLUSH/FUA until
 P6 provides the remote durability path. Later control protocols remain
 unimplemented.
+
+Workspace cache directories have one owner at a time; drop the prior cache
+handle before reopening its directory. An exclusive file lock also prevents
+another process from rebuilding or filling that same cache concurrently.
+
 Validated view handles seal without reading their map nodes. Imported volume
 handles can retain the result of `VolumeExtentMap::validate` to check metadata
 once before later mutations; named-map opens validate entries and retain counts.

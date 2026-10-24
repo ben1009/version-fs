@@ -14,6 +14,8 @@ use versionfs_core::persistent_map::MapObjectStore;
 
 const KERNEL_SECTOR_BYTES: u64 = 512;
 const UBLK_IO_F_FUA: u32 = 1 << 13;
+type QueueInitializer =
+    for<'device> fn(u16, &'device UblkDev) -> Result<UblkQueue<'device>, UblkError>;
 
 /// Serves one fixed-size, single-queue ublk device.
 ///
@@ -25,6 +27,15 @@ pub fn run_device<S: MapObjectStore + Send + 'static>(
     name: &str,
     volume: Arc<Mutex<DirtyVolume<S>>>,
     shutdown: mpsc::Receiver<()>,
+) -> Result<i32, UblkError> {
+    run_device_with_queue_initializer(name, volume, shutdown, UblkQueue::new)
+}
+
+fn run_device_with_queue_initializer<S: MapObjectStore + Send + 'static>(
+    name: &str,
+    volume: Arc<Mutex<DirtyVolume<S>>>,
+    shutdown: mpsc::Receiver<()>,
+    initialize_queue: QueueInitializer,
 ) -> Result<i32, UblkError> {
     let capacity_bytes = match volume.lock() {
         Ok(volume) => volume.geometry().capacity_bytes,
@@ -42,8 +53,10 @@ pub fn run_device<S: MapObjectStore + Send + 'static>(
     let queue_error_receiver = Mutex::new(queue_error_receiver);
     let control_failed = Arc::new(AtomicBool::new(false));
     let control_failed_flag = Arc::clone(&control_failed);
+    let queue_start_error = Arc::new(Mutex::new(None));
+    let queue_start_error_for_thread = Arc::clone(&queue_start_error);
 
-    ctrl.run_target(
+    let run_result = ctrl.run_target(
         move |device| {
             device.set_default_params(capacity_bytes);
             device.tgt.params.basic.logical_bs_shift = 12;
@@ -60,6 +73,8 @@ pub fn run_device<S: MapObjectStore + Send + 'static>(
                 device,
                 Arc::clone(&queue_volume),
                 queue_error_sender.clone(),
+                Arc::clone(&queue_start_error_for_thread),
+                initialize_queue,
             );
         },
         move |device_control| {
@@ -104,7 +119,17 @@ pub fn run_device<S: MapObjectStore + Send + 'static>(
                 control_failed_flag.store(true, Ordering::Release);
             }
         },
-    )?;
+    );
+
+    if let Some(error) = queue_start_error
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        ctrl.del_dev()?;
+        return Err(error);
+    }
+    run_result?;
 
     ctrl.del_dev()?;
     if control_failed.load(Ordering::Acquire) {
@@ -118,14 +143,24 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
     device: &UblkDev,
     volume: Arc<Mutex<DirtyVolume<S>>>,
     queue_errors: mpsc::Sender<()>,
+    queue_start_error: Arc<Mutex<Option<UblkError>>>,
+    initialize_queue: QueueInitializer,
 ) {
     let buffers = Rc::new(RefCell::new(device.alloc_queue_io_bufs()));
-    let queue = match UblkQueue::new(queue_id, device).and_then(|queue| {
+    let queue = match initialize_queue(queue_id, device).and_then(|queue| {
         queue.submit_fetch_commands_unified(BufDescList::Slices(Some(&buffers.borrow())))
     }) {
         Ok(queue) => queue,
         Err(error) => {
             eprintln!("failed to start ublk queue: {error}");
+            *queue_start_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+            // libublk 0.4.8 waits for buffer registration before running the
+            // control callback. Its only public registration-failure signal is
+            // the mlock flag; use it to abort that wait, then return the actual
+            // setup error saved above instead of the internal EPERM sentinel.
+            device.notify_buffer_registration_complete(true);
             let _ = queue_errors.send(());
             return;
         }
@@ -272,6 +307,30 @@ mod tests {
             self.0.insert(id, bytes);
             Ok(())
         }
+    }
+
+    #[test]
+    #[ignore = "requires privileged Linux with /dev/ublk-control"]
+    fn ublk_queue_setup_failure_returns_without_waiting_for_registration() {
+        fn fail_queue_setup(_queue_id: u16, _device: &UblkDev) -> Result<UblkQueue<'_>, UblkError> {
+            Err(UblkError::OtherError(-libc::ENOMEM))
+        }
+
+        let mut store = Store::default();
+        let root =
+            VolumeExtentMap::empty(VolumeGeometry::new(65_536).unwrap(), &mut store).unwrap();
+        let volume = Arc::new(Mutex::new(DirtyVolume::new(store, root, 65_536).unwrap()));
+        let (_shutdown_sender, shutdown) = mpsc::channel();
+
+        assert!(matches!(
+            run_device_with_queue_initializer(
+                "versionfs-queue-failure-test",
+                volume,
+                shutdown,
+                fail_queue_setup,
+            ),
+            Err(UblkError::OtherError(error)) if error == -libc::ENOMEM
+        ));
     }
 
     #[test]

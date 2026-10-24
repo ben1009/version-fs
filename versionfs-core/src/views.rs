@@ -187,7 +187,11 @@ impl VolumeExtentMap {
         self.geometry.validate_range(offset, length)?;
         let output_len = usize::try_from(length)
             .map_err(|_| FormatError::InvalidGeometry("range does not fit memory"))?;
-        let mut output = vec![0; output_len];
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| FormatError::InvalidGeometry("range does not fit memory"))?;
+        output.resize(output_len, 0);
         let extent_bytes = u64::from(EXTENT_BYTES);
         let mut position = offset;
         let mut written = 0_usize;
@@ -1097,6 +1101,20 @@ mod tests {
         assert!(matches!(
             map.read_range(&store, 0, 4096),
             Err(ViewError::Format(FormatError::ObjectReferenceMismatch))
+        ));
+    }
+
+    #[test]
+    fn volume_range_reads_reject_ranges_too_large_for_memory() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(1_u64 << 63).unwrap();
+        let map = VolumeExtentMap::empty(geometry, &mut store).unwrap();
+
+        assert!(matches!(
+            map.read_range(&store, 0, 1_u64 << 63),
+            Err(ViewError::Format(FormatError::InvalidGeometry(
+                "range does not fit memory"
+            )))
         ));
     }
 

@@ -12,6 +12,7 @@ use versionfs_core::identity::{ObjectId, WorkspaceId};
 use versionfs_core::persistent_map::MapObjectStore;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+const CACHE_LOCK_FILE: &str = ".lock";
 
 /// Errors returned by the verified local object cache.
 #[derive(Debug, Error)]
@@ -139,6 +140,32 @@ impl InFlight {
     }
 }
 
+struct FillLeader<'a> {
+    cache: &'a WorkspaceObjectCache,
+    key: CacheKey,
+    flight: Arc<InFlight>,
+    completed: bool,
+}
+
+impl FillLeader<'_> {
+    fn complete(mut self, result: SharedResult) {
+        self.flight.complete(result);
+        self.cache.release_flight(self.key, &self.flight);
+        self.completed = true;
+    }
+}
+
+impl Drop for FillLeader<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.flight.complete(Err(SharedCacheError::Fetch(Arc::from(
+                "object cache fill was interrupted",
+            ))));
+            self.cache.release_flight(self.key, &self.flight);
+        }
+    }
+}
+
 struct CapacityReservation<'a> {
     cache: &'a WorkspaceObjectCache,
     bytes: u64,
@@ -241,10 +268,14 @@ pub struct WorkspaceObjectCache {
     directory: PathBuf,
     capacity_bytes: u64,
     state: Mutex<CacheState>,
+    _directory_lock: File,
 }
 
 impl WorkspaceObjectCache {
     /// Opens a cache directory scoped to one workspace and indexes valid files.
+    ///
+    /// The directory is exclusively locked until this cache is dropped. Another
+    /// handle or process opening the same directory receives an I/O error.
     pub fn open(
         root: impl AsRef<Path>,
         workspace_id: WorkspaceId,
@@ -269,11 +300,28 @@ impl WorkspaceObjectCache {
             });
         }
 
+        let lock_path = directory.join(CACHE_LOCK_FILE);
+        let directory_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|source| CacheError::Io {
+                path: lock_path.clone(),
+                source,
+            })?;
+        directory_lock.try_lock().map_err(|source| CacheError::Io {
+            path: lock_path,
+            source: source.into(),
+        })?;
+
         let mut cache = Self {
             workspace_id,
             directory,
             capacity_bytes,
             state: Mutex::new(CacheState::default()),
+            _directory_lock: directory_lock,
         };
         cache.rebuild_index()?;
         Ok(cache)
@@ -320,12 +368,17 @@ impl WorkspaceObjectCache {
                 .map_err(SharedCacheError::into_cache_error);
         }
 
+        let leader = FillLeader {
+            cache: self,
+            key,
+            flight,
+            completed: false,
+        };
         let result = self.read_cached_or_fetch(key, fetch);
         let shared_result = result
             .map(|result| result.map(Arc::<[u8]>::from))
             .map_err(SharedCacheError::from_cache_error);
-        flight.complete(shared_result.clone());
-        self.release_flight(key, &flight);
+        leader.complete(shared_result.clone());
         shared_result
             .map(|result| result.map(|bytes| bytes.to_vec()))
             .map_err(SharedCacheError::into_cache_error)
@@ -529,6 +582,9 @@ impl WorkspaceObjectCache {
                 source,
             })?;
             let path = item.path();
+            if item.file_name() == CACHE_LOCK_FILE {
+                continue;
+            }
             let kind = item.file_type().map_err(|source| CacheError::Io {
                 path: path.clone(),
                 source,
@@ -720,7 +776,7 @@ fn object_id_from_file_name(path: &Path) -> Option<ObjectId> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheError, CachedMapStore, WorkspaceObjectCache};
+    use super::{CacheError, CacheKey, CachedMapStore, SharedCacheError, WorkspaceObjectCache};
     use std::collections::HashMap;
     use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
@@ -771,6 +827,51 @@ mod tests {
     }
 
     #[test]
+    fn workspace_cache_directory_has_one_owner_until_drop() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x3F; 16]);
+        let cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+
+        assert!(matches!(
+            WorkspaceObjectCache::open(&directory.0, workspace, 1024),
+            Err(CacheError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        drop(cache);
+        let _reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        assert!(matches!(
+            WorkspaceObjectCache::open(&directory.0, workspace, 1024),
+            Err(CacheError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn workspace_cache_directory_lock_rejects_another_process() {
+        const CHILD_DIRECTORY: &str = "VERSIONFS_CACHE_LOCK_TEST_DIRECTORY";
+        let workspace = WorkspaceId::from_bytes([0x40; 16]);
+        if let Some(directory) = std::env::var_os(CHILD_DIRECTORY) {
+            assert!(matches!(
+                WorkspaceObjectCache::open(directory, workspace, 1024),
+                Err(CacheError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            return;
+        }
+
+        let directory = TestDirectory::new();
+        let _cache = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("object_cache::tests::workspace_cache_directory_lock_rejects_another_process")
+            .env(CHILD_DIRECTORY, &directory.0)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
     fn verified_cache_fill_is_reused_after_reopen() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x31; 16]);
@@ -789,6 +890,7 @@ mod tests {
         assert_eq!(first, bytes);
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
 
+        drop(cache);
         let reopened = WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap();
         assert_eq!(fetch(&reopened, reference, &[]), bytes);
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -798,8 +900,8 @@ mod tests {
             .collect();
         assert_eq!(
             files.len(),
-            1,
-            "successful fills leave no partial temp file"
+            2,
+            "successful fills leave only the lock and object file"
         );
     }
 
@@ -950,6 +1052,40 @@ mod tests {
     }
 
     #[test]
+    fn panicking_fill_wakes_its_follower_and_allows_retry() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x41; 16]);
+        let (reference, bytes) = encoded_object(0xA4);
+        let cache = Arc::new(WorkspaceObjectCache::open(&directory.0, workspace, 1024).unwrap());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (panic_tx, panic_rx) = std::sync::mpsc::channel();
+        let leader_cache = Arc::clone(&cache);
+        let leader = thread::spawn(move || {
+            leader_cache.get_or_fetch(reference, |_, _| {
+                entered_tx.send(()).unwrap();
+                panic_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                panic!("injected object fetch panic");
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // Join the existing flight before allowing its leader to unwind.
+        let (flight, is_leader) = cache.acquire_flight(CacheKey(reference.object_id)).unwrap();
+        assert!(!is_leader);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let follower = thread::spawn(move || assert!(completed_tx.send(flight.wait()).is_ok()));
+        panic_tx.send(()).unwrap();
+
+        assert!(leader.join().is_err());
+        assert!(matches!(
+            completed_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(SharedCacheError::Fetch(_))
+        ));
+        follower.join().unwrap();
+        assert_eq!(fetch(&cache, reference, &bytes), bytes);
+    }
+
+    #[test]
     fn different_object_misses_fetch_concurrently() {
         let directory = TestDirectory::new();
         let workspace = WorkspaceId::from_bytes([0x3A; 16]);
@@ -1092,7 +1228,7 @@ mod tests {
             fs::read_dir(directory.0.join(workspace.to_string()))
                 .unwrap()
                 .count(),
-            0
+            1
         );
     }
 
