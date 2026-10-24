@@ -27,11 +27,20 @@ pub enum ViewError {
 }
 
 /// Persistent map from logical volume extent number to immutable extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub struct VolumeExtentMap {
     geometry: VolumeGeometry,
     map: PersistentBTree,
+    metadata_validated: bool,
 }
+
+impl PartialEq for VolumeExtentMap {
+    fn eq(&self, other: &Self) -> bool {
+        self.geometry == other.geometry && self.map == other.map
+    }
+}
+
+impl Eq for VolumeExtentMap {}
 
 impl VolumeExtentMap {
     /// Creates a complete empty sparse volume map.
@@ -43,6 +52,7 @@ impl VolumeExtentMap {
         Ok(Self {
             geometry,
             map: PersistentBTree::empty(ObjectType::VolumeMapNode, store)?,
+            metadata_validated: true,
         })
     }
 
@@ -52,6 +62,27 @@ impl VolumeExtentMap {
         Ok(Self {
             geometry: root.geometry,
             map: from_typed_map_root(root.extent_map_root, ObjectType::VolumeMapNode)?,
+            metadata_validated: false,
+        })
+    }
+
+    /// Returns a handle whose complete key/reference metadata has been validated.
+    ///
+    /// Keep this returned handle to avoid rescanning an imported root on later
+    /// seals. Mutations preserve its validation status. Extent payloads and
+    /// durability are checked separately by the Generation graph verifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unavailable/malformed map nodes, out-of-capacity keys,
+    /// or references with an invalid extent type or size.
+    pub fn validate<S: MapObjectStore>(&self, store: &S) -> Result<Self, ViewError> {
+        if !self.metadata_validated {
+            self.entries(store)?;
+        }
+        Ok(Self {
+            metadata_validated: true,
+            ..*self
         })
     }
 
@@ -91,6 +122,7 @@ impl VolumeExtentMap {
         Ok(Self {
             geometry: self.geometry,
             map,
+            metadata_validated: self.metadata_validated,
         })
     }
 
@@ -104,6 +136,7 @@ impl VolumeExtentMap {
         Ok(Self {
             geometry: self.geometry,
             map: self.map.remove(store, &extent_number.to_be_bytes())?,
+            metadata_validated: self.metadata_validated,
         })
     }
 
@@ -125,9 +158,11 @@ impl VolumeExtentMap {
     }
 
     /// Stores a complete volume root for this immutable extent-map version.
+    ///
+    /// Unverified handles validate all metadata here; retain the result of
+    /// [`Self::validate`] to reuse that validation across subsequent mutations.
     pub fn seal<S: MapObjectStore>(&self, store: &mut S) -> Result<ObjectRef, ViewError> {
-        // Validate every key before making a complete root object available.
-        self.entries(store)?;
+        self.validate(store)?;
         let bytes = VolumeRoot {
             geometry: self.geometry,
             extent_map_root: self.map.root(),
@@ -214,6 +249,7 @@ impl LogSegmentIndex {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogMap {
     map: PersistentBTree,
+    entry_count: u64,
 }
 
 impl LogMap {
@@ -221,6 +257,7 @@ impl LogMap {
     pub fn empty<S: MapObjectStore>(store: &mut S) -> Result<Self, ViewError> {
         Ok(Self {
             map: PersistentBTree::empty(ObjectType::LogMapNode, store)?,
+            entry_count: 0,
         })
     }
 
@@ -228,12 +265,18 @@ impl LogMap {
     pub fn open<S: MapObjectStore>(store: &S, root_ref: ObjectRef) -> Result<Self, ViewError> {
         let root = LogMapRoot::decode(&load_verified(store, root_ref)?)?;
         let map = PersistentBTree::from_root(root.log_index_root)?;
-        if map.entries(store)?.len() as u64 != root.log_count {
+        let entry_count = validate_named_map(
+            &map,
+            store,
+            LogMapEntry::decode,
+            "log names must be non-empty UTF-8",
+        )?;
+        if entry_count != root.log_count {
             return Err(
                 FormatError::InvalidNativeView("log count differs from map contents").into(),
             );
         }
-        Ok(Self { map })
+        Ok(Self { map, entry_count })
     }
 
     /// Returns the log state bound to a name, if present.
@@ -259,36 +302,38 @@ impl LogMap {
         if name.is_empty() {
             return Err(FormatError::InvalidNativeView("log name must not be empty").into());
         }
+        let value = entry.encode()?;
+        let exists = self.map.get(store, name.as_bytes())?.is_some();
+        let entry_count = self
+            .entry_count
+            .checked_add(u64::from(!exists))
+            .ok_or(FormatError::InvalidNativeView("log count overflow"))?;
         Ok(Self {
-            map: self
-                .map
-                .insert(store, name.as_bytes().to_vec(), entry.encode()?)?,
+            map: self.map.insert(store, name.as_bytes().to_vec(), value)?,
+            entry_count,
         })
     }
 
     /// Returns a new map with a named log removed.
     pub fn remove<S: MapObjectStore>(&self, store: &mut S, name: &str) -> Result<Self, ViewError> {
+        let exists = self.map.get(store, name.as_bytes())?.is_some();
+        let entry_count = self
+            .entry_count
+            .checked_sub(u64::from(exists))
+            .ok_or(FormatError::InvalidNativeView("log count underflow"))?;
         Ok(Self {
             map: self.map.remove(store, name.as_bytes())?,
+            entry_count,
         })
     }
 
     /// Stores the complete named-log root for this map version.
     pub fn seal<S: MapObjectStore>(&self, store: &mut S) -> Result<ObjectRef, ViewError> {
-        let entries = self.map.entries(store)?;
-        for (name, value) in &entries {
-            if name.is_empty() || std::str::from_utf8(name).is_err() {
-                return Err(
-                    FormatError::InvalidNativeView("log names must be non-empty UTF-8").into(),
-                );
-            }
-            LogMapEntry::decode(value)?;
-        }
         store_encoded(
             store,
             LogMapRoot {
                 log_index_root: self.map.root(),
-                log_count: entries.len() as u64,
+                log_count: self.entry_count,
             }
             .encode()?,
         )
@@ -299,6 +344,7 @@ impl LogMap {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactMap {
     map: PersistentBTree,
+    entry_count: u64,
 }
 
 impl ArtifactMap {
@@ -306,6 +352,7 @@ impl ArtifactMap {
     pub fn empty<S: MapObjectStore>(store: &mut S) -> Result<Self, ViewError> {
         Ok(Self {
             map: PersistentBTree::empty(ObjectType::ArtifactMapNode, store)?,
+            entry_count: 0,
         })
     }
 
@@ -313,12 +360,18 @@ impl ArtifactMap {
     pub fn open<S: MapObjectStore>(store: &S, root_ref: ObjectRef) -> Result<Self, ViewError> {
         let root = ArtifactMapRoot::decode(&load_verified(store, root_ref)?)?;
         let map = PersistentBTree::from_root(root.artifact_index_root)?;
-        if map.entries(store)?.len() as u64 != root.artifact_count {
+        let entry_count = validate_named_map(
+            &map,
+            store,
+            ArtifactDescriptor::decode,
+            "artifact names must be non-empty UTF-8",
+        )?;
+        if entry_count != root.artifact_count {
             return Err(
                 FormatError::InvalidNativeView("artifact count differs from map contents").into(),
             );
         }
-        Ok(Self { map })
+        Ok(Self { map, entry_count })
     }
 
     /// Returns the descriptor bound to a name, if present.
@@ -344,37 +397,38 @@ impl ArtifactMap {
         if name.is_empty() {
             return Err(FormatError::InvalidNativeView("artifact name must not be empty").into());
         }
+        let value = descriptor.encode()?;
+        let exists = self.map.get(store, name.as_bytes())?.is_some();
+        let entry_count = self
+            .entry_count
+            .checked_add(u64::from(!exists))
+            .ok_or(FormatError::InvalidNativeView("artifact count overflow"))?;
         Ok(Self {
-            map: self
-                .map
-                .insert(store, name.as_bytes().to_vec(), descriptor.encode()?)?,
+            map: self.map.insert(store, name.as_bytes().to_vec(), value)?,
+            entry_count,
         })
     }
 
     /// Returns a new map with a named artifact removed.
     pub fn remove<S: MapObjectStore>(&self, store: &mut S, name: &str) -> Result<Self, ViewError> {
+        let exists = self.map.get(store, name.as_bytes())?.is_some();
+        let entry_count = self
+            .entry_count
+            .checked_sub(u64::from(exists))
+            .ok_or(FormatError::InvalidNativeView("artifact count underflow"))?;
         Ok(Self {
             map: self.map.remove(store, name.as_bytes())?,
+            entry_count,
         })
     }
 
     /// Stores the complete named-artifact root for this map version.
     pub fn seal<S: MapObjectStore>(&self, store: &mut S) -> Result<ObjectRef, ViewError> {
-        let entries = self.map.entries(store)?;
-        for (name, value) in &entries {
-            if name.is_empty() || std::str::from_utf8(name).is_err() {
-                return Err(FormatError::InvalidNativeView(
-                    "artifact names must be non-empty UTF-8",
-                )
-                .into());
-            }
-            ArtifactDescriptor::decode(value)?;
-        }
         store_encoded(
             store,
             ArtifactMapRoot {
                 artifact_index_root: self.map.root(),
-                artifact_count: entries.len() as u64,
+                artifact_count: self.entry_count,
             }
             .encode()?,
         )
@@ -497,6 +551,23 @@ fn decode_u64_key(key: &[u8]) -> Result<u64, FormatError> {
     Ok(u64::from_be_bytes(bytes))
 }
 
+/// Validates an imported named map once and retains its exact count in the handle.
+fn validate_named_map<S: MapObjectStore, T>(
+    map: &PersistentBTree,
+    store: &S,
+    decode_value: impl Fn(&[u8]) -> Result<T, FormatError>,
+    invalid_name: &'static str,
+) -> Result<u64, ViewError> {
+    let entries = map.entries(store)?;
+    for (name, value) in &entries {
+        if name.is_empty() || std::str::from_utf8(name).is_err() {
+            return Err(FormatError::InvalidNativeView(invalid_name).into());
+        }
+        decode_value(value)?;
+    }
+    Ok(entries.len() as u64)
+}
+
 fn store_encoded<S: MapObjectStore>(store: &mut S, bytes: Vec<u8>) -> Result<ObjectRef, ViewError> {
     let reference = ObjectRef::from_encoded(&bytes)?;
     store
@@ -527,13 +598,14 @@ fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactChunkIndex, ArtifactMap, LogSegmentIndex, ViewError, VolumeExtentMap, encode_ref,
+        ArtifactChunkIndex, ArtifactMap, LogMap, LogSegmentIndex, ViewError, VolumeExtentMap,
+        encode_ref, store_encoded,
     };
     use crate::format::{
-        ArtifactDescriptor, FormatError, MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType,
-        VolumeGeometry, VolumeRoot,
+        ArtifactDescriptor, ArtifactMapRoot, FormatError, LogMapEntry, LogMapRoot,
+        MAX_PERSISTENT_NODE_BYTES, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
     };
-    use crate::identity::{ArtifactId, ObjectId, ObjectStoreScopeId};
+    use crate::identity::{ArtifactId, LogId, ObjectId, ObjectStoreScopeId};
     use crate::persistent_map::{MapObjectStore, PersistentBTree};
     use std::collections::HashMap;
 
@@ -552,6 +624,184 @@ mod tests {
         fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
             self.0.insert(id, bytes);
             Ok(())
+        }
+    }
+
+    struct NoReadStore<'a>(&'a mut MemoryStore);
+
+    impl MapObjectStore for NoReadStore<'_> {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            self.0.proof_scope()
+        }
+
+        fn get(&self, _id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            Err("unexpected object read while sealing".to_owned())
+        }
+
+        fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+            self.0.put(id, bytes)
+        }
+    }
+
+    #[test]
+    fn validated_volume_seal_does_not_read_map_nodes() {
+        let mut store = MemoryStore::default();
+        let extent = ObjectRef {
+            object_type: ObjectType::Extent,
+            object_id: ObjectId::from_bytes([1; 32]),
+            encoded_len: 16 + 65_536,
+        };
+        let volume = VolumeExtentMap::empty(VolumeGeometry::new(4 * 65_536).unwrap(), &mut store)
+            .unwrap()
+            .insert_extent(&mut store, 0, extent)
+            .unwrap()
+            .remove_extent(&mut store, 1)
+            .unwrap();
+        let root_ref = volume.seal(&mut NoReadStore(&mut store)).unwrap();
+        let root = VolumeRoot::decode(store.0.get(&root_ref.object_id).unwrap()).unwrap();
+        let imported = VolumeExtentMap::from_root(root).unwrap();
+        assert_eq!(volume, imported);
+        assert!(imported.seal(&mut NoReadStore(&mut store)).is_err());
+
+        let validated = imported.validate(&store).unwrap();
+        assert_eq!(
+            validated.seal(&mut NoReadStore(&mut store)).unwrap(),
+            root_ref
+        );
+        let updated = validated.insert_extent(&mut store, 2, extent).unwrap();
+        assert!(updated.seal(&mut NoReadStore(&mut store)).is_ok());
+    }
+
+    #[test]
+    fn log_counts_survive_replacement_and_removal_without_seal_reads() {
+        let mut store = MemoryStore::default();
+        let entry = LogMapEntry {
+            log_id: LogId::from_bytes([1; 16]),
+            first_seq: 0,
+            end_seq: 0,
+            segment_index_root: LogSegmentIndex::empty(&mut store).unwrap().root(),
+        };
+        let logs = LogMap::empty(&mut store)
+            .unwrap()
+            .insert(&mut store, "keep", entry)
+            .unwrap()
+            .insert(
+                &mut store,
+                "keep",
+                LogMapEntry {
+                    first_seq: 1,
+                    end_seq: 1,
+                    ..entry
+                },
+            )
+            .unwrap()
+            .insert(&mut store, "remove", entry)
+            .unwrap()
+            .remove(&mut store, "absent")
+            .unwrap()
+            .remove(&mut store, "remove")
+            .unwrap();
+        let root_ref = logs.seal(&mut NoReadStore(&mut store)).unwrap();
+        let root = LogMapRoot::decode(store.0.get(&root_ref.object_id).unwrap()).unwrap();
+        assert_eq!(root.log_count, 1);
+        let reopened = LogMap::open(&store, root_ref).unwrap();
+        assert_eq!(
+            reopened.seal(&mut NoReadStore(&mut store)).unwrap(),
+            root_ref
+        );
+
+        let empty = reopened.remove(&mut store, "keep").unwrap();
+        let empty_ref = empty.seal(&mut NoReadStore(&mut store)).unwrap();
+        assert_eq!(
+            LogMapRoot::decode(store.0.get(&empty_ref.object_id).unwrap())
+                .unwrap()
+                .log_count,
+            0
+        );
+    }
+
+    #[test]
+    fn artifact_counts_survive_replacement_and_removal_without_seal_reads() {
+        let mut store = MemoryStore::default();
+        let descriptor = ArtifactDescriptor {
+            artifact_id: ArtifactId::from_bytes([1; 16]),
+            logical_len: 0,
+            content_root: ObjectRef {
+                object_type: ObjectType::ArtifactBlob,
+                object_id: ObjectId::from_bytes([2; 32]),
+                encoded_len: 16,
+            },
+            dependencies: Vec::new(),
+        };
+        let replacement = ArtifactDescriptor {
+            artifact_id: ArtifactId::from_bytes([3; 16]),
+            ..descriptor.clone()
+        };
+        let artifacts = ArtifactMap::empty(&mut store)
+            .unwrap()
+            .insert(&mut store, "keep", &descriptor)
+            .unwrap()
+            .insert(&mut store, "keep", &replacement)
+            .unwrap()
+            .insert(&mut store, "remove", &descriptor)
+            .unwrap()
+            .remove(&mut store, "absent")
+            .unwrap()
+            .remove(&mut store, "remove")
+            .unwrap();
+        let root_ref = artifacts.seal(&mut NoReadStore(&mut store)).unwrap();
+        let root = ArtifactMapRoot::decode(store.0.get(&root_ref.object_id).unwrap()).unwrap();
+        assert_eq!(root.artifact_count, 1);
+        let reopened = ArtifactMap::open(&store, root_ref).unwrap();
+        assert_eq!(
+            reopened.seal(&mut NoReadStore(&mut store)).unwrap(),
+            root_ref
+        );
+
+        let empty = reopened.remove(&mut store, "keep").unwrap();
+        let empty_ref = empty.seal(&mut NoReadStore(&mut store)).unwrap();
+        assert_eq!(
+            ArtifactMapRoot::decode(store.0.get(&empty_ref.object_id).unwrap())
+                .unwrap()
+                .artifact_count,
+            0
+        );
+    }
+
+    #[test]
+    fn named_map_open_rejects_malformed_metadata_before_trusting_counts() {
+        for (name, value) in [(vec![0xFF], Vec::new()), (b"name".to_vec(), vec![0xFF])] {
+            let mut store = MemoryStore::default();
+            let log_tree = PersistentBTree::empty(ObjectType::LogMapNode, &mut store)
+                .unwrap()
+                .insert(&mut store, name.clone(), value.clone())
+                .unwrap();
+            let root_ref = store_encoded(
+                &mut store,
+                LogMapRoot {
+                    log_index_root: log_tree.root(),
+                    log_count: 1,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(LogMap::open(&store, root_ref).is_err());
+            let artifact_tree = PersistentBTree::empty(ObjectType::ArtifactMapNode, &mut store)
+                .unwrap()
+                .insert(&mut store, name, value)
+                .unwrap();
+            let root_ref = store_encoded(
+                &mut store,
+                ArtifactMapRoot {
+                    artifact_index_root: artifact_tree.root(),
+                    artifact_count: 1,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(ArtifactMap::open(&store, root_ref).is_err());
         }
     }
 
@@ -643,6 +893,9 @@ mod tests {
             assert!(volume.entries(&store).is_err());
             assert_eq!(volume.extent(&store, 1).unwrap(), None);
             assert_eq!(volume.extent(&store, 2).unwrap(), Some(valid));
+            let changed = volume.insert_extent(&mut store, 1, valid).unwrap();
+            assert!(changed.validate(&store).is_err());
+            assert!(changed.seal(&mut store).is_err());
         }
     }
 

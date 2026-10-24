@@ -14,6 +14,9 @@ ignored and requires a dedicated test bucket. P2 adds the toy-kv Metadata
 Authority adapter and its conformance tests. P3 adds persistent copy-on-write
 maps, typed volume/log/artifact roots, and complete Generation graph verification;
 the ublk data path and later control protocols remain unimplemented.
+Validated view handles seal without reading their map nodes. Imported volume
+handles can retain the result of `VolumeExtentMap::validate` to check metadata
+once before later mutations; named-map opens validate entries and retain counts.
 Tooling checks do not qualify any MVP durability gate.
 
 ## Setup and tools
