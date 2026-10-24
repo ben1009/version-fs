@@ -113,6 +113,9 @@ in-process sanitizer runs skip them.
 All external actions retain upstream commit-SHA pins. Workflows harden runners,
 avoid persisting checkout credentials, and use read-only permissions unless a
 specific reporting job needs more.
+The tools job builds the pinned `cargo-sort` version from registry source because
+its prebuilt release archive fails its published checksum. Other tool downloads
+retain checksum verification.
 
 | Workflow | Coverage |
 | --- | --- |
