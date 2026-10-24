@@ -1,5 +1,6 @@
 //! Version FS formats, persistent maps, and backend-neutral protocols.
 
+pub mod control;
 pub mod fault;
 pub mod format;
 pub mod graph;

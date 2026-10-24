@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0–P3 merged; P1 real-S3 run pending; P2 locally qualified; P4 implemented on this branch |
+| Status | P0–P4 merged; P1 real-S3 run pending; P2 locally qualified; P5 implemented on this branch |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -225,23 +225,48 @@ claiming reliable barriers until P6 is qualified.
 
 ### P5. Control schema and attachment authority
 
-- [ ] Implement operation fingerprints, durable terminal results, query/abort
+- [x] Implement operation fingerprints, durable terminal results, query/abort
   tombstones, fixed identities, branch-name indexes, and exact revision/epoch CAS.
-- [ ] Implement writer/attachment grants, owner incarnation restart fencing, and
+- [x] Implement writer/attachment grants, owner incarnation restart fencing, and
   one writable attachment per branch. Device numbers/filesystem UUIDs are not IDs.
-- [ ] Implement retention eligibility guards, pins, read/live-log protections,
+  Renewal and detach validate the exact volume epoch and protection ID, so a
+  delayed request cannot target a replacement that reuses an attachment ID.
+- [x] Implement retention eligibility guards, pins, read/live-log protections,
   attachment bases, and shared preparation/renewal state from the start.
-- [ ] Add checkpoint capture-token admission: block other head/live mutations,
-  allow only identified drain-flush children until sealing, and retain independent
-  renew/query/abort paths. Definite expiry/fencing resolves token cleanup safely.
+  Retire protections into rootless workspace-lifetime tombstones; delayed requests
+  cannot act on a new protection that reuses an ID across any protection kind.
+- [x] Add checkpoint capture-token admission: block other head/live mutations,
+  wait for ordinary mutation preparations to resolve, allow only identified
+  VolumeBarrier drain-flush children, and retain independent renew/query/abort
+  paths. Preparations bind the exact volume epoch and live attachment-base
+  protection at admission and commit. Definite expiry/fencing resolves token
+  cleanup safely.
+- [x] Persist an exact capture-child reservation when authorizing a drain child.
+  Direct abort of an unstarted child clears the pending slot and tombstones its
+  ID atomically; parent abort/expiry retires the same reservation without scans.
+  All unrelated operation claims respect that reservation. Capture ownership
+  records its caller principal; child authorization/admission, sealing, and
+  cleanup retain that scope even if another caller shares the writer grant.
+- [x] Enforce preparation root scope at admission and commit: volume barriers
+  replace only VolumeRoot, log mutations only the log root, and artifact
+  mutations only the artifact root.
 
 Use the RFC's lease/renewal defaults centrally. Every new heartbeat has an operation
 ID; replay returns its old deadline. Keep terminal fingerprints/results for the
 workspace lifetime and surface capacity exhaustion rather than forgetting IDs.
 
-**Exit evidence:** duplicate creates/acquisitions/renewals return original results;
-changed payloads reject replay; absent-key name claims yield one binding; delayed
-requests lose to abort tombstones; stale grants/devices cannot mutate authority.
+**Exit evidence:** authority-backed integration tests pass against the toy-kv
+adapter. They exercise duplicate results and changed-payload rejection, concurrent
+absent-key branch-name claims, writer/attachment acquisition and restart fencing,
+active-preparation renewal under a refreshed writer grant, exact attachment epochs
+and protection expiry, capture exclusion/admission/sealing/abort, preparation
+renewal and expiry cleanup, direct abort and retry of an unstarted capture child,
+reserved-ID conflicts, cross-principal capture rejection, per-preparation root
+scope, opaque zero-ID preparation cleanup, retired protection-ID rejection,
+pin/read/live-log protection, and retention eligibility
+after close or expiry. This qualifies the backend-neutral P5 control protocol through
+the MVP adapter; it does not qualify live block-device durability, Generation
+publication, or device fencing integration, which remain in P6/P7/P9.
 
 ### P6. Durable barriers and live volume recovery
 

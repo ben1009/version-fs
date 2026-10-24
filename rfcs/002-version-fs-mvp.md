@@ -446,20 +446,33 @@ precommit hook.
 | --- | --- |
 | Workspace | Stable ID, access scope, and retention policy. |
 | Authority owner | Durable incarnation used to fence lease grants across owner restart. |
-| Branch | Stable ID/name, head Generation, revision, writer epoch/lease, volume and stream epochs, live VolumeRoot/log-map root, active attachment, and capture token. |
+| Branch | Stable ID/name, head Generation, revision, writer epoch/lease, volume and stream epochs, live VolumeRoot/log-map/artifact-map roots, active attachment, and capture token. |
 | Name / retention indexes | Point-key name bindings and per-Generation eligibility guards, updated atomically with their referenced records. |
 | Generation | Descriptor reference, publication operation, retention deadline, lifecycle state. |
 | Operation | ID, request fingerprint, phase, allocated identities, prepared dependencies, terminal result. |
-| Protection | Pins, reader leases, attachment base roots, and preparation dependencies, including capture/flush children. |
+| Protection | Pins, reader leases, attachment base roots, preparation dependencies including capture/flush children, and rootless retirement tombstones. |
+| Capture-child reservation | Point-key binding from an authorized child operation ID to its capture and branch, allowing direct abort to release the exact pending-child slot without a scan. |
 | GC report | Report ID, root snapshot/time, inventory window, completeness, and candidate summary/pages. |
 
-These are logical records encoded as versioned keys and values. Branch IDs,
-workspace IDs, and attachment IDs are never reused. Volume and stream epochs
-are never reset or reused within their branch. Deleting and recreating a
-branch name creates a new branch ID. Every head or live-view mutation increments
-its state revision, including durable changes to its live volume or log map. Lease-only
-renewal does not change this revision. Writer ownership changes advance the
-writer epoch. Comparing only head Generation IDs is insufficient for CAS.
+These are logical records encoded as versioned keys and values. Workspace and
+branch IDs are never reused. Volume and stream epochs are never reset or reused
+within their branch. An attachment identity includes its branch and volume
+epoch; an attachment ID may be reused after detach only with a newly allocated
+volume epoch, which continues to fence preparations from the earlier attachment.
+Deleting and recreating a branch name creates a new branch ID. Every head or
+live-view mutation increments its state revision, including durable changes to
+its live volume, log map, or artifact map. Lease-only renewal does not change
+this revision.
+Writer ownership changes advance the writer epoch. Comparing only head
+Generation IDs is insufficient for CAS.
+
+Protection IDs are unique for the workspace lifetime across all protection kinds.
+Close, expiry, detach/fencing, and preparation completion release their references
+and replace the active protection with a permanent retirement tombstone. That
+tombstone retains no Generation, root, or dependency; it prevents a delayed close
+or renewal from acting on a new protection that reuses the ID. New protection
+acquisition requires a fresh ID. Opaque fixed-width IDs reserve no all-zero
+sentinel; encoding and decoding accept the same values.
 
 Normal transactions read and validate their branch, owner, operation, and
 retention/index keys, then buffer all required changes in one `transact` call.
@@ -468,6 +481,13 @@ concurrent change to a read precondition causes a conflict, retried with the
 same operation ID. Independent branches need no exclusive workspace admission
 lock. A GC report uses an authority snapshot without pausing writers or reader
 acquisition. No mutation transaction remains open across S3 I/O.
+
+Each live-root mutation is scoped to its preparation kind: `VolumeBarrier` may
+replace only the live VolumeRoot, `LogMutation` only the live log root, and
+`ArtifactMutation` only the live artifact root. `CheckpointCapture` is not a
+live-root mutation. The authority validates this scope both when a preparation
+is admitted and when its roots are committed. Updating multiple view roots
+requires separate scoped mutations or the Generation capture protocol.
 
 ### 5.3 Idempotent mutations
 
@@ -492,6 +512,11 @@ preconditions, and logical payload. A protected preparation binds its request
 first; checkpoint sealing records the final immutable root once, rejecting a
 different root on retry. Matching retries return the recorded result or resume
 that preparation. Reusing an ID with another request is `OperationMismatch`.
+Authorizing a capture child reserves its operation ID across all mutation kinds
+in the owning caller's namespace. An unrelated mutation or preparation on any
+branch cannot claim that ID while it is reserved, even before an operation
+record exists. Only the identified child preparation or its abort may consume
+the reservation.
 After matching the fingerprint, terminal-result lookup precedes checking the
 preconditions of a new mutation. A replay does not fail merely because the
 head, name, or grant has changed since its original success.
@@ -508,12 +533,18 @@ Generation expires. v0 provides replay-safe idempotency for the workspace
 lifetime at this storage cost. Bounded deduplication windows and safe result
 expiry are deferred; metadata capacity must be provisioned and exhaustion
 handled explicitly.
+Rootless protection retirement records also remain for the workspace lifetime,
+adding to cumulative metadata growth.
 
 `get_operation(id)` reads authoritative state. A timeout means unknown outcome.
 Even `NotFound` does not prove the original request cannot arrive later: retry
 the same ID, or atomically record an abort tombstone before abandoning it.
 `abort_operation(id)` creates that tombstone if absent, aborts a preparation, or
 returns an already committed result. It cannot undo a committed mutation.
+When the ID names an authorized but unstarted capture child, direct abort
+atomically clears the capture's pending-child slot, consumes its reservation,
+and tombstones the child ID. The parent capture may then authorize another
+child; a delayed start using the aborted ID remains rejected.
 
 An old successful result does not extend a lease or retain its objects forever.
 The caller can learn that an operation committed while its returned read lease,
@@ -600,7 +631,17 @@ a filesystem workload, not a native Version FS database participant.
 attachment ID under its exact writer grant and volume epoch. One writable
 attachment is active per branch. A fork gets an independent writable identity;
 reset, detach/replacement, and ownership handover fence the previous attachment.
-Every durable root replacement validates that identity and the writer lease.
+Every protected preparation carries the exact volume epoch and validates the
+current attachment-base protection when it begins, renews, and commits. Reusing
+an attachment ID after detach cannot make a preparation from the prior epoch
+valid. Detach and writer release return `busy` while any mutation preparation
+(including a volume barrier) or capture is pending. These operations do not
+resolve pending work; callers must resolve or let it expire before retrying.
+
+Attachment-base renewal and detach bind the exact attachment ID, volume epoch,
+and protection ID in their request and fingerprint. A delayed request for an
+earlier attachment cannot renew or detach its replacement, including when the
+attachment ID and writer grant are reused.
 
 The worker records the attachment, base root/protection, pending operation IDs,
 and capture/freeze intent outside the exported volume. Control files, block-server
@@ -885,6 +926,17 @@ in v0. The parent Generation ID is not a required content edge.
    from the authority, and then drain active producers. Register the branch
    capture token and protected preparation under those exact pre-drain revision/root
    preconditions and the worker's original attachment/grant/fencing identities.
+   Capture admission requires all ordinary mutation preparations to be resolved;
+   while the token is open, only a `VolumeBarrier` preparation may be admitted as
+   its identified drain-flush child. Authorization stores a point-key reservation
+   for the child operation ID. Log and artifact mutations cannot use that child
+   slot. Aborting an authorized child before it begins atomically clears the
+   pending-child slot, consumes the reservation, and tombstones the child ID, so
+   the capture can continue without allowing a delayed child start.
+   The token records the authenticated principal that owns the capture operation.
+   Child authorization/admission and sealing require that same principal, even
+   when another authorized caller holds the same writer grant. Abort/expiry
+   resolves child reservations and operation IDs in the owning principal's scope.
    A change of ownership fences this attempt; it must not refresh to a new owner.
    A definite acquisition conflict ends this attempt: restart Step 1 with a new
    checkpoint operation ID, fresh pre-drain revision/root preconditions, and a
@@ -1146,7 +1198,7 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 | `create_branch` / `get_branch` | Retained base and identified create, or stable ID/name lookup; returns head, live roots, revisions, epochs, and attachment state. |
 | `acquire_writer` / `renew_writer` / `release_writer` | Identified request and exact grant/epoch/handover policy; returns original grant/deadline or release result. |
 | `attach_volume` | Operation ID, branch ID/revision, exact grant; returns fenced attachment ID, protected base, live VolumeRoot/geometry, and device setup inputs. |
-| `renew_base_protection` / `detach_volume` | Operation ID and exact attachment/protection; detach requires unmounted/drained state, resolves pending barriers/capture, and releases protection. It must flush unless explicit discard is requested. |
+| `renew_base_protection` / `detach_volume` | Operation ID, exact attachment ID/volume epoch/protection ID, and writer grant; detach requires an unmounted, drained device and returns `busy` while a mutation preparation (including a barrier) or capture is pending. Callers must resolve pending work before retrying. Successful detach releases the attachment-base protection; callers must flush dirty state first or explicitly discard it. |
 | `flush_volume` | Internal operation ID, exact attachment/epoch/grant, covered I/O boundary, sealed dirty version, and expected live revision; returns durable volume boundary/root/revision. |
 | `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
 | `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |
@@ -1257,9 +1309,10 @@ path may block later writes through commit to avoid keeping multiple dirty epoch
 
 Before admission return Busy/capacity errors. After admission preserve identified
 outcomes/protection or record a definite abort. Report budget exhaustion does not
-block writers. Both unreclaimed S3 objects and workspace-lifetime operation records
-(including durability barriers and heartbeats) grow cumulatively in v0. Expiry or
-trim cannot be used to erase deduplication records or enable physical deletion.
+block writers. Unreclaimed S3 objects, workspace-lifetime operation records
+(including durability barriers and heartbeats), and rootless protection retirement
+records grow cumulatively in v0. Expiry or trim cannot erase identity/deduplication
+records or enable physical deletion.
 
 ### 14.3 Benchmark report
 
