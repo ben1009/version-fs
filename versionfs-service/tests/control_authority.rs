@@ -402,6 +402,26 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             .attachment
             .is_none()
     );
+
+    let reattached = env
+        .control
+        .attach_volume(
+            op(12),
+            branch(1),
+            committed.revision,
+            grant,
+            attachment(2),
+            protection(12),
+        )
+        .expect("reattach from the branch's durable live root");
+    env.clock.set(2);
+    let renewed_reattachment = env
+        .control
+        .renew_attachment_base(op(13), branch(1), attachment(2), grant)
+        .expect("renew protection for a base whose live roots advanced");
+    assert_eq!(reattached.base_generation, generation(1));
+    assert_eq!(renewed_reattachment.base_generation, generation(1));
+    assert!(renewed_reattachment.protection_expires_at > reattached.protection_expires_at);
 }
 
 #[test]
@@ -497,6 +517,85 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
 }
 
 #[test]
+fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let begin_capture = |operation_id, protection_id| {
+        env.control.begin_preparation(PreparationRequest {
+            operation_id,
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id,
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+    };
+    let begin_child = |operation_id, protection_id| {
+        env.control.begin_preparation(PreparationRequest {
+            operation_id,
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            protection_id,
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(20)),
+            dependencies: vec![],
+        })
+    };
+
+    begin_capture(op(40), protection(40)).expect("begin first capture");
+    env.control
+        .authorize_capture_child(op(41), op(40), op(42), grant)
+        .expect("authorize child before worker starts it");
+    assert_eq!(
+        env.control
+            .abort_operation(op(40))
+            .expect("abort capture and retire absent child"),
+        OperationState::Aborted
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control.get_operation(op(42)).unwrap(),
+        OperationState::Aborted
+    );
+    assert_eq!(
+        begin_child(op(42), protection(42)),
+        Err(ControlError::Aborted)
+    );
+
+    let OperationState::Preparing {
+        expires_at: deadline,
+        ..
+    } = begin_capture(op(50), protection(50)).expect("begin second capture")
+    else {
+        panic!("capture should remain in preparation");
+    };
+    env.control
+        .authorize_capture_child(op(51), op(50), op(52), grant)
+        .expect("authorize child before worker starts it");
+    env.clock.set(deadline.as_nanos());
+    assert_eq!(
+        env.control
+            .expire_preparation(op(50))
+            .expect("expire capture and retire absent child"),
+        OperationState::Aborted
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control.get_operation(op(52)).unwrap(),
+        OperationState::Aborted
+    );
+    assert_eq!(
+        begin_child(op(52), protection(52)),
+        Err(ControlError::Aborted)
+    );
+}
+
+#[test]
 fn owner_restart_fences_old_grants_and_expired_read_protections_release_retention() {
     let env = TestEnv::new();
     let old_grant = env.writer_and_attachment();
@@ -508,6 +607,10 @@ fn owner_restart_fences_old_grants_and_expired_read_protections_release_retentio
     );
 
     let next_control = env.control_for_owner(next_owner);
+    assert_eq!(
+        next_control.renew_writer(op(252), old_grant),
+        Err(ControlError::Fenced)
+    );
     let new_grant = next_control
         .acquire_writer(op(5), branch(1), 1, old_grant.writer_epoch)
         .expect("new owner takes fenced branch");

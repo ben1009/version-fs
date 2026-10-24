@@ -641,7 +641,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let key = branch_key(self.workspace_id, grant.branch_id);
             let mut branch = read_branch(txn, &key)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             let renewed = WriterGrant {
                 expires_at: txn.now().saturating_add_nanos(WRITER_LEASE_NANOS),
                 ..grant
@@ -698,7 +698,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let key = branch_key(self.workspace_id, branch_id);
             let mut branch = read_branch(txn, &key)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
@@ -770,7 +770,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 self.require_current_owner(txn)?;
                 let key = branch_key(self.workspace_id, branch_id);
                 let mut branch = read_branch(txn, &key)?;
-                validate_writer(&branch, grant, txn.now())?;
+                validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 let mut attachment = branch.attachment.ok_or_else(|| reject("fenced"))?;
                 if attachment.attachment_id != attachment_id
                     || attachment.writer_epoch != grant.writer_epoch
@@ -788,7 +788,6 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         branch_id: protected_branch,
                         attachment_id: protected_attachment,
                         generation_id,
-                        roots,
                         owner_incarnation,
                         expires_at,
                         ..
@@ -798,6 +797,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         if *protected_branch != branch_id
                             || *protected_attachment != attachment_id
                             || *generation_id != attachment.base_generation
+                            || *expires_at != attachment.protection_expires_at
                         {
                             return Err(reject("corrupt_record"));
                         }
@@ -805,7 +805,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             txn,
                             &generation_key(self.workspace_id, *generation_id),
                         )?;
-                        if *roots != generation.seed.roots {
+                        if generation.attachment_refs == 0 {
                             return Err(reject("corrupt_record"));
                         }
                         *expires_at = txn.now().saturating_add_nanos(ATTACHMENT_PROTECTION_NANOS);
@@ -840,7 +840,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let key = branch_key(self.workspace_id, branch_id);
             let mut branch = read_branch(txn, &key)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             if branch
                 .attachment
                 .is_none_or(|a| a.attachment_id != attachment_id)
@@ -1273,7 +1273,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let bkey = branch_key(self.workspace_id, branch_id);
             let mut branch = read_branch(txn, &bkey)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
@@ -1421,7 +1421,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     return Err(reject("fenced"));
                 }
                 let branch = read_branch(txn, &branch_key(self.workspace_id, branch_id))?;
-                validate_writer(&branch, grant, txn.now())?;
+                validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 if capture {
                     let token = branch.capture.as_ref().ok_or_else(|| reject("fenced"))?;
                     if token.operation_id != prepared_id || token.protection_id != protection_id {
@@ -1490,6 +1490,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         child_id: OperationId,
         grant: WriterGrant,
     ) -> Result<(), ControlError> {
+        if operation_id == capture_id || operation_id == child_id || capture_id == child_id {
+            return Err(ControlError::InvalidRequest(
+                "capture and child operation IDs must be distinct",
+            ));
+        }
         let mut payload = CanonicalEncoder::new();
         payload.fixed(capture_id.as_bytes());
         payload.fixed(child_id.as_bytes());
@@ -1502,7 +1507,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 self.require_current_owner(txn)?;
                 let key = branch_key(self.workspace_id, grant.branch_id);
                 let mut branch = read_branch(txn, &key)?;
-                validate_writer(&branch, grant, txn.now())?;
+                validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
                 let capture = branch.capture.as_mut().ok_or_else(|| reject("not_found"))?;
                 if capture.operation_id != capture_id || capture.sealed {
                     return Err(reject("invalid_transition"));
@@ -1517,6 +1522,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 )?;
                 if capture.pending_child.is_some() {
                     return Err(reject("busy"));
+                }
+                if txn.get(&self.operation_key(child_id))?.is_some() {
+                    return Err(MetadataError::Conflict);
                 }
                 capture.pending_child = Some(child_id);
                 txn.put(&key, &encode_branch(&branch).map_err(to_metadata_error)?)?;
@@ -1614,7 +1622,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let bkey = branch_key(self.workspace_id, grant.branch_id);
             let mut branch = read_branch(txn, &bkey)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             if branch.attachment.is_none_or(|attachment| {
                 attachment.attachment_id != prepared_attachment
                     || attachment.writer_epoch != grant.writer_epoch
@@ -1695,7 +1703,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             self.require_current_owner(txn)?;
             let key = branch_key(self.workspace_id, grant.branch_id);
             let mut branch = read_branch(txn, &key)?;
-            validate_writer(&branch, grant, txn.now())?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
@@ -1814,8 +1822,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         {
                             return Err(reject("corrupt_record"));
                         }
-                        if token.pending_child.is_some() {
-                            return Err(reject("busy"));
+                        if let Some(child_id) = token.pending_child {
+                            self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
                         }
                         branch.capture = None;
                     } else if let Some(token) = &mut branch.capture
@@ -1917,8 +1925,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 if token.operation_id != operation_id || token.protection_id != protection_id {
                     return Err(reject("corrupt_record"));
                 }
-                if token.pending_child.is_some() {
-                    return Err(reject("busy"));
+                if let Some(child_id) = token.pending_child {
+                    self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
                 }
                 branch.capture = None;
             } else if let Some(token) = &mut branch.capture
@@ -1948,6 +1956,47 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
 
     fn operation_key(&self, id: OperationId) -> Vec<u8> {
         scoped_operation_key(self.workspace_id, self.principal_id, id)
+    }
+
+    /// Retires a capture child that was authorized but never began preparation.
+    /// A tombstone reserves the ID so a delayed worker cannot start it after the
+    /// parent capture has released admission.
+    fn retire_unstarted_capture_child(
+        &self,
+        txn: &mut dyn MetadataTxn,
+        branch_id: BranchId,
+        grant: WriterGrant,
+        child_id: OperationId,
+    ) -> Result<(), MetadataError> {
+        let key = self.operation_key(child_id);
+        let Some(bytes) = txn.get(&key)? else {
+            let tombstone = StoredOperation::aborted(OP_TOMBSTONE, [0; 32]);
+            txn.put(
+                &key,
+                &encode_operation(&tombstone).map_err(to_metadata_error)?,
+            )?;
+            return Ok(());
+        };
+
+        let record = decode_operation(&bytes).map_err(to_metadata_error)?;
+        match record.status {
+            StoredOperationStatus::Aborted => Ok(()),
+            StoredOperationStatus::Preparing {
+                branch_id: child_branch,
+                grant: child_grant,
+                capture,
+                ..
+            } if record.kind == OP_BEGIN_PREPARATION
+                && child_branch == branch_id
+                && child_grant == grant
+                && !capture =>
+            {
+                Err(reject("busy"))
+            }
+            StoredOperationStatus::Preparing { .. } | StoredOperationStatus::Committed(_) => {
+                Err(reject("corrupt_record"))
+            }
+        }
     }
 
     fn transition_key(&self, id: OperationId, transition: u16) -> Vec<u8> {
@@ -3014,10 +3063,11 @@ fn validate_grant_identity(
 fn validate_writer(
     branch: &BranchState,
     grant: WriterGrant,
+    owner: OwnerIncarnation,
     now: MonotonicTime,
 ) -> Result<(), MetadataError> {
     ensure_live_branch(branch)?;
-    validate_grant_identity(branch, grant, grant.owner_incarnation)?;
+    validate_grant_identity(branch, grant, owner)?;
     if grant.expires_at <= now {
         return Err(reject("expired"));
     }
