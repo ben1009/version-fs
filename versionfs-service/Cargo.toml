@@ -22,5 +22,8 @@ thiserror = "=2.0.21"
 tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
 versionfs-core = { path = "../versionfs-core" }
 
+[dev-dependencies]
+versionfs-sdk = { path = "../versionfs-sdk" }
+
 [lints]
 workspace = true

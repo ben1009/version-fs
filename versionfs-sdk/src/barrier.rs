@@ -52,6 +52,11 @@ pub struct PendingBarrier {
     pub attachment_id: AttachmentId,
     /// Volume fencing epoch for the attachment.
     pub volume_epoch: u64,
+    /// Capture whose identified drain child this barrier belongs to.
+    pub capture_id: Option<OperationId>,
+    /// Stable operation ID used to reserve this barrier as a capture child.
+    /// `None` means a capture coordinator already reserved `operation_id`.
+    pub capture_authorization_id: Option<OperationId>,
     /// Prior complete live roots.
     pub previous_roots: LiveRoots,
     /// Complete result roots, changing only the volume root.
@@ -107,7 +112,8 @@ pub trait BarrierJournal {
 }
 
 const JOURNAL_IDS_MAGIC: &[u8; 8] = b"VFSBID01";
-const JOURNAL_PENDING_MAGIC: &[u8; 8] = b"VFSPND01";
+const JOURNAL_PENDING_MAGIC_V1: &[u8; 8] = b"VFSPND01";
+const JOURNAL_PENDING_MAGIC: &[u8; 8] = b"VFSPND02";
 const CHECKSUM_BYTES: usize = 32;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -330,6 +336,8 @@ fn encode_pending_file(barrier: &PendingBarrier) -> Result<Vec<u8>, String> {
     encode_grant(&mut payload, barrier.writer_grant);
     payload.extend_from_slice(barrier.attachment_id.as_bytes());
     push_u64(&mut payload, barrier.volume_epoch);
+    encode_optional_operation_id(&mut payload, barrier.capture_id);
+    encode_optional_operation_id(&mut payload, barrier.capture_authorization_id);
     encode_roots(&mut payload, barrier.previous_roots);
     encode_roots(&mut payload, barrier.next_roots);
     push_u64(&mut payload, barrier.dirty_revision);
@@ -366,7 +374,15 @@ fn encode_pending_file(barrier: &PendingBarrier) -> Result<Vec<u8>, String> {
 }
 
 fn decode_pending_file(bytes: &[u8]) -> Result<PendingBarrier, String> {
-    let payload = decode_checked(JOURNAL_PENDING_MAGIC, bytes)?;
+    let (payload, has_capture_fields) = match bytes.get(..8) {
+        Some(magic) if magic == JOURNAL_PENDING_MAGIC => {
+            (decode_checked(JOURNAL_PENDING_MAGIC, bytes)?, true)
+        }
+        Some(magic) if magic == JOURNAL_PENDING_MAGIC_V1 => {
+            (decode_checked(JOURNAL_PENDING_MAGIC_V1, bytes)?, false)
+        }
+        _ => return Err("invalid barrier journal header".to_owned()),
+    };
     let mut reader = JournalReader::new(payload);
     let operation_id = OperationId::from_bytes(reader.fixed()?);
     let protection_id = ProtectionId::from_bytes(reader.fixed()?);
@@ -375,6 +391,14 @@ fn decode_pending_file(bytes: &[u8]) -> Result<PendingBarrier, String> {
     let writer_grant = decode_grant(&mut reader)?;
     let attachment_id = AttachmentId::from_bytes(reader.fixed()?);
     let volume_epoch = reader.u64()?;
+    let (capture_id, capture_authorization_id) = if has_capture_fields {
+        (
+            reader.optional_operation_id()?,
+            reader.optional_operation_id()?,
+        )
+    } else {
+        (None, None)
+    };
     let previous_roots = decode_roots(&mut reader)?;
     let next_roots = decode_roots(&mut reader)?;
     let dirty_revision = reader.u64()?;
@@ -409,6 +433,8 @@ fn decode_pending_file(bytes: &[u8]) -> Result<PendingBarrier, String> {
         writer_grant,
         attachment_id,
         volume_epoch,
+        capture_id,
+        capture_authorization_id,
         previous_roots,
         next_roots,
         dirty_revision,
@@ -427,6 +453,9 @@ fn validate_pending(barrier: &PendingBarrier) -> Result<(), String> {
     }
     if barrier.renewal_operation_id.is_some() != barrier.renewal_grant.is_some() {
         return Err("pending renewal ID and grant must be recorded together".to_owned());
+    }
+    if barrier.capture_authorization_id.is_some() && barrier.capture_id.is_none() {
+        return Err("capture authorization ID is missing its capture ID".to_owned());
     }
     if let Some(grant) = barrier.renewal_grant
         && !same_grant_identity(barrier.writer_grant, grant)
@@ -515,6 +544,15 @@ fn encode_ref(bytes: &mut Vec<u8>, reference: ObjectRef) {
     push_u16(bytes, reference.object_type as u16);
     bytes.extend_from_slice(reference.object_id.as_bytes());
     push_u64(bytes, reference.encoded_len);
+}
+
+fn encode_optional_operation_id(bytes: &mut Vec<u8>, operation_id: Option<OperationId>) {
+    if let Some(operation_id) = operation_id {
+        bytes.push(1);
+        bytes.extend_from_slice(operation_id.as_bytes());
+    } else {
+        bytes.push(0);
+    }
 }
 
 fn push_count(bytes: &mut Vec<u8>, count: usize) -> Result<(), String> {
@@ -672,6 +710,14 @@ impl<'a> JournalReader<'a> {
         Ok(u64::from_le_bytes(self.fixed()?))
     }
 
+    fn optional_operation_id(&mut self) -> Result<Option<OperationId>, String> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(OperationId::from_bytes(self.fixed()?))),
+            _ => Err("invalid optional operation ID tag".to_owned()),
+        }
+    }
+
     fn count(&mut self) -> Result<usize, String> {
         let count = usize::try_from(self.u32()?)
             .map_err(|_| "barrier journal count does not fit memory".to_owned())?;
@@ -724,6 +770,15 @@ pub trait VolumeBarrierControl: Send + Sync {
         request: PreparationRequest,
     ) -> Result<OperationState, ControlError>;
 
+    /// Reserves one volume-barrier operation as the active capture's drain child.
+    fn authorize_capture_child(
+        &self,
+        authorization_id: OperationId,
+        capture_id: OperationId,
+        child_id: OperationId,
+        grant: WriterGrant,
+    ) -> Result<(), ControlError>;
+
     /// Renews an active preparation using a fresh ID or replays the same renewal.
     /// A replay must use the exact original grant; a refreshed expiry requires a
     /// fresh renewal operation ID.
@@ -741,6 +796,7 @@ pub trait VolumeBarrierControl: Send + Sync {
         expected_revision: u64,
         grant: WriterGrant,
         roots: LiveRoots,
+        capture_id: Option<OperationId>,
     ) -> Result<BranchState, ControlError>;
 
     /// Aborts a preparation or tombstones an operation ID that never began.
@@ -762,6 +818,22 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
         WorkspaceControl::begin_preparation(self, request)
     }
 
+    fn authorize_capture_child(
+        &self,
+        authorization_id: OperationId,
+        capture_id: OperationId,
+        child_id: OperationId,
+        grant: WriterGrant,
+    ) -> Result<(), ControlError> {
+        WorkspaceControl::authorize_capture_child(
+            self,
+            authorization_id,
+            capture_id,
+            child_id,
+            grant,
+        )
+    }
+
     fn renew_preparation(
         &self,
         renewal_id: OperationId,
@@ -777,6 +849,7 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
         expected_revision: u64,
         grant: WriterGrant,
         roots: LiveRoots,
+        capture_id: Option<OperationId>,
     ) -> Result<BranchState, ControlError> {
         WorkspaceControl::commit_live_roots(
             self,
@@ -784,7 +857,7 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
             expected_revision,
             grant,
             roots,
-            None,
+            capture_id.map(|capture_id| (capture_id, operation_id)),
         )
     }
 
@@ -1068,19 +1141,38 @@ where
     pub fn flush(&mut self) -> Result<(), BarrierError> {
         if self.pending.is_none() {
             if self.inner.dirty_extent_count() == 0 {
+                let branch = self.control.get_branch(self.branch_id)?;
+                if let Some(child_id) = branch
+                    .capture
+                    .as_ref()
+                    .filter(|capture| !capture.sealed)
+                    .and_then(|capture| capture.pending_child)
+                {
+                    if matches!(
+                        self.control.abort_operation(child_id)?,
+                        OperationState::Committed(_)
+                    ) {
+                        self.refresh_clean_branch()?;
+                    }
+                }
                 return Ok(());
             }
             let staged = self.inner.stage_dirty()?.ok_or(BarrierError::Conflict)?;
-            let ids = self
-                .journal
-                .reserve_barrier_ids()
-                .map_err(BarrierError::Journal)?;
+            let branch = self.control.get_branch(self.branch_id)?;
+            let (ids, capture_id, capture_authorization_id) =
+                self.reserve_barrier_context(&branch)?;
             let next_roots = LiveRoots {
                 volume: staged.volume_root,
                 logs: self.live_roots.logs,
                 artifacts: self.live_roots.artifacts,
             };
-            let barrier = self.pending_from_stage(ids, next_roots, staged);
+            let barrier = self.pending_from_stage(
+                ids,
+                next_roots,
+                staged,
+                capture_id,
+                capture_authorization_id,
+            );
             self.pending = Some(barrier);
             self.pending_journaled = false;
             self.last_renewal = None;
@@ -1099,11 +1191,32 @@ where
         self.live_roots
     }
 
+    fn refresh_clean_branch(&mut self) -> Result<(), BarrierError> {
+        let branch = self.control.get_branch(self.branch_id)?;
+        let grant = validate_attachment(
+            &branch,
+            self.branch_id,
+            self.attachment_id,
+            self.volume_epoch,
+            self.writer_grant,
+        )?;
+        if branch.volume_root != self.live_roots.volume {
+            let map = self.inner.load_map(branch.volume_root)?;
+            self.inner.replace_base(map);
+        }
+        self.live_roots = roots(&branch);
+        self.revision = branch.revision;
+        self.writer_grant = grant;
+        Ok(())
+    }
+
     fn pending_from_stage(
         &self,
         ids: BarrierIds,
         next_roots: LiveRoots,
         staged: StagedVolume,
+        capture_id: Option<OperationId>,
+        capture_authorization_id: Option<OperationId>,
     ) -> PendingBarrier {
         PendingBarrier {
             operation_id: ids.operation_id,
@@ -1113,6 +1226,8 @@ where
             writer_grant: self.writer_grant,
             attachment_id: self.attachment_id,
             volume_epoch: self.volume_epoch,
+            capture_id,
+            capture_authorization_id,
             previous_roots: self.live_roots,
             next_roots,
             dirty_revision: staged.dirty_revision,
@@ -1121,6 +1236,37 @@ where
             renewal_operation_id: None,
             renewal_grant: None,
         }
+    }
+
+    fn reserve_barrier_context(
+        &mut self,
+        branch: &BranchState,
+    ) -> Result<(BarrierIds, Option<OperationId>, Option<OperationId>), BarrierError> {
+        let mut ids = self
+            .journal
+            .reserve_barrier_ids()
+            .map_err(BarrierError::Journal)?;
+        let Some(capture) = branch.capture.as_ref() else {
+            return Ok((ids, None, None));
+        };
+        if capture.sealed {
+            return Err(ControlError::Busy.into());
+        }
+        let capture_id = capture.operation_id;
+        let authorization_id = if let Some(child_id) = capture.pending_child {
+            // A capture coordinator may have reserved this child before issuing
+            // the device drain request. Burn the locally reserved operation ID
+            // and use the exact authorized ID for the barrier.
+            ids.operation_id = child_id;
+            None
+        } else {
+            Some(
+                self.journal
+                    .reserve_operation_id()
+                    .map_err(BarrierError::Journal)?,
+            )
+        };
+        Ok((ids, Some(capture_id), authorization_id))
     }
 
     fn resume_pending(&mut self) -> Result<(), BarrierError> {
@@ -1134,12 +1280,14 @@ where
             let volume_epoch = barrier.volume_epoch;
             let previous_roots = barrier.previous_roots;
             let next_roots = barrier.next_roots;
+            let capture_id = barrier.capture_id;
+            let capture_authorization_id = barrier.capture_authorization_id;
             let saved_grant = barrier.writer_grant;
             let branch = self.control.get_branch(self.branch_id)?;
             let current_grant =
                 validate_attachment(&branch, branch_id, attachment_id, volume_epoch, saved_grant)?;
 
-            match self.control.get_operation(operation_id) {
+            let operation_missing = match self.control.get_operation(operation_id) {
                 Ok(OperationState::Committed(_)) => return self.finish_committed(),
                 Ok(OperationState::Aborted) => {
                     if self.restart_pending(&branch, current_grant)? {
@@ -1147,8 +1295,26 @@ where
                     }
                     continue;
                 }
-                Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {}
+                Ok(OperationState::Preparing { .. }) => false,
+                Err(ControlError::NotFound) => true,
                 Err(error) => return Err(error.into()),
+            };
+
+            let active_capture_id = branch
+                .capture
+                .as_ref()
+                .filter(|capture| !capture.sealed)
+                .map(|capture| capture.operation_id);
+            let child_conflicts = branch.capture.as_ref().is_some_and(|capture| {
+                capture
+                    .pending_child
+                    .is_some_and(|child_id| child_id != operation_id)
+            });
+            if operation_missing && (active_capture_id != capture_id || child_conflicts) {
+                if self.abort_and_restage(operation_id)? {
+                    return Ok(());
+                }
+                continue;
             }
 
             if branch.revision != expected_revision || roots(&branch) != previous_roots {
@@ -1170,6 +1336,27 @@ where
                 self.control.get_operation(operation_id),
                 Err(ControlError::NotFound)
             ) {
+                if let (Some(capture_id), Some(authorization_id)) =
+                    (capture_id, capture_authorization_id)
+                {
+                    match self.control.authorize_capture_child(
+                        authorization_id,
+                        capture_id,
+                        operation_id,
+                        current_grant,
+                    ) {
+                        Ok(()) => {}
+                        Err(
+                            ControlError::Conflict | ControlError::Busy | ControlError::NotFound,
+                        ) => {
+                            if self.abort_and_restage(operation_id)? {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 match self.control.begin_preparation(PreparationRequest {
                     operation_id,
                     branch_id,
@@ -1266,6 +1453,7 @@ where
                 expected_revision,
                 current_grant,
                 next_roots,
+                capture_id,
             ) {
                 Ok(branch) => branch,
                 Err(ControlError::Conflict) => {
@@ -1395,16 +1583,19 @@ where
             self.last_renewal = None;
             return Ok(true);
         };
-        let ids = self
-            .journal
-            .reserve_barrier_ids()
-            .map_err(BarrierError::Journal)?;
+        let (ids, capture_id, capture_authorization_id) = self.reserve_barrier_context(branch)?;
         let next_roots = LiveRoots {
             volume: staged.volume_root,
             logs: self.live_roots.logs,
             artifacts: self.live_roots.artifacts,
         };
-        let replacement = self.pending_from_stage(ids, next_roots, staged);
+        let replacement = self.pending_from_stage(
+            ids,
+            next_roots,
+            staged,
+            capture_id,
+            capture_authorization_id,
+        );
         self.journal
             .replace_pending(old_operation_id, &replacement)
             .map_err(BarrierError::Journal)?;
@@ -1715,6 +1906,7 @@ mod tests {
     struct FakeControlState {
         branch: BranchState,
         operations: HashMap<OperationId, OperationState>,
+        capture_authorizations: HashMap<OperationId, (OperationId, OperationId)>,
         renewals: HashMap<OperationId, (MonotonicTime, WriterGrant)>,
         expire_next_renewal: bool,
         lose_next_commit_reply: bool,
@@ -1749,6 +1941,11 @@ mod tests {
             {
                 return Err(ControlError::Conflict);
             }
+            if let Some(capture) = &branch.capture
+                && (capture.sealed || capture.pending_child != Some(request.operation_id))
+            {
+                return Err(ControlError::Busy);
+            }
             let operation = OperationState::Preparing {
                 operation_id: request.operation_id,
                 expires_at: MonotonicTime::from_nanos(600_000_000_000),
@@ -1758,6 +1955,41 @@ mod tests {
                 .operations
                 .insert(request.operation_id, operation.clone());
             Ok(operation)
+        }
+
+        fn authorize_capture_child(
+            &self,
+            authorization_id: OperationId,
+            capture_id: OperationId,
+            child_id: OperationId,
+            _grant: WriterGrant,
+        ) -> Result<(), ControlError> {
+            let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
+            if let Some((prior_capture_id, prior_child_id)) =
+                state.capture_authorizations.get(&authorization_id)
+            {
+                return if (*prior_capture_id, *prior_child_id) == (capture_id, child_id) {
+                    Ok(())
+                } else {
+                    Err(ControlError::OperationMismatch)
+                };
+            }
+            let capture = state
+                .branch
+                .capture
+                .as_mut()
+                .ok_or(ControlError::NotFound)?;
+            if capture.operation_id != capture_id || capture.sealed {
+                return Err(ControlError::InvalidTransition);
+            }
+            if capture.pending_child.is_some() {
+                return Err(ControlError::Busy);
+            }
+            capture.pending_child = Some(child_id);
+            state
+                .capture_authorizations
+                .insert(authorization_id, (capture_id, child_id));
+            Ok(())
         }
 
         fn renew_preparation(
@@ -1797,6 +2029,7 @@ mod tests {
             expected_revision: u64,
             _grant: WriterGrant,
             roots: LiveRoots,
+            capture_id: Option<OperationId>,
         ) -> Result<BranchState, ControlError> {
             let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
             if matches!(
@@ -1813,6 +2046,17 @@ mod tests {
             }
             if state.branch.revision != expected_revision {
                 return Err(ControlError::Conflict);
+            }
+            match (&mut state.branch.capture, capture_id) {
+                (None, None) => {}
+                (Some(capture), Some(capture_id))
+                    if capture.operation_id == capture_id
+                        && !capture.sealed
+                        && capture.pending_child == Some(operation_id) =>
+                {
+                    capture.pending_child = None;
+                }
+                _ => return Err(ControlError::Busy),
             }
             state.branch.volume_root = roots.volume;
             state.branch.logs_root = roots.logs;
@@ -1847,6 +2091,11 @@ mod tests {
             operation_id: OperationId,
         ) -> Result<OperationState, ControlError> {
             let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
+            if let Some(capture) = state.branch.capture.as_mut()
+                && capture.pending_child == Some(operation_id)
+            {
+                capture.pending_child = None;
+            }
             let operation = state
                 .operations
                 .entry(operation_id)
@@ -1917,6 +2166,7 @@ mod tests {
             let control = FakeControl(Arc::new(Mutex::new(FakeControlState {
                 branch,
                 operations: HashMap::new(),
+                capture_authorizations: HashMap::new(),
                 renewals: HashMap::new(),
                 expire_next_renewal: false,
                 lose_next_commit_reply: false,
@@ -1969,6 +2219,8 @@ mod tests {
             writer_grant: grant,
             attachment_id: AttachmentId::from_bytes([15; 16]),
             volume_epoch: 6,
+            capture_id: None,
+            capture_authorization_id: None,
             previous_roots: LiveRoots {
                 volume: previous_volume,
                 logs,
@@ -2164,6 +2416,23 @@ mod tests {
     }
 
     #[test]
+    fn pending_journal_migrates_the_pre_capture_record_format() {
+        let barrier = sample_pending();
+        let encoded_v2 = encode_pending_file(&barrier).expect("encode current pending record");
+        let payload = decode_checked(JOURNAL_PENDING_MAGIC, &encoded_v2)
+            .expect("read current pending payload");
+        let prefix_length = 16 + 16 + 16 + 8 + 56 + 16 + 8;
+        let mut payload_v1 = payload[..prefix_length].to_vec();
+        payload_v1.extend_from_slice(&payload[prefix_length + 2..]);
+        let encoded_v1 = encode_checked(JOURNAL_PENDING_MAGIC_V1, &payload_v1);
+
+        let decoded = decode_pending_file(&encoded_v1).expect("decode legacy pending record");
+        assert_eq!(decoded, barrier);
+        assert_eq!(decoded.capture_id, None);
+        assert_eq!(decoded.capture_authorization_id, None);
+    }
+
+    #[test]
     fn flush_recovers_after_worker_loss_during_an_object_upload() {
         let environment = TestEnvironment::new();
         let mut worker = environment.open();
@@ -2198,6 +2467,121 @@ mod tests {
         let restored = environment.open();
         assert_eq!(restored.inner.read(4096, 4096).unwrap(), vec![0xA3; 4096]);
         assert!(restored.pending.is_none());
+    }
+
+    #[test]
+    fn flush_commits_as_an_identified_capture_child() {
+        let environment = TestEnvironment::new();
+        let capture_id = OperationId::from_bytes([19; 16]);
+        environment.control.0.lock().unwrap().branch.capture =
+            Some(versionfs_core::control::CaptureState {
+                operation_id: capture_id,
+                principal_id: versionfs_core::identity::PrincipalId::from_bytes([20; 16]),
+                protection_id: ProtectionId::from_bytes([21; 16]),
+                expected_revision: 1,
+                sealed: false,
+                pending_child: None,
+                sealed_revision: None,
+                sealed_roots: None,
+            });
+
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(4096, &[0xD2; 4096])
+            .expect("stage drain write");
+        worker.flush().expect("commit capture drain barrier");
+
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(state.branch.revision, 2);
+        assert_eq!(state.commit_count, 1);
+        assert_eq!(state.capture_authorizations.len(), 1);
+        let capture = state.branch.capture.as_ref().expect("capture remains open");
+        assert_eq!(capture.operation_id, capture_id);
+        assert_eq!(capture.pending_child, None);
+        assert_eq!(
+            state.branch.volume_root, worker.live_roots.volume,
+            "the drain child root is the branch live root"
+        );
+    }
+
+    #[test]
+    fn flush_uses_an_already_authorized_capture_child_id() {
+        let environment = TestEnvironment::new();
+        let capture_id = OperationId::from_bytes([22; 16]);
+        let child_id = OperationId::from_bytes([23; 16]);
+        environment.control.0.lock().unwrap().branch.capture =
+            Some(versionfs_core::control::CaptureState {
+                operation_id: capture_id,
+                principal_id: versionfs_core::identity::PrincipalId::from_bytes([24; 16]),
+                protection_id: ProtectionId::from_bytes([25; 16]),
+                expected_revision: 1,
+                sealed: false,
+                pending_child: Some(child_id),
+                sealed_revision: None,
+                sealed_roots: None,
+            });
+
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(4096, &[0xE3; 4096])
+            .expect("stage drain write");
+        worker.flush().expect("commit preauthorized drain barrier");
+
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(state.branch.revision, 2);
+        assert_eq!(state.commit_count, 1);
+        assert!(state.capture_authorizations.is_empty());
+        assert_eq!(
+            state.operations.get(&child_id),
+            Some(&OperationState::Committed(Vec::new()))
+        );
+        assert_eq!(
+            state
+                .branch
+                .capture
+                .as_ref()
+                .expect("capture remains open")
+                .pending_child,
+            None
+        );
+    }
+
+    #[test]
+    fn empty_flush_retires_an_unused_capture_child_reservation() {
+        let environment = TestEnvironment::new();
+        let capture_id = OperationId::from_bytes([26; 16]);
+        let child_id = OperationId::from_bytes([27; 16]);
+        environment.control.0.lock().unwrap().branch.capture =
+            Some(versionfs_core::control::CaptureState {
+                operation_id: capture_id,
+                principal_id: versionfs_core::identity::PrincipalId::from_bytes([28; 16]),
+                protection_id: ProtectionId::from_bytes([29; 16]),
+                expected_revision: 1,
+                sealed: false,
+                pending_child: Some(child_id),
+                sealed_revision: None,
+                sealed_roots: None,
+            });
+
+        let mut worker = environment.open();
+        worker.flush().expect("complete empty drain flush");
+
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(
+            state.operations.get(&child_id),
+            Some(&OperationState::Aborted)
+        );
+        assert_eq!(
+            state
+                .branch
+                .capture
+                .as_ref()
+                .expect("capture remains open")
+                .pending_child,
+            None
+        );
     }
 
     #[test]
@@ -2432,7 +2816,7 @@ mod tests {
             logs: worker.live_roots.logs,
             artifacts: worker.live_roots.artifacts,
         };
-        let mut pending = worker.pending_from_stage(ids, next_roots, staged);
+        let mut pending = worker.pending_from_stage(ids, next_roots, staged, None, None);
         let renewal_id = worker
             .journal
             .reserve_operation_id()
@@ -2507,7 +2891,7 @@ mod tests {
             logs: worker.live_roots.logs,
             artifacts: worker.live_roots.artifacts,
         };
-        let mut pending = worker.pending_from_stage(ids, next_roots, staged);
+        let mut pending = worker.pending_from_stage(ids, next_roots, staged, None, None);
         let expired_renewal_id = worker
             .journal
             .reserve_operation_id()
