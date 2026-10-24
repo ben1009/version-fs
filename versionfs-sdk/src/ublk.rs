@@ -147,7 +147,7 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
     queue_start_error: Arc<Mutex<Option<UblkError>>>,
     initialize_queue: QueueInitializer,
 ) {
-    let setup = check_queue_buffer_allocations(device.alloc_queue_io_bufs()).and_then(|buffers| {
+    let setup = prepare_queue_buffers(device.alloc_queue_io_bufs()).and_then(|buffers| {
         let buffers = Rc::new(RefCell::new(buffers));
         let queue = initialize_queue(queue_id, device)?
             .submit_fetch_commands_unified(BufDescList::Slices(Some(&buffers.borrow())))?;
@@ -199,7 +199,7 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
     let _ = queue_errors.send(());
 }
 
-fn check_queue_buffer_allocations(buffers: Vec<IoBuf<u8>>) -> Result<Vec<IoBuf<u8>>, UblkError> {
+fn prepare_queue_buffers(mut buffers: Vec<IoBuf<u8>>) -> Result<Vec<IoBuf<u8>>, UblkError> {
     if buffers.iter().any(|buffer| buffer.as_ptr().is_null()) {
         // libublk 0.4.8 silently skips null buffers during registration and its
         // IoBuf destructor unconditionally deallocates the pointer. Discard
@@ -210,6 +210,12 @@ fn check_queue_buffer_allocations(buffers: Vec<IoBuf<u8>>) -> Result<Vec<IoBuf<u
             }
         }
         return Err(UblkError::OtherError(-libc::ENOMEM));
+    }
+
+    // IoBuf allocations are uninitialized. Initialize their complete storage
+    // before any request handler creates a slice, including for partial I/O.
+    for buffer in &mut buffers {
+        buffer.zero_buf();
     }
 
     Ok(buffers)
@@ -330,11 +336,16 @@ mod tests {
     }
 
     #[test]
-    fn queue_buffer_allocation_check_preserves_buffers() {
-        let buffers = vec![IoBuf::<u8>::new(4096), IoBuf::<u8>::new(8192)];
+    fn queue_buffer_preparation_zeroes_and_preserves_buffers() {
+        let mut buffers = vec![IoBuf::<u8>::new(4096), IoBuf::<u8>::new(8192)];
+        for buffer in &mut buffers {
+            // Initialize storage before using a safe slice to seed test bytes.
+            buffer.zero_buf();
+            buffer.as_mut_slice().fill(0xA5);
+        }
         let pointers: Vec<_> = buffers.iter().map(IoBuf::as_ptr).collect();
 
-        let checked = check_queue_buffer_allocations(buffers).unwrap();
+        let checked = prepare_queue_buffers(buffers).unwrap();
 
         assert_eq!(checked.len(), 2);
         assert_eq!(checked[0].len(), 4096);
@@ -342,6 +353,11 @@ mod tests {
         assert_eq!(
             checked.iter().map(IoBuf::as_ptr).collect::<Vec<_>>(),
             pointers
+        );
+        assert!(
+            checked
+                .iter()
+                .all(|buffer| buffer.as_slice().iter().all(|byte| *byte == 0))
         );
     }
 
@@ -358,7 +374,7 @@ mod tests {
         let buffers = vec![IoBuf::<u8>::new(4096), failed, IoBuf::<u8>::new(8192)];
 
         assert!(matches!(
-            check_queue_buffer_allocations(buffers),
+            prepare_queue_buffers(buffers),
             Err(UblkError::OtherError(error)) if error == -libc::ENOMEM
         ));
     }
