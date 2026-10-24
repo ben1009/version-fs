@@ -1,9 +1,9 @@
 //! Checks the canonical on-disk byte vectors shared with non-Rust readers.
 
 use versionfs_core::format::{
-    CaptureMode, GenerationDescriptor, LogSegment, MetadataRecordType, ObjectRef, ObjectType,
-    VolumeGeometry, VolumeRoot, encode_metadata_record, encode_object, encode_ordered_entries,
-    object_id, ordered_u64_key,
+    ArtifactMapRoot, CaptureMode, GenerationDescriptor, LogMapRoot, LogSegment, MetadataRecordType,
+    ObjectRef, ObjectType, VolumeGeometry, VolumeRoot, encode_metadata_record, encode_object,
+    encode_ordered_entries, object_id, ordered_u64_key,
 };
 use versionfs_core::identity::{GenerationId, LogId, ObjectId, VolumeBoundaryId};
 
@@ -65,6 +65,22 @@ fn canonical_envelopes_match_shared_golden_vectors() {
         .unwrap(),
     );
     assert_vector(
+        "empty_log_map_node",
+        &encode_object(
+            ObjectType::LogMapNode,
+            &encode_ordered_entries(&[]).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_vector(
+        "empty_artifact_map_node",
+        &encode_object(
+            ObjectType::ArtifactMapNode,
+            &encode_ordered_entries(&[]).unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_vector(
         "metadata_branch_v1",
         &encode_metadata_record(MetadataRecordType::Branch, &[1, 2, 3]).unwrap(),
     );
@@ -102,6 +118,45 @@ fn complete_roots_and_ordered_log_segments_match_golden_vectors() {
     assert_vector(
         "generation_descriptor_block_cut",
         &descriptor.encode().unwrap(),
+    );
+}
+
+#[test]
+fn native_roots_match_golden_vectors() {
+    let log_index = ObjectRef::from_encoded(
+        &encode_object(
+            ObjectType::LogMapNode,
+            &encode_ordered_entries(&[]).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_vector(
+        "empty_log_map_root",
+        &LogMapRoot {
+            log_index_root: log_index,
+            log_count: 0,
+        }
+        .encode()
+        .unwrap(),
+    );
+
+    let artifact_index = ObjectRef::from_encoded(
+        &encode_object(
+            ObjectType::ArtifactMapNode,
+            &encode_ordered_entries(&[]).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_vector(
+        "empty_artifact_map_root",
+        &ArtifactMapRoot {
+            artifact_index_root: artifact_index,
+            artifact_count: 0,
+        }
+        .encode()
+        .unwrap(),
     );
 }
 

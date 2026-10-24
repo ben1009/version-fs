@@ -11,8 +11,12 @@ P0 added canonical-format primitives, bounded shared fixtures, and an opt-in
 RAM-backed ublk/ext4 feasibility harness. P1 adds the workspace-scoped S3 object
 adapter and deterministic conformance tests. The real-S3 test is explicitly
 ignored and requires a dedicated test bucket. P2 adds the toy-kv Metadata
-Authority adapter and its conformance tests; higher storage protocols, the
-service daemon, and user-facing commands remain unimplemented.
+Authority adapter and its conformance tests. P3 adds persistent copy-on-write
+maps, typed volume/log/artifact roots, and complete Generation graph verification;
+the ublk data path and later control protocols remain unimplemented.
+Validated view handles seal without reading their map nodes. Imported volume
+handles can retain the result of `VolumeExtentMap::validate` to check metadata
+once before later mutations; named-map opens validate entries and retain counts.
 Tooling checks do not qualify any MVP durability gate.
 
 ## Setup and tools
@@ -109,6 +113,9 @@ in-process sanitizer runs skip them.
 All external actions retain upstream commit-SHA pins. Workflows harden runners,
 avoid persisting checkout credentials, and use read-only permissions unless a
 specific reporting job needs more.
+The tools job builds the pinned `cargo-sort` version from registry source because
+its prebuilt release archive fails its published checksum. Other tool downloads
+retain checksum verification.
 
 | Workflow | Coverage |
 | --- | --- |

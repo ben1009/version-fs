@@ -1,10 +1,10 @@
 //! Payload-budget checks for canonical log segments.
 
 use versionfs_core::format::{
-    FormatError, LogSegment, MAX_OBJECT_PAYLOAD_BYTES, ObjectRef, ObjectType, decode_object,
-    encode_object,
+    ArtifactChunkEntry, ArtifactDescriptor, FormatError, LogSegment, MAX_OBJECT_PAYLOAD_BYTES,
+    ObjectRef, ObjectType, decode_object, encode_object,
 };
-use versionfs_core::identity::LogId;
+use versionfs_core::identity::{ArtifactId, LogId, ObjectId};
 
 // A segment with one one-byte record has 40 fixed bytes and a five-byte record.
 const ONE_RECORD_PAYLOAD_BYTES: usize = 45;
@@ -53,4 +53,46 @@ fn oversized_attachment_list_is_rejected_before_attachment_traversal() {
             maximum: MAX_OBJECT_PAYLOAD_BYTES,
         })
     );
+}
+
+#[test]
+fn artifact_dependencies_fit_one_minimal_name_leaf() {
+    let reference = |object_type| ObjectRef {
+        object_type,
+        object_id: ObjectId::from_bytes([1; 32]),
+        encoded_len: 16,
+    };
+    let descriptor = ArtifactDescriptor {
+        artifact_id: ArtifactId::from_bytes([2; 16]),
+        logical_len: 65_537,
+        content_root: reference(ObjectType::ArtifactIndexNode),
+        dependencies: vec![reference(ObjectType::ArtifactBlob); 1558],
+    };
+    let encoded = descriptor.encode().unwrap();
+    assert_eq!(encoded.len(), 65_506);
+
+    let oversized = ArtifactDescriptor {
+        dependencies: vec![reference(ObjectType::ArtifactBlob); 1559],
+        ..descriptor
+    };
+    assert!(matches!(
+        oversized.encode(),
+        Err(FormatError::PayloadTooLarge { .. })
+    ));
+}
+
+#[test]
+fn artifact_chunk_entries_reject_zero_length_chunks() {
+    let entry = ArtifactChunkEntry {
+        actual_len: 0,
+        chunk: ObjectRef {
+            object_type: ObjectType::ArtifactChunk,
+            object_id: ObjectId::from_bytes([3; 32]),
+            encoded_len: 16,
+        },
+    };
+    assert!(matches!(
+        entry.encode(),
+        Err(FormatError::InvalidNativeView(_))
+    ));
 }

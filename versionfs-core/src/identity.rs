@@ -37,6 +37,11 @@ fixed_id!(
     "A SHA-256 content identity for one encoded Version FS object."
 );
 fixed_id!(
+    ObjectStoreScopeId,
+    16,
+    "A stable identity for one immutable-object namespace."
+);
+fixed_id!(
     WorkspaceId,
     16,
     "An opaque identity for one Version FS workspace."
