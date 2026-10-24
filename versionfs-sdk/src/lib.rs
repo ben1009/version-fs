@@ -1,5 +1,6 @@
 //! Version FS client transport, Linux worker integration, and capture coordination.
 
+pub mod barrier;
 pub mod object_cache;
 pub mod volume;
 

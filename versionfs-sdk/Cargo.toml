@@ -20,6 +20,8 @@ ublk-smoke = ["dep:ctrlc", "dep:libc", "dep:libublk"]
 ublk-adapter = ["dep:libc", "dep:libublk"]
 
 [dependencies]
+getrandom = "=0.3.4"
+sha2 = "=0.10.9"
 thiserror = "=2.0.21"
 versionfs-core = { path = "../versionfs-core" }
 

@@ -778,6 +778,17 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
             .map_err(|error| error.to_string())
     }
 
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        self.cache
+            .get_or_fetch(reference, |_, expected| {
+                self.backing
+                    .get_ref(expected)?
+                    .ok_or_else(|| format!("immutable object {} is missing", expected.object_id))
+            })
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
+
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
         let reference = ObjectRef::from_encoded(&bytes).map_err(|error| error.to_string())?;
         if reference.object_id != id {
@@ -788,6 +799,17 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
             Ok(_) | Err(CacheError::Io { .. } | CacheError::Poisoned) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+impl<S: versionfs_core::persistent_map::DurableObjectStore>
+    versionfs_core::persistent_map::DurableObjectStore for CachedMapStore<S>
+{
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        reference
+            .verify(encoded)
+            .map_err(|error| error.to_string())?;
+        self.backing.put_durable(reference, encoded)
     }
 }
 

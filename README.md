@@ -36,9 +36,11 @@ volume roots and native indexes. P4 adds the bounded local block path, verified
 workspace cache, extent readers/diff, and an opt-in single-queue ublk adapter.
 P5 adds backend-neutral control records and authority-backed tests for operation
 replay, branch claims, writer/attachment fencing, retention protections, and
-checkpoint capture admission. Durable FLUSH/FUA barriers remain in P6; the
-current ublk adapter reports the volatile cache and rejects those barriers. The
-service daemon and user-facing commands are still in progress.
+checkpoint capture admission. P6 adds an SDK barrier coordinator, local recovery
+journal, and a typed S3 bridge for durable live-volume roots. `DirtyVolume`
+remains volatile, while the generic ublk adapter derives FLUSH/FUA capability
+from its supplied block device. P6 is not yet qualified against real S3, ublk,
+or ext4. The service daemon and user-facing commands are still in progress.
 
 ## Development
 

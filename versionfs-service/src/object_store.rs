@@ -10,14 +10,18 @@ use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use object_store::path::Path;
 use object_store::{Error as S3Error, GetOptions, ObjectStore as S3Store, PutMode, PutOptions};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use versionfs_core::format::{
     ENVELOPE_HEADER_BYTES, MAX_ENCODED_OBJECT_BYTES, ObjectRef, ObjectType,
 };
-use versionfs_core::identity::{ObjectId, WorkspaceId};
+use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, WorkspaceId};
+use versionfs_core::persistent_map::{DurableObjectStore, MapObjectStore};
 
 /// Maximum number of objects returned by one inventory request.
 pub const MAX_INVENTORY_PAGE_SIZE: usize = 1_000;
@@ -228,6 +232,111 @@ pub struct S3ObjectStore {
     deployment_prefix: String,
     backend_namespace: String,
     transfer_budget: TransferBudget,
+}
+
+/// Synchronous typed map-store bridge for block workers using an S3 client.
+///
+/// Block algorithms run on the ublk request thread and require synchronous
+/// object reads. This adapter drives the async S3 client through the supplied
+/// Tokio handle. Call its map methods only from a thread outside a Tokio
+/// runtime; a runtime worker is rejected instead of being blocked or nested.
+pub struct BlockingS3MapObjectStore {
+    store: Arc<S3ObjectStore>,
+    workspace_id: WorkspaceId,
+    scope: ObjectStoreScopeId,
+    runtime: Handle,
+}
+
+impl BlockingS3MapObjectStore {
+    /// Creates a workspace-scoped bridge for one S3 store and runtime.
+    pub fn new(store: Arc<S3ObjectStore>, workspace_id: WorkspaceId, runtime: Handle) -> Self {
+        let mut scope_input =
+            Vec::with_capacity(store.backend_namespace.len() + workspace_id.as_bytes().len());
+        scope_input.extend_from_slice(store.backend_namespace.as_bytes());
+        scope_input.extend_from_slice(workspace_id.as_bytes());
+        let digest = Sha256::digest(&scope_input);
+        let scope = ObjectStoreScopeId::from_bytes(
+            digest[..16]
+                .try_into()
+                .expect("SHA-256 digest has at least 16 bytes"),
+        );
+        Self {
+            store,
+            workspace_id,
+            scope,
+            runtime,
+        }
+    }
+
+    fn block_on<T>(
+        &self,
+        future: impl Future<Output = Result<T, ObjectStoreError>>,
+    ) -> Result<T, String> {
+        if Handle::try_current().is_ok() {
+            return Err("blocking S3 map access cannot run on a Tokio runtime thread".to_owned());
+        }
+        self.runtime
+            .block_on(future)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl MapObjectStore for BlockingS3MapObjectStore {
+    fn proof_scope(&self) -> ObjectStoreScopeId {
+        self.scope
+    }
+
+    fn get(&self, _id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        Err("typed ObjectRef is required for workspace-scoped S3 reads".to_owned())
+    }
+
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        let store = Arc::clone(&self.store);
+        let workspace_id = self.workspace_id;
+        self.block_on(async move {
+            match store.get(workspace_id, reference).await {
+                Ok(encoded) => Ok(Some(encoded)),
+                Err(ObjectStoreError::NotFound { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        let reference = ObjectRef::from_encoded(&bytes).map_err(|error| error.to_string())?;
+        if reference.object_id != id {
+            return Err("object ID does not match encoded bytes".to_owned());
+        }
+        self.put_durable(reference, &bytes)
+    }
+}
+
+impl DurableObjectStore for BlockingS3MapObjectStore {
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        reference
+            .verify(encoded)
+            .map_err(|error| error.to_string())?;
+        let store = Arc::clone(&self.store);
+        let workspace_id = self.workspace_id;
+        let encoded = encoded.to_vec();
+        self.block_on(async move {
+            let stored = store.put(workspace_id, &encoded).await?;
+            if stored.object_ref != reference {
+                return Err(ObjectStoreError::IntegrityMismatch {
+                    workspace_id,
+                    object_id: reference.object_id,
+                });
+            }
+            let verified = store.get(workspace_id, reference).await?;
+            if verified != encoded {
+                return Err(ObjectStoreError::IntegrityMismatch {
+                    workspace_id,
+                    object_id: reference.object_id,
+                });
+            }
+            Ok(())
+        })
+    }
 }
 
 impl S3ObjectStore {
@@ -1079,6 +1188,37 @@ mod tests {
             store.get(workspace(3), first.object_ref).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocking_map_bridge_uses_typed_refs_and_verifies_durable_puts() {
+        let backend = Arc::new(MemoryBackend::default());
+        let store = Arc::new(make_store(backend));
+        let runtime = Handle::current();
+        let first_workspace =
+            BlockingS3MapObjectStore::new(Arc::clone(&store), workspace(1), runtime.clone());
+        let second_workspace =
+            BlockingS3MapObjectStore::new(Arc::clone(&store), workspace(2), runtime);
+        assert_ne!(
+            first_workspace.proof_scope(),
+            second_workspace.proof_scope()
+        );
+
+        std::thread::spawn(move || {
+            let mut first_workspace = first_workspace;
+            let bytes = encoded(ObjectType::ArtifactBlob, b"durable bridge");
+            let reference = ObjectRef::from_encoded(&bytes).expect("reference encoded object");
+            first_workspace
+                .put_durable(reference, &bytes)
+                .expect("conditionally store and verify object");
+            assert_eq!(
+                first_workspace.get_ref(reference).unwrap(),
+                Some(bytes.clone())
+            );
+            assert!(first_workspace.get(reference.object_id).is_err());
+        })
+        .join()
+        .expect("blocking S3 bridge thread");
     }
 
     #[tokio::test]

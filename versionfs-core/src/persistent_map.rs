@@ -29,8 +29,28 @@ pub trait MapObjectStore {
     /// Reads an object by content identity.
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String>;
 
+    /// Reads an object using its complete typed reference.
+    ///
+    /// Backends whose key layout includes the object type should override this
+    /// method. The default preserves compatibility with stores keyed only by
+    /// content identity.
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        self.get(reference.object_id)
+    }
+
     /// Stores bytes under their already-computed content identity.
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String>;
+}
+
+/// Immutable object store whose write acknowledgement means the object is durable.
+///
+/// `put_durable` must verify that `encoded` matches `reference`, conditionally
+/// create or verify identical immutable content, and return only after the
+/// object is durable and readable through the store's typed read path. A local
+/// cache write alone does not satisfy this contract.
+pub trait DurableObjectStore: MapObjectStore {
+    /// Persist one already-encoded immutable object and verify identical reuse.
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String>;
 }
 
 /// Errors returned while reading or mutating a persistent ordered map.
@@ -364,7 +384,7 @@ pub(crate) fn load_node<S: MapObjectStore>(
         return Err(FormatError::ObjectReferenceMismatch.into());
     }
     let bytes = store
-        .get(reference.object_id)
+        .get_ref(reference)
         .map_err(PersistentMapError::Store)?
         .ok_or(PersistentMapError::MissingObject(reference.object_id))?;
     let object = reference.verify(&bytes)?;

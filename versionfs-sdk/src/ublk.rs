@@ -1,6 +1,6 @@
 //! Linux ublk adapter for the fixed-capacity volatile block data path.
 
-use crate::volume::{BlockError, BlockRequest, BlockResponse, DirtyVolume};
+use crate::volume::{BlockDevice, BlockError, BlockRequest, BlockResponse};
 use libublk::ctrl::UblkCtrlBuilder;
 use libublk::helpers::IoBuf;
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkQueue};
@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use versionfs_core::format::LOGICAL_SECTOR_BYTES;
-use versionfs_core::persistent_map::MapObjectStore;
 
 const KERNEL_SECTOR_BYTES: u64 = 512;
 const UBLK_IO_F_FUA: u32 = 1 << 13;
@@ -20,26 +19,27 @@ type QueueInitializer =
 
 /// Serves one fixed-size, single-queue ublk device.
 ///
-/// The adapter advertises a volatile write cache and does not advertise native
-/// FUA. FLUSH and FUA requests fail until P6 supplies the remote durability path.
+/// Device cache and FUA capabilities follow the supplied [`BlockDevice`]. A
+/// volatile [`DirtyVolume`](crate::volume::DirtyVolume) rejects FLUSH/FUA, while
+/// a durable device may advertise FUA after its remote barrier path is qualified.
 /// The shutdown receiver is consumed by the device-control thread; sending a
 /// value asks ublk to stop the queue and remove the device.
-pub fn run_device<S: MapObjectStore + Send + 'static>(
+pub fn run_device<D: BlockDevice + Send + 'static>(
     name: &str,
-    volume: Arc<Mutex<DirtyVolume<S>>>,
+    volume: Arc<Mutex<D>>,
     shutdown: mpsc::Receiver<()>,
 ) -> Result<i32, UblkError> {
     run_device_with_queue_initializer(name, volume, shutdown, UblkQueue::new)
 }
 
-fn run_device_with_queue_initializer<S: MapObjectStore + Send + 'static>(
+fn run_device_with_queue_initializer<D: BlockDevice + Send + 'static>(
     name: &str,
-    volume: Arc<Mutex<DirtyVolume<S>>>,
+    volume: Arc<Mutex<D>>,
     shutdown: mpsc::Receiver<()>,
     initialize_queue: QueueInitializer,
 ) -> Result<i32, UblkError> {
-    let capacity_bytes = match volume.lock() {
-        Ok(volume) => volume.geometry().capacity_bytes,
+    let (capacity_bytes, supports_fua) = match volume.lock() {
+        Ok(volume) => (volume.geometry().capacity_bytes, volume.supports_fua()),
         Err(_) => return Err(UblkError::InvalidVal),
     };
     let ctrl = UblkCtrlBuilder::default()
@@ -64,8 +64,9 @@ fn run_device_with_queue_initializer<S: MapObjectStore + Send + 'static>(
             device.tgt.params.basic.physical_bs_shift = 12;
             device.tgt.params.basic.io_min_shift = 12;
             device.tgt.params.basic.io_opt_shift = 12;
-            // `set_default_params` sets VOLATILE_CACHE only. Do not set
-            // UBLK_ATTR_FUA before the remote barrier path exists.
+            if supports_fua {
+                device.tgt.params.basic.attrs |= libublk::sys::UBLK_ATTR_FUA;
+            }
             Ok::<(), UblkError>(())
         },
         move |queue_id, device| {
@@ -139,10 +140,10 @@ fn run_device_with_queue_initializer<S: MapObjectStore + Send + 'static>(
     Ok(0)
 }
 
-fn serve_queue<S: MapObjectStore + Send + 'static>(
+fn serve_queue<D: BlockDevice + Send + 'static>(
     queue_id: u16,
     device: &UblkDev,
-    volume: Arc<Mutex<DirtyVolume<S>>>,
+    volume: Arc<Mutex<D>>,
     queue_errors: mpsc::Sender<()>,
     queue_start_error: Arc<Mutex<Option<UblkError>>>,
     initialize_queue: QueueInitializer,
@@ -221,8 +222,8 @@ fn prepare_queue_buffers(mut buffers: Vec<IoBuf<u8>>) -> Result<Vec<IoBuf<u8>>, 
     Ok(buffers)
 }
 
-fn dispatch_request<S: MapObjectStore + Send>(
-    volume: &Mutex<DirtyVolume<S>>,
+fn dispatch_request<D: BlockDevice>(
+    volume: &Mutex<D>,
     operation: u32,
     has_fua: bool,
     start_sector: u64,
@@ -230,7 +231,14 @@ fn dispatch_request<S: MapObjectStore + Send>(
     buffer: &mut [u8],
 ) -> i32 {
     if operation == libublk::sys::UBLK_IO_OP_FLUSH {
-        return -libc::EOPNOTSUPP;
+        let Ok(mut volume) = volume.lock() else {
+            return -libc::EIO;
+        };
+        return match volume.dispatch(BlockRequest::Flush) {
+            Ok(BlockResponse::Written(_)) => 0,
+            Ok(BlockResponse::Read(_)) => -libc::EIO,
+            Err(error) => error_to_errno(error),
+        };
     }
     if !matches!(
         operation,
@@ -289,7 +297,10 @@ fn error_to_errno(error: BlockError) -> i32 {
             -libc::EOPNOTSUPP
         }
         BlockError::Format(_) => -libc::EINVAL,
-        BlockError::View(_) | BlockError::InvalidDirtyCapacity => -libc::EIO,
+        BlockError::View(_)
+        | BlockError::InvalidDirtyCapacity
+        | BlockError::BarrierUnresolved
+        | BlockError::Barrier(_) => -libc::EIO,
     }
 }
 
@@ -311,6 +322,7 @@ fn complete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::volume::DirtyVolume;
     use std::collections::HashMap;
     use versionfs_core::format::VolumeGeometry;
     use versionfs_core::identity::{ObjectId, ObjectStoreScopeId};

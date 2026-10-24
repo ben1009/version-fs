@@ -2879,8 +2879,10 @@ name = "versionfs-sdk"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "getrandom 0.3.4",
  "libc",
  "libublk",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "versionfs-core",
 ]
@@ -2893,6 +2895,7 @@ dependencies = [
  "futures-util",
  "kv-engine",
  "object_store",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "versionfs-core",

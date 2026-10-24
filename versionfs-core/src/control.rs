@@ -69,6 +69,11 @@ const OP_TOMBSTONE: u16 = u16::MAX;
 pub struct OwnerIncarnation(u64);
 
 impl OwnerIncarnation {
+    /// Reconstructs an incarnation from its durable fixed-width value.
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     /// Returns the monotone value persisted by start_authority_owner.
     pub const fn get(self) -> u64 {
         self.0
