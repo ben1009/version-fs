@@ -1147,13 +1147,12 @@ where
                     .as_ref()
                     .filter(|capture| !capture.sealed)
                     .and_then(|capture| capture.pending_child)
-                {
-                    if matches!(
+                    && matches!(
                         self.control.abort_operation(child_id)?,
                         OperationState::Committed(_)
-                    ) {
-                        self.refresh_clean_branch()?;
-                    }
+                    )
+                {
+                    self.refresh_clean_branch()?;
                 }
                 return Ok(());
             }
