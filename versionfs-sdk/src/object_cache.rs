@@ -779,14 +779,14 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
     }
 
     fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
-        self.cache
-            .get_or_fetch(reference, |_, expected| {
-                self.backing
-                    .get_ref(expected)?
-                    .ok_or_else(|| format!("immutable object {} is missing", expected.object_id))
-            })
-            .map(Some)
-            .map_err(|error| error.to_string())
+        let bytes = self
+            .cache
+            .get_or_fetch_id(reference.object_id, |_| self.backing.get_ref(reference))
+            .map_err(|error| error.to_string())?;
+        if let Some(bytes) = &bytes {
+            reference.verify(bytes).map_err(|error| error.to_string())?;
+        }
+        Ok(bytes)
     }
 
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
@@ -1706,5 +1706,18 @@ mod tests {
         assert_eq!(store.backing().gets.load(Ordering::SeqCst), 0);
         assert_eq!(store.get(ObjectId::from_bytes([0; 32])).unwrap(), None);
         assert_eq!(store.backing().gets.load(Ordering::SeqCst), 1);
+
+        let (uncached_reference, uncached_bytes) = encoded_object(0xB9);
+        store
+            .backing
+            .objects
+            .insert(uncached_reference.object_id, uncached_bytes.clone());
+        assert_eq!(
+            store.get_ref(uncached_reference).unwrap(),
+            Some(uncached_bytes)
+        );
+
+        let (missing_reference, _) = encoded_object(0xC9);
+        assert_eq!(store.get_ref(missing_reference).unwrap(), None);
     }
 }

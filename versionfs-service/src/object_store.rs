@@ -14,8 +14,9 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use thiserror::Error;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use versionfs_core::format::{
     ENVELOPE_HEADER_BYTES, MAX_ENCODED_OBJECT_BYTES, ObjectRef, ObjectType,
@@ -30,6 +31,7 @@ pub const DEFAULT_WORKSPACE_TRANSFER_LIMIT: usize = 8;
 /// Default concurrent object transfers admitted by one service instance.
 pub const DEFAULT_SERVICE_TRANSFER_LIMIT: usize = 32;
 const MAX_UPLOAD_ATTEMPTS: usize = 2;
+const MAX_BLOCKING_S3_OPERATION: Duration = Duration::from_secs(5 * 60);
 
 /// Errors returned by the trusted object layer.
 #[derive(Debug, Error)]
@@ -238,8 +240,10 @@ pub struct S3ObjectStore {
 ///
 /// Block algorithms run on the ublk request thread and require synchronous
 /// object reads. This adapter drives the async S3 client through the supplied
-/// Tokio handle. Call its map methods only from a thread outside a Tokio
-/// runtime; a runtime worker is rejected instead of being blocked or nested.
+/// multi-thread Tokio handle. Call its map methods only from a thread outside a
+/// Tokio runtime; a runtime worker and a current-thread runtime are rejected
+/// instead of being blocked or left idle. Every S3 operation is bounded to five
+/// minutes so protected barrier preparation can be renewed between operations.
 pub struct BlockingS3MapObjectStore {
     store: Arc<S3ObjectStore>,
     workspace_id: WorkspaceId,
@@ -272,12 +276,28 @@ impl BlockingS3MapObjectStore {
         &self,
         future: impl Future<Output = Result<T, ObjectStoreError>>,
     ) -> Result<T, String> {
+        self.block_on_with_timeout(future, MAX_BLOCKING_S3_OPERATION)
+    }
+
+    fn block_on_with_timeout<T>(
+        &self,
+        future: impl Future<Output = Result<T, ObjectStoreError>>,
+        timeout: Duration,
+    ) -> Result<T, String> {
         if Handle::try_current().is_ok() {
             return Err("blocking S3 map access cannot run on a Tokio runtime thread".to_owned());
         }
-        self.runtime
-            .block_on(future)
-            .map_err(|error| error.to_string())
+        if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread {
+            return Err("blocking S3 map access requires a multi-thread Tokio runtime".to_owned());
+        }
+        match self
+            .runtime
+            .block_on(async move { tokio::time::timeout(timeout, future).await })
+        {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err(format!("S3 map operation exceeded {timeout:?}")),
+        }
     }
 }
 
@@ -1219,6 +1239,45 @@ mod tests {
         })
         .join()
         .expect("blocking S3 bridge thread");
+    }
+
+    #[test]
+    fn blocking_map_bridge_rejects_current_thread_runtime_handles() {
+        let backend = Arc::new(MemoryBackend::default());
+        let store = Arc::new(make_store(backend));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+        let bridge = BlockingS3MapObjectStore::new(store, workspace(1), runtime.handle().clone());
+        let bytes = encoded(ObjectType::ArtifactBlob, b"typed read");
+        let reference = ObjectRef::from_encoded(&bytes).expect("typed reference");
+
+        let error = bridge
+            .get_ref(reference)
+            .expect_err("idle current-thread runtime must not stall the worker");
+        assert!(error.contains("multi-thread Tokio runtime"));
+    }
+
+    #[test]
+    fn blocking_map_bridge_enforces_operation_deadlines() {
+        let backend = Arc::new(MemoryBackend::default());
+        let store = Arc::new(make_store(backend));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(1)
+            .build()
+            .expect("build multi-thread runtime");
+        let bridge = BlockingS3MapObjectStore::new(store, workspace(1), runtime.handle().clone());
+
+        let result = bridge.block_on_with_timeout(
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok::<(), ObjectStoreError>(())
+            },
+            Duration::from_millis(10),
+        );
+        assert!(result.unwrap_err().contains("exceeded"));
     }
 
     #[tokio::test]

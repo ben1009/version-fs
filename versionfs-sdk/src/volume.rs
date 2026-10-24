@@ -1,11 +1,13 @@
 //! Fixed-geometry block request handling and a bounded worker-local dirty overlay.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
-use versionfs_core::format::{EXTENT_BYTES, FormatError, ObjectRef, ObjectType, encode_object};
+use versionfs_core::format::{
+    EXTENT_BYTES, FormatError, ObjectRef, ObjectType, VolumeRoot, encode_object,
+};
 use versionfs_core::identity::ObjectId;
-use versionfs_core::persistent_map::MapObjectStore;
+use versionfs_core::persistent_map::{MapObjectStore, PersistentBTree};
 use versionfs_core::views::{ViewError, VolumeExtentMap};
 
 const EXTENT_SIZE: usize = EXTENT_BYTES as usize;
@@ -283,6 +285,11 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         self.dirty.clear();
     }
 
+    /// Replaces the authoritative base while preserving the local dirty overlay.
+    pub(crate) fn rebase_base(&mut self, base: VolumeExtentMap) {
+        self.base = base;
+    }
+
     /// Dispatches supported ordinary I/O and rejects unsupported barriers/ops.
     pub fn dispatch(&mut self, request: BlockRequest<'_>) -> Result<BlockResponse, BlockError> {
         match request {
@@ -322,11 +329,29 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         }
 
         let volume_root = map.seal(&mut staging)?;
-        let objects = staging
-            .into_objects()?
-            .into_iter()
-            .map(|(reference, encoded)| StagedObject { reference, encoded })
-            .collect();
+        let encoded_root = staging
+            .get_ref(volume_root)
+            .map_err(ViewError::Store)?
+            .ok_or(ViewError::MissingObject(volume_root.object_id))?;
+        let root = VolumeRoot::decode(&encoded_root)?;
+        let tree = PersistentBTree::from_root(root.extent_map_root).map_err(ViewError::from)?;
+        let mut reachable = vec![volume_root];
+        reachable.extend(dirty_extent_refs.iter().map(|(_, reference)| *reference));
+        let mut pending_nodes = vec![root.extent_map_root];
+        let mut visited_nodes = BTreeSet::new();
+        while let Some(reference) = pending_nodes.pop() {
+            if !staging.contains_staged(reference.object_id)
+                || !visited_nodes.insert(reference.object_id)
+            {
+                continue;
+            }
+            reachable.push(reference);
+            pending_nodes.extend(
+                tree.child_refs(&staging, reference)
+                    .map_err(ViewError::from)?,
+            );
+        }
+        let objects = staging.into_objects_referenced(reachable)?;
         Ok(Some(StagedVolume {
             volume_root,
             dirty_revision: self.revision,
@@ -449,6 +474,10 @@ impl<'a, S: MapObjectStore> StagingMapStore<'a, S> {
         }
     }
 
+    pub(crate) fn contains_staged(&self, id: ObjectId) -> bool {
+        self.staged.contains_key(&id)
+    }
+
     pub(crate) fn into_objects(self) -> Result<Vec<(ObjectRef, Vec<u8>)>, FormatError> {
         self.staged
             .into_iter()
@@ -460,6 +489,31 @@ impl<'a, S: MapObjectStore> StagingMapStore<'a, S> {
                 Ok((reference, encoded))
             })
             .collect()
+    }
+
+    pub(crate) fn into_objects_referenced(
+        self,
+        references: impl IntoIterator<Item = ObjectRef>,
+    ) -> Result<Vec<StagedObject>, FormatError> {
+        let mut referenced = BTreeMap::new();
+        for reference in references {
+            if referenced
+                .insert(reference.object_id, reference)
+                .is_some_and(|existing| existing != reference)
+            {
+                return Err(FormatError::ObjectReferenceMismatch);
+            }
+        }
+
+        let mut objects = Vec::new();
+        for (id, encoded) in self.staged {
+            let Some(reference) = referenced.get(&id).copied() else {
+                continue;
+            };
+            reference.verify(&encoded)?;
+            objects.push(StagedObject { reference, encoded });
+        }
+        Ok(objects)
     }
 }
 

@@ -68,6 +68,13 @@ pub struct PendingBarrier {
     pub renewal_grant: Option<WriterGrant>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeStep {
+    Continue,
+    Restarted,
+    Completed,
+}
+
 /// Durable storage for barrier IDs and sealed local recovery state.
 ///
 /// Implementations must keep this state outside the exported block volume. ID
@@ -88,6 +95,13 @@ pub trait BarrierJournal {
     /// Durably replaces the pending recovery record before remote I/O continues.
     fn persist_pending(&mut self, barrier: &PendingBarrier) -> Result<(), String>;
 
+    /// Atomically replaces one exact terminal pending barrier with its retry.
+    fn replace_pending(
+        &mut self,
+        expected_operation_id: OperationId,
+        replacement: &PendingBarrier,
+    ) -> Result<(), String>;
+
     /// Durably removes a terminal pending barrier record.
     fn finish_pending(&mut self, operation_id: OperationId) -> Result<(), String>;
 }
@@ -100,12 +114,14 @@ static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 /// Crash-safe file journal for one writable block attachment.
 ///
 /// The directory must be dedicated to this journal on a local filesystem
-/// outside the exported volume. On Unix, this type restricts it to mode `0700`
-/// and creates files with mode `0600`; other platforms must provide equivalent
-/// ACL protection. An exclusive OS file lock enforces one process per journal
-/// directory. It is safe to reopen the directory after that process exits; this
-/// is not a cross-host coordination mechanism. Each ID reservation and
-/// pending-record replacement is fsynced before this type returns success.
+/// outside the exported volume. This implementation supports Unix, restricts
+/// the directory to mode `0700`, and creates files with mode `0600`. Other
+/// platforms need a different [`BarrierJournal`] implementation that enforces
+/// equivalent ACL and atomic-replacement guarantees. An exclusive OS file lock
+/// enforces one process per journal directory. It is safe to reopen the
+/// directory after that process exits; this is not a cross-host coordination
+/// mechanism. Each ID reservation and pending-record replacement is fsynced
+/// before this type returns success.
 pub struct FileBarrierJournal {
     directory: PathBuf,
     ids_path: PathBuf,
@@ -118,7 +134,23 @@ pub struct FileBarrierJournal {
 impl FileBarrierJournal {
     /// Opens or initializes one journal directory.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, String> {
-        let directory = directory.as_ref().to_path_buf();
+        #[cfg(not(unix))]
+        {
+            let _ = directory;
+            return Err(
+                "FileBarrierJournal requires Unix private permissions; provide another BarrierJournal implementation".to_owned(),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            Self::open_unix(directory.as_ref())
+        }
+    }
+
+    #[cfg(unix)]
+    fn open_unix(directory: &Path) -> Result<Self, String> {
+        let directory = directory.to_path_buf();
         fs::create_dir_all(&directory).map_err(journal_io("create journal directory"))?;
         restrict_journal_directory(&directory)?;
         let ids_path = directory.join("barrier-ids.v1");
@@ -233,6 +265,21 @@ impl BarrierJournal for FileBarrierJournal {
             return Err("another barrier is already pending in this journal".to_owned());
         }
         let bytes = encode_pending_file(barrier)?;
+        atomic_replace(&self.directory, &self.pending_path, &bytes)
+    }
+
+    fn replace_pending(
+        &mut self,
+        expected_operation_id: OperationId,
+        replacement: &PendingBarrier,
+    ) -> Result<(), String> {
+        validate_pending(replacement)?;
+        match self.load_pending()? {
+            Some(existing) if existing.operation_id == expected_operation_id => {}
+            Some(_) => return Err("cannot replace a different pending barrier".to_owned()),
+            None => return Err("cannot replace a missing pending barrier".to_owned()),
+        }
+        let bytes = encode_pending_file(replacement)?;
         atomic_replace(&self.directory, &self.pending_path, &bytes)
     }
 
@@ -560,11 +607,6 @@ fn restrict_journal_directory(directory: &Path) -> Result<(), String> {
         .map_err(journal_io("restrict barrier journal directory permissions"))
 }
 
-#[cfg(not(unix))]
-fn restrict_journal_directory(_directory: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 fn set_private_creation_mode(options: &mut OpenOptions, mode: u32) {
     #[cfg(unix)]
     {
@@ -701,6 +743,9 @@ pub trait VolumeBarrierControl: Send + Sync {
         roots: LiveRoots,
     ) -> Result<BranchState, ControlError>;
 
+    /// Aborts a preparation or tombstones an operation ID that never began.
+    fn abort_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
+
     /// Reads the exact state of a barrier operation for recovery.
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
 }
@@ -741,6 +786,10 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
             roots,
             None,
         )
+    }
+
+    fn abort_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
+        WorkspaceControl::abort_operation(self, operation_id)
     }
 
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
@@ -936,57 +985,40 @@ where
         max_dirty_bytes: usize,
     ) -> Result<Self, BarrierError> {
         let branch = control.get_branch(branch_id)?;
-        let current_grant = branch.writer.ok_or(BarrierError::Fenced)?;
+        let current_grant = validate_attachment(
+            &branch,
+            branch_id,
+            attachment_id,
+            branch.volume_epoch,
+            writer_grant,
+        )?;
         let attachment = branch.attachment.ok_or(BarrierError::Fenced)?;
-        if !same_grant_identity(current_grant, writer_grant)
-            || attachment.attachment_id != attachment_id
-            || attachment.writer_epoch != current_grant.writer_epoch
-            || attachment.volume_epoch != branch.volume_epoch
-        {
-            return Err(BarrierError::Fenced);
-        }
         let base = load_map(&store, branch.volume_root)?;
         let mut inner = DirtyVolume::new(store, base, max_dirty_bytes)?;
-        let mut pending = journal.load_pending().map_err(BarrierError::Journal)?;
-        let mut aborted_dirty_root = None;
+        let pending = journal.load_pending().map_err(BarrierError::Journal)?;
         if let Some(barrier) = &pending {
             if barrier.branch_id != branch_id
                 || barrier.attachment_id != attachment_id
+                || barrier.volume_epoch != attachment.volume_epoch
                 || !same_grant_identity(barrier.writer_grant, current_grant)
             {
                 return Err(BarrierError::Fenced);
             }
             match control.get_operation(barrier.operation_id) {
-                Ok(OperationState::Committed(_)) => {
-                    let latest = control.get_branch(branch_id)?;
-                    inner.replace_base(load_map_from_dirty(&inner, latest.volume_root)?);
-                    journal
-                        .finish_pending(barrier.operation_id)
-                        .map_err(BarrierError::Journal)?;
-                    pending = None;
-                }
+                Ok(OperationState::Committed(_)) => {}
                 Ok(OperationState::Aborted) => {
-                    if branch.volume_root != barrier.previous_roots.volume {
-                        return Err(BarrierError::Conflict);
-                    }
                     inner.restore_pending_dirty(
                         barrier.dirty_revision,
                         &barrier.dirty_extent_refs,
                         &barrier.objects,
                     )?;
-                    aborted_dirty_root = Some(barrier.previous_roots.volume);
-                    journal
-                        .finish_pending(barrier.operation_id)
-                        .map_err(BarrierError::Journal)?;
-                    pending = None;
                 }
                 Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {
-                    if branch.revision != barrier.expected_revision
-                        || roots(&branch) != barrier.previous_roots
+                    if branch.revision == barrier.expected_revision
+                        && roots(&branch) == barrier.previous_roots
                     {
-                        return Err(BarrierError::Conflict);
+                        inner.load_staged_map(barrier.next_roots.volume, &barrier.objects)?;
                     }
-                    inner.load_staged_map(barrier.next_roots.volume, &barrier.objects)?;
                     inner.restore_pending_dirty(
                         barrier.dirty_revision,
                         &barrier.dirty_extent_refs,
@@ -996,38 +1028,40 @@ where
                 Err(error) => return Err(error.into()),
             }
         }
-        let branch = control.get_branch(branch_id)?;
-        let pending_journaled = pending.is_some();
-        let current_grant = validate_attachment(
-            &branch,
-            branch_id,
-            attachment_id,
-            branch.volume_epoch,
-            writer_grant,
-        )?;
-        if let Some(barrier) = &pending
-            && (branch.revision != barrier.expected_revision
-                || roots(&branch) != barrier.previous_roots)
-        {
-            return Err(BarrierError::Conflict);
-        }
-        if aborted_dirty_root.is_some_and(|root| branch.volume_root != root) {
-            return Err(BarrierError::Conflict);
-        }
-        Ok(Self {
+        let mut volume = Self {
             inner,
             control,
             journal,
             branch_id,
             writer_grant: current_grant,
             attachment_id,
-            volume_epoch: branch.attachment.ok_or(BarrierError::Fenced)?.volume_epoch,
+            volume_epoch: attachment.volume_epoch,
             live_roots: roots(&branch),
             revision: branch.revision,
+            pending_journaled: pending.is_some(),
             pending,
-            pending_journaled,
             last_renewal: None,
-        })
+        };
+        if volume.pending.is_some() {
+            volume.resume_pending()?;
+        } else {
+            let latest = volume.control.get_branch(branch_id)?;
+            let latest_grant = validate_attachment(
+                &latest,
+                branch_id,
+                attachment_id,
+                volume.volume_epoch,
+                writer_grant,
+            )?;
+            if latest.volume_root != volume.live_roots.volume {
+                let latest_map = volume.inner.load_map(latest.volume_root)?;
+                volume.inner.replace_base(latest_map);
+            }
+            volume.live_roots = roots(&latest);
+            volume.revision = latest.revision;
+            volume.writer_grant = latest_grant;
+        }
+        Ok(volume)
     }
 
     /// Persists all currently dirty writes and advances the authoritative live root.
@@ -1090,127 +1124,182 @@ where
     }
 
     fn resume_pending(&mut self) -> Result<(), BarrierError> {
-        self.ensure_pending_journaled()?;
-        let barrier = self.pending.as_ref().ok_or(BarrierError::Conflict)?;
-        let operation_id = barrier.operation_id;
-        let branch_id = barrier.branch_id;
-        let expected_revision = barrier.expected_revision;
-        let attachment_id = barrier.attachment_id;
-        let volume_epoch = barrier.volume_epoch;
-        let previous_roots = barrier.previous_roots;
-        let next_roots = barrier.next_roots;
-        let saved_grant = barrier.writer_grant;
-        let branch = self.control.get_branch(self.branch_id)?;
-        let current_grant =
-            validate_attachment(&branch, branch_id, attachment_id, volume_epoch, saved_grant)?;
+        loop {
+            self.ensure_pending_journaled()?;
+            let barrier = self.pending.as_ref().ok_or(BarrierError::Conflict)?;
+            let operation_id = barrier.operation_id;
+            let branch_id = barrier.branch_id;
+            let expected_revision = barrier.expected_revision;
+            let attachment_id = barrier.attachment_id;
+            let volume_epoch = barrier.volume_epoch;
+            let previous_roots = barrier.previous_roots;
+            let next_roots = barrier.next_roots;
+            let saved_grant = barrier.writer_grant;
+            let branch = self.control.get_branch(self.branch_id)?;
+            let current_grant =
+                validate_attachment(&branch, branch_id, attachment_id, volume_epoch, saved_grant)?;
 
-        let operation_state = self.control.get_operation(operation_id);
-        let was_preparing = matches!(&operation_state, Ok(OperationState::Preparing { .. }));
-        let was_not_found = matches!(&operation_state, Err(ControlError::NotFound));
-        match operation_state {
-            Ok(OperationState::Committed(_)) => return self.finish_committed(),
-            Ok(OperationState::Aborted) => {
-                if branch.volume_root != previous_roots.volume {
-                    return Err(BarrierError::Conflict);
+            match self.control.get_operation(operation_id) {
+                Ok(OperationState::Committed(_)) => return self.finish_committed(),
+                Ok(OperationState::Aborted) => {
+                    if self.restart_pending(&branch, current_grant)? {
+                        return Ok(());
+                    }
+                    continue;
                 }
-                self.journal
-                    .finish_pending(operation_id)
-                    .map_err(BarrierError::Journal)?;
-                self.pending = None;
-                self.pending_journaled = false;
-                return Err(BarrierError::Aborted);
+                Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {}
+                Err(error) => return Err(error.into()),
             }
-            Ok(OperationState::Preparing { .. }) => {}
-            Err(ControlError::NotFound) => {}
-            Err(error) => return Err(error.into()),
-        }
 
-        if was_preparing || was_not_found {
             if branch.revision != expected_revision || roots(&branch) != previous_roots {
-                return Err(BarrierError::Conflict);
+                if self.abort_and_restage(operation_id)? {
+                    return Ok(());
+                }
+                continue;
             }
-            let pending = self.pending.as_ref().ok_or(BarrierError::Conflict)?;
+            let staged_objects = self
+                .pending
+                .as_ref()
+                .ok_or(BarrierError::Conflict)?
+                .objects
+                .as_slice();
             self.inner
-                .load_staged_map(next_roots.volume, &pending.objects)?;
-        }
+                .load_staged_map(next_roots.volume, staged_objects)?;
 
-        if was_not_found {
-            let state = self.control.begin_preparation(PreparationRequest {
-                operation_id,
+            if matches!(
+                self.control.get_operation(operation_id),
+                Err(ControlError::NotFound)
+            ) {
+                match self.control.begin_preparation(PreparationRequest {
+                    operation_id,
+                    branch_id,
+                    expected_revision,
+                    grant: current_grant,
+                    attachment_id,
+                    volume_epoch,
+                    protection_id: self
+                        .pending
+                        .as_ref()
+                        .ok_or(BarrierError::Conflict)?
+                        .protection_id,
+                    kind: PreparationKind::VolumeBarrier,
+                    expected_roots: Some(next_roots),
+                    dependencies: vec![next_roots.volume],
+                }) {
+                    Ok(OperationState::Committed(_)) => return self.finish_committed(),
+                    Ok(OperationState::Preparing { .. }) => {
+                        self.last_renewal = Some(Instant::now());
+                    }
+                    Ok(OperationState::Aborted) => {
+                        if self.restart_pending(&branch, current_grant)? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(ControlError::Conflict) => {
+                        if self.abort_and_restage(operation_id)? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+
+            if self.last_renewal.is_none() {
+                match self.renew_preparation(current_grant) {
+                    Ok(()) => {}
+                    Err(BarrierError::Control(ControlError::Expired)) => {
+                        if self.abort_and_restage(operation_id)? {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            let upload_count = self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.objects.len());
+            let mut restarted = false;
+            for index in 0..upload_count {
+                match self.renew_if_due()? {
+                    ResumeStep::Continue => {}
+                    ResumeStep::Restarted => {
+                        restarted = true;
+                        break;
+                    }
+                    ResumeStep::Completed => return Ok(()),
+                }
+                let object = &self.pending.as_ref().ok_or(BarrierError::Conflict)?.objects[index];
+                object
+                    .reference
+                    .verify(&object.encoded)
+                    .map_err(BarrierError::Format)?;
+                self.inner
+                    .store_mut()
+                    .put_durable(object.reference, &object.encoded)
+                    .map_err(BarrierError::ObjectStore)?;
+            }
+            if restarted {
+                continue;
+            }
+
+            let latest = self.control.get_branch(self.branch_id)?;
+            let current_grant = validate_attachment(
+                &latest,
                 branch_id,
-                expected_revision,
-                grant: current_grant,
                 attachment_id,
                 volume_epoch,
-                protection_id: self
-                    .pending
-                    .as_ref()
-                    .ok_or(BarrierError::Conflict)?
-                    .protection_id,
-                kind: PreparationKind::VolumeBarrier,
-                expected_roots: Some(next_roots),
-                dependencies: vec![next_roots.volume],
-            })?;
-            if matches!(state, OperationState::Committed(_)) {
-                return self.finish_committed();
+                current_grant,
+            )?;
+            if latest.revision != expected_revision || roots(&latest) != previous_roots {
+                if self.abort_and_restage(operation_id)? {
+                    return Ok(());
+                }
+                continue;
             }
-            self.last_renewal = Some(Instant::now());
+            let committed = match self.control.commit_live_roots(
+                operation_id,
+                expected_revision,
+                current_grant,
+                next_roots,
+            ) {
+                Ok(branch) => branch,
+                Err(ControlError::Conflict) => {
+                    if self.abort_and_restage(operation_id)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(ControlError::Expired) => {
+                    if self.abort_and_restage(operation_id)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let map = self.inner.load_map(committed.volume_root)?;
+            let dirty_revision = self
+                .pending
+                .as_ref()
+                .ok_or(BarrierError::Conflict)?
+                .dirty_revision;
+            self.inner.commit_durable_map(map, dirty_revision)?;
+            self.live_roots = roots(&committed);
+            self.revision = committed.revision;
+            self.writer_grant = committed.writer.ok_or(BarrierError::Fenced)?;
+            self.journal
+                .finish_pending(operation_id)
+                .map_err(BarrierError::Journal)?;
+            self.pending = None;
+            self.pending_journaled = false;
+            self.last_renewal = None;
+            return Ok(());
         }
-
-        if self.last_renewal.is_none() {
-            self.renew_preparation(current_grant)?;
-        }
-        let upload_count = self
-            .pending
-            .as_ref()
-            .map_or(0, |pending| pending.objects.len());
-        for index in 0..upload_count {
-            self.maybe_renew()?;
-            let object = &self.pending.as_ref().ok_or(BarrierError::Conflict)?.objects[index];
-            object
-                .reference
-                .verify(&object.encoded)
-                .map_err(BarrierError::Format)?;
-            self.inner
-                .store_mut()
-                .put_durable(object.reference, &object.encoded)
-                .map_err(BarrierError::ObjectStore)?;
-        }
-
-        let latest = self.control.get_branch(self.branch_id)?;
-        let current_grant = validate_attachment(
-            &latest,
-            branch_id,
-            attachment_id,
-            volume_epoch,
-            current_grant,
-        )?;
-        if latest.revision != expected_revision || roots(&latest) != previous_roots {
-            return Err(BarrierError::Conflict);
-        }
-        let committed = self.control.commit_live_roots(
-            operation_id,
-            expected_revision,
-            current_grant,
-            next_roots,
-        )?;
-        let map = self.inner.load_map(committed.volume_root)?;
-        let dirty_revision = self
-            .pending
-            .as_ref()
-            .ok_or(BarrierError::Conflict)?
-            .dirty_revision;
-        self.inner.commit_durable_map(map, dirty_revision)?;
-        self.live_roots = roots(&committed);
-        self.revision = committed.revision;
-        self.writer_grant = committed.writer.ok_or(BarrierError::Fenced)?;
-        self.journal
-            .finish_pending(operation_id)
-            .map_err(BarrierError::Journal)?;
-        self.pending = None;
-        self.pending_journaled = false;
-        self.last_renewal = None;
-        Ok(())
     }
 
     fn ensure_pending_journaled(&mut self) -> Result<(), BarrierError> {
@@ -1225,7 +1314,7 @@ where
         Ok(())
     }
 
-    fn maybe_renew(&mut self) -> Result<(), BarrierError> {
+    fn renew_if_due(&mut self) -> Result<ResumeStep, BarrierError> {
         let unresolved = self
             .pending
             .as_ref()
@@ -1236,6 +1325,7 @@ where
         if unresolved || due {
             let branch = self.control.get_branch(self.branch_id)?;
             let pending = self.pending.as_ref().ok_or(BarrierError::Conflict)?;
+            let operation_id = pending.operation_id;
             let grant = validate_attachment(
                 &branch,
                 pending.branch_id,
@@ -1243,9 +1333,85 @@ where
                 pending.volume_epoch,
                 pending.writer_grant,
             )?;
-            self.renew_preparation(grant)?;
+            match self.renew_preparation(grant) {
+                Ok(()) => {}
+                Err(BarrierError::Control(ControlError::Expired)) => {
+                    return if self.abort_and_restage(operation_id)? {
+                        Ok(ResumeStep::Completed)
+                    } else {
+                        Ok(ResumeStep::Restarted)
+                    };
+                }
+                Err(error) => return Err(error),
+            }
         }
-        Ok(())
+        Ok(ResumeStep::Continue)
+    }
+
+    fn abort_and_restage(&mut self, operation_id: OperationId) -> Result<bool, BarrierError> {
+        match self.control.abort_operation(operation_id)? {
+            OperationState::Committed(_) => {
+                self.finish_committed()?;
+                Ok(true)
+            }
+            OperationState::Aborted => {
+                let branch = self.control.get_branch(self.branch_id)?;
+                let grant = validate_attachment(
+                    &branch,
+                    self.branch_id,
+                    self.attachment_id,
+                    self.volume_epoch,
+                    self.writer_grant,
+                )?;
+                self.restart_pending(&branch, grant)
+            }
+            OperationState::Preparing { .. } => Err(BarrierError::Conflict),
+        }
+    }
+
+    /// Rebuilds the pending volume map over the latest authoritative roots.
+    /// Returns true when no dirty overlay remains and the pending record is gone.
+    fn restart_pending(
+        &mut self,
+        branch: &BranchState,
+        grant: WriterGrant,
+    ) -> Result<bool, BarrierError> {
+        let old_operation_id = self
+            .pending
+            .as_ref()
+            .ok_or(BarrierError::Conflict)?
+            .operation_id;
+        let base = self.inner.load_map(branch.volume_root)?;
+        self.inner.rebase_base(base);
+        self.live_roots = roots(branch);
+        self.revision = branch.revision;
+        self.writer_grant = grant;
+        let Some(staged) = self.inner.stage_dirty()? else {
+            self.journal
+                .finish_pending(old_operation_id)
+                .map_err(BarrierError::Journal)?;
+            self.pending = None;
+            self.pending_journaled = false;
+            self.last_renewal = None;
+            return Ok(true);
+        };
+        let ids = self
+            .journal
+            .reserve_barrier_ids()
+            .map_err(BarrierError::Journal)?;
+        let next_roots = LiveRoots {
+            volume: staged.volume_root,
+            logs: self.live_roots.logs,
+            artifacts: self.live_roots.artifacts,
+        };
+        let replacement = self.pending_from_stage(ids, next_roots, staged);
+        self.journal
+            .replace_pending(old_operation_id, &replacement)
+            .map_err(BarrierError::Journal)?;
+        self.pending = Some(replacement);
+        self.pending_journaled = true;
+        self.last_renewal = None;
+        Ok(false)
     }
 
     fn renew_preparation(&mut self, grant: WriterGrant) -> Result<(), BarrierError> {
@@ -1283,7 +1449,7 @@ where
             .renew_preparation(renewal_id, prepared_id, renewal_grant)
         {
             Ok(_) => {}
-            Err(ControlError::Expired)
+            Err(ControlError::Expired | ControlError::Fenced)
                 if same_grant_identity(renewal_grant, grant)
                     && renewal_grant.expires_at < grant.expires_at =>
             {
@@ -1435,14 +1601,7 @@ fn load_map<S: MapObjectStore>(
     Ok(VolumeExtentMap::from_root(decoded)?.validate(store)?)
 }
 
-fn load_map_from_dirty<S: DurableObjectStore>(
-    inner: &DirtyVolume<S>,
-    volume_root: ObjectRef,
-) -> Result<VolumeExtentMap, BarrierError> {
-    inner.load_map(volume_root).map_err(Into::into)
-}
-
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1557,6 +1716,7 @@ mod tests {
         branch: BranchState,
         operations: HashMap<OperationId, OperationState>,
         renewals: HashMap<OperationId, (MonotonicTime, WriterGrant)>,
+        expire_next_renewal: bool,
         lose_next_commit_reply: bool,
         commit_count: usize,
     }
@@ -1619,12 +1779,12 @@ mod tests {
             ) {
                 return Err(ControlError::InvalidTransition);
             }
-            if state
-                .branch
-                .writer
-                .is_some_and(|current| grant.expires_at < current.expires_at)
-            {
+            if state.expire_next_renewal {
+                state.expire_next_renewal = false;
                 return Err(ControlError::Expired);
+            }
+            if state.branch.writer != Some(grant) {
+                return Err(ControlError::Fenced);
             }
             let deadline = MonotonicTime::from_nanos(600_000_000_000);
             state.renewals.insert(renewal_id, (deadline, grant));
@@ -1681,6 +1841,21 @@ mod tests {
                 .cloned()
                 .ok_or(ControlError::NotFound)
         }
+
+        fn abort_operation(
+            &self,
+            operation_id: OperationId,
+        ) -> Result<OperationState, ControlError> {
+            let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
+            let operation = state
+                .operations
+                .entry(operation_id)
+                .or_insert(OperationState::Aborted);
+            if matches!(operation, OperationState::Preparing { .. }) {
+                *operation = OperationState::Aborted;
+            }
+            Ok(operation.clone())
+        }
     }
 
     struct TestEnvironment {
@@ -1702,7 +1877,7 @@ mod tests {
                 &mut store,
                 generation_id,
                 boundary_id,
-                VolumeGeometry::new(u64::from(EXTENT_BYTES)).expect("valid test geometry"),
+                VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).expect("valid test geometry"),
                 1,
             )
             .expect("create durable empty graph");
@@ -1743,6 +1918,7 @@ mod tests {
                 branch,
                 operations: HashMap::new(),
                 renewals: HashMap::new(),
+                expire_next_renewal: false,
                 lose_next_commit_reply: false,
                 commit_count: 0,
             })));
@@ -1764,7 +1940,7 @@ mod tests {
                 self.branch_id,
                 self.grant,
                 self.attachment_id,
-                EXTENT_BYTES as usize,
+                EXTENT_BYTES as usize * 4,
             )
             .expect("open durable volume")
         }
@@ -1868,7 +2044,48 @@ mod tests {
             .expect("resolve the volume root with its typed reference");
         assert_eq!(
             map.geometry(),
-            VolumeGeometry::new(u64::from(EXTENT_BYTES)).unwrap()
+            VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn staging_exports_only_map_nodes_reachable_from_the_sealed_root() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(0, &[0xA1; 4096])
+            .expect("stage first extent write");
+        worker
+            .inner
+            .write(u64::from(EXTENT_BYTES), &[0xB2; 4096])
+            .expect("stage second extent write");
+
+        let staged = worker
+            .inner
+            .stage_dirty()
+            .expect("stage updated persistent map")
+            .expect("dirty extents produce a staged map");
+        assert_eq!(staged.dirty_extent_refs.len(), 2);
+        assert_eq!(
+            staged.objects.len(),
+            4,
+            "only two extents, the final leaf, and the volume root are reachable"
+        );
+        assert_eq!(
+            staged
+                .objects
+                .iter()
+                .filter(|object| object.reference.object_type == ObjectType::VolumeMapNode)
+                .count(),
+            1,
+            "the intermediate leaf from the first insertion must not be uploaded"
+        );
+        assert!(
+            staged
+                .objects
+                .iter()
+                .any(|object| object.reference == staged.volume_root)
         );
     }
 
@@ -1981,6 +2198,115 @@ mod tests {
         let restored = environment.open();
         assert_eq!(restored.inner.read(4096, 4096).unwrap(), vec![0xA3; 4096]);
         assert!(restored.pending.is_none());
+    }
+
+    #[test]
+    fn pending_barrier_from_an_old_volume_epoch_is_fenced_without_restoring_it() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(4096, &[0xA3; 4096])
+            .expect("stage ordinary write");
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        let pending = worker.pending.as_ref().unwrap().clone();
+        drop(worker);
+
+        {
+            let mut state = environment.control.0.lock().unwrap();
+            state.branch.volume_epoch += 1;
+            state.branch.attachment.as_mut().unwrap().volume_epoch += 1;
+        }
+
+        let journal = FileBarrierJournal::open(&environment._directory.0)
+            .expect("reopen journal after old worker exits");
+        let result = DurableVolume::open(
+            environment.store.clone(),
+            environment.control.clone(),
+            journal,
+            environment.branch_id,
+            environment.grant,
+            environment.attachment_id,
+            EXTENT_BYTES as usize,
+        );
+        assert!(matches!(result, Err(BarrierError::Fenced)));
+
+        let mut journal = FileBarrierJournal::open(&environment._directory.0)
+            .expect("reopen journal after rejected stale attach");
+        assert_eq!(
+            journal.load_pending().unwrap(),
+            Some(pending),
+            "stale attachment recovery must not consume or restore its pending state"
+        );
+    }
+
+    #[test]
+    fn expired_preparation_is_aborted_and_rebased_before_recovery() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(4096, &[0xD4; 4096])
+            .expect("stage ordinary write");
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        let expired_operation_id = worker.pending.as_ref().unwrap().operation_id;
+        environment.control.0.lock().unwrap().expire_next_renewal = true;
+        drop(worker);
+
+        let replacement_worker = environment.open();
+        assert!(replacement_worker.pending.is_none());
+        assert_eq!(
+            replacement_worker.inner.read(4096, 4096).unwrap(),
+            vec![0xD4; 4096]
+        );
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(
+            state.operations.get(&expired_operation_id),
+            Some(&OperationState::Aborted)
+        );
+        assert_eq!(state.branch.revision, 2);
+    }
+
+    #[test]
+    fn pending_barrier_rebases_after_a_branch_revision_conflict() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker
+            .inner
+            .write(4096, &[0xB7; 4096])
+            .expect("stage ordinary write");
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        let stale_operation_id = worker.pending.as_ref().unwrap().operation_id;
+        {
+            let mut state = environment.control.0.lock().unwrap();
+            state.branch.revision += 1;
+        }
+        drop(worker);
+
+        let replacement_worker = environment.open();
+        assert!(replacement_worker.pending.is_none());
+        assert_eq!(
+            replacement_worker.inner.read(4096, 4096).unwrap(),
+            vec![0xB7; 4096]
+        );
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(
+            state.operations.get(&stale_operation_id),
+            Some(&OperationState::Aborted)
+        );
+        assert_eq!(state.branch.revision, 3);
     }
 
     #[test]
@@ -2155,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_uncommitted_renewal_restarts_with_a_fresh_id_and_grant() {
+    fn unresolved_uncommitted_renewal_retries_after_writer_heartbeat() {
         let environment = TestEnvironment::new();
         let expiring_grant = WriterGrant {
             expires_at: MonotonicTime::from_nanos(u64::MAX - 1),

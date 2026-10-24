@@ -969,6 +969,11 @@ expiry; an unknown renewal must be retried/queried under the same ID before anot
 is allocated. Pause further work while unresolved, keeping the capture freeze or
 barrier admission and dependencies protected.
 
+The block worker checks renewal between immutable-object transfers. Each blocking
+S3 bridge operation has a five-minute enforced deadline, shorter than the
+preparation's ten-minute inactivity deadline, so one stalled transfer cannot
+prevent the worker from renewing protection indefinitely.
+
 Expiry permits the authority to record an abort; it never proves an unknown
 transaction did not commit. Abort/expiry and final commit are ordered atomically.
 An aborted operation cannot later publish a Generation or replace a live root;

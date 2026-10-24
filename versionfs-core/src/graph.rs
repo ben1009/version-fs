@@ -480,7 +480,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
     fn object_bytes(&self, reference: ObjectRef) -> Result<Vec<u8>, GraphError> {
         let bytes = self
             .store
-            .get(reference.object_id)
+            .get_ref(reference)
             .map_err(GraphError::Store)?
             .ok_or(GraphError::MissingObject(reference.object_id))?;
         reference.verify(&bytes)?;
@@ -1004,6 +1004,36 @@ mod tests {
             created_at_unix_ms: 10,
         };
         store_object(store, descriptor.encode().unwrap())
+    }
+
+    struct TypedOnlyStore<'a>(&'a MemoryStore);
+
+    impl MapObjectStore for TypedOnlyStore<'_> {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            self.0.proof_scope()
+        }
+
+        fn get(&self, _id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            Err("typed object reference required".to_owned())
+        }
+
+        fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+            self.0.get(reference.object_id)
+        }
+
+        fn put(&mut self, _id: ObjectId, _bytes: Vec<u8>) -> Result<(), String> {
+            Err("read-only test store".to_owned())
+        }
+    }
+
+    #[test]
+    fn complete_generation_verification_uses_typed_object_references() {
+        let mut store = MemoryStore::default();
+        let descriptor_ref =
+            empty_generation(&mut store, GenerationId::from_bytes([0xA1; 16]), None);
+
+        verify_generation(&TypedOnlyStore(&store), descriptor_ref)
+            .expect("verify generation through typed-only reads");
     }
 
     struct DenyObjectStore<'a> {

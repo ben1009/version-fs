@@ -297,10 +297,13 @@ fn error_to_errno(error: BlockError) -> i32 {
             -libc::EOPNOTSUPP
         }
         BlockError::Format(_) => -libc::EINVAL,
-        BlockError::View(_)
-        | BlockError::InvalidDirtyCapacity
-        | BlockError::BarrierUnresolved
-        | BlockError::Barrier(_) => -libc::EIO,
+        BlockError::Barrier(error) => {
+            eprintln!("ublk durable barrier failed: {error}");
+            -libc::EIO
+        }
+        BlockError::View(_) | BlockError::InvalidDirtyCapacity | BlockError::BarrierUnresolved => {
+            -libc::EIO
+        }
     }
 }
 
@@ -456,6 +459,14 @@ mod tests {
                 &mut buffer,
             ),
             -libc::EOPNOTSUPP
+        );
+    }
+
+    #[test]
+    fn durable_barrier_error_keeps_the_kernel_io_error_mapping() {
+        assert_eq!(
+            error_to_errno(BlockError::Barrier("injected S3 timeout".to_owned())),
+            -libc::EIO
         );
     }
 }
