@@ -2881,6 +2881,8 @@ dependencies = [
  "ctrlc",
  "libc",
  "libublk",
+ "thiserror 2.0.21",
+ "versionfs-core",
 ]
 
 [[package]]

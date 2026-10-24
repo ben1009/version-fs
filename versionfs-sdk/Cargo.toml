@@ -17,6 +17,11 @@ required-features = ["ublk-smoke"]
 [features]
 default = []
 ublk-smoke = ["dep:ctrlc", "dep:libc", "dep:libublk"]
+ublk-adapter = ["dep:libc", "dep:libublk"]
+
+[dependencies]
+thiserror = "=2.0.21"
+versionfs-core = { path = "../versionfs-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ctrlc = { version = "=3.5.2", features = ["termination"], optional = true }

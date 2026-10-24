@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0 merged; P1 object layer implemented, real-S3 run pending; P2 locally qualified; P3 implemented on this branch |
+| Status | P0–P3 merged; P1 real-S3 run pending; P2 locally qualified; P4 implemented on this branch |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -194,20 +194,34 @@ parent separator bytes. Fixtures resolve with ancestor descriptor reads denied.
 
 ### P4. ublk adapter and local data path
 
-- [ ] Implement a fixed-size single-queue device with truthful cache/FUA capability
-  negotiation and checked READ/WRITE/FLUSH dispatch. Reject unsupported I/O/geometry.
-- [ ] Implement bounded dirty sectors/extents, partial-extent read-modify-write,
-  ordered barriers, and immutable sealed upload versions. Normal writes acknowledge
-  only local volatile state until P6 provides persistence.
-- [ ] Implement verified workspace-scoped cache fills, atomic installation, fill
+- [x] Implement a fixed-size single-queue device with truthful volatile-cache/FUA
+  capability negotiation and checked READ/WRITE dispatch. Reject FLUSH/FUA until
+  P6 supplies durability; reject unsupported I/O and geometry.
+- [x] Implement a bounded dirty-extent overlay, partial-extent read-modify-write,
+  single-queue request ordering, and immutable sealed upload versions. Normal writes
+  acknowledge only local volatile state until P6 provides persistence.
+- [x] Implement verified workspace-scoped cache fills, atomic installation, fill
   coordination, clean eviction, and dirty/control-state separation.
-- [ ] Implement protected-root range readers and extent-range diff. Never infer
+- [x] Implement protected-root range readers and structural extent-range diff.
+  Callers must retain protection for both roots through reads/diffs. Never infer
   zeros for an allocated missing/corrupt extent or label range diff as file diff.
 
-**Exit evidence:** device contents match a byte-array model; dirty tracking needs
-no file scan; cold reads fetch only required index/extent working sets. Extent
-upload buffers cannot change beneath their hashed version. Do not mount a writable
-filesystem claiming reliable barriers until P6 is qualified.
+**Exit evidence:** dirty-volume tests match a byte-array model across partial and
+cross-extent writes, and prove capacity rejection leaves state untouched. The
+single-queue ublk adapter builds with `ublk-adapter`; request validation rejects
+unaligned ranges and unavailable FLUSH/FUA. P0 separately qualified a RAM-backed
+ublk/ext4 smoke path. Counting-store tests show cold reads fetch only the needed
+index path and requested extent, while range diff skips shared subtrees and never
+fetches extent payloads. Dirty tracking requires no filesystem scan. Upload views
+borrow immutable sealed extent buffers. Verified-cache tests cover reopen,
+corruption, oversize entries, workspace isolation, concurrent fill coordination,
+object-store namespace isolation, exclusive directory ownership across processes,
+interrupted-fill recovery, and bounded LRU eviction. Cached map stores reject a
+cache/backing namespace mismatch; reopening a cache for another namespace cannot
+prove objects that are absent from that backend. A privileged ublk regression
+injects a queue setup error and verifies that startup returns the original error
+without waiting for buffer registration. Do not mount a writable filesystem
+claiming reliable barriers until P6 is qualified.
 
 ### P5. Control schema and attachment authority
 

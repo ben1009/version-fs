@@ -13,7 +13,22 @@ adapter and deterministic conformance tests. The real-S3 test is explicitly
 ignored and requires a dedicated test bucket. P2 adds the toy-kv Metadata
 Authority adapter and its conformance tests. P3 adds persistent copy-on-write
 maps, typed volume/log/artifact roots, and complete Generation graph verification;
-the ublk data path and later control protocols remain unimplemented.
+P4 adds the bounded local block overlay, verified workspace object cache,
+protected-root range reads, structural extent diff, and the opt-in single-queue
+ublk adapter. The adapter advertises a volatile cache and rejects FLUSH/FUA until
+P6 provides the remote durability path. Later control protocols remain
+unimplemented.
+
+Workspace cache directories have one owner at a time; drop the prior cache
+handle before reopening its directory. An exclusive file lock also prevents
+another process from rebuilding or filling that same cache concurrently.
+Cache handles identify both their workspace and object-store scope. A cached
+map store requires its cache scope to match the backing store's `proof_scope`;
+reopening a directory for another scope removes the previous scope's clean
+objects before serving reads.
+If temporary-file cleanup fails, its capacity stays reserved until reopening
+removes the leftover file. Verified backing reads remain available in the meantime.
+
 Validated view handles seal without reading their map nodes. Imported volume
 handles can retain the result of `VolumeExtentMap::validate` to check metadata
 once before later mutations; named-map opens validate entries and retain counts.
@@ -27,9 +42,10 @@ through `.github/actions/setup-rust`, so ordinary jobs share the local toolchain
 Linux is the reference environment for the planned ublk integration and the
 sanitizer jobs.
 
-The P0 ublk binding is pinned to the published `libublk` `0.4.8` crate. Upstream
-`0.5.0` is not yet published in the registry. Its optional feature is excluded
-from normal SDK users: `ublk-smoke` is only a disposable platform prototype.
+The ublk binding is pinned to the published `libublk` `0.4.8` crate. Upstream
+`0.5.0` is not yet published in the registry. The `ublk-smoke` feature builds
+only the disposable P0 platform prototype; `ublk-adapter` builds the P4 block
+server, which still has no durable barrier support.
 
 `./dev` runs from the repository root even when invoked from another directory.
 It installs cargo-make if missing, then forwards arguments to cargo-make. Individual
@@ -66,6 +82,7 @@ not download or execute an unpinned bootstrap script.
 | `./dev test-cov` | Generate HTML coverage under `target/llvm-cov/html` when runnable tests exist. |
 | `./dev test-asan` | Run AddressSanitizer tests on Linux x86-64. |
 | `./dev test-lsan` | Run LeakSanitizer tests with the shared suppression file. |
+| `cargo test -p versionfs-sdk --features ublk-adapter` | Test the opt-in Linux ublk adapter and local block path. |
 | `cargo build -p versionfs-sdk --features ublk-smoke --bin versionfs-ublk-smoke` | Build the opt-in ublk RAM target. |
 | `sudo ./scripts/ublk-ext4-smoke.sh` | Format/mount ext4, exercise file I/O and flush/freeze, check unsupported discard, and verify orderly and abrupt-server teardown. |
 | `docs/s3-conformance.md` | Dedicated-bucket setup and command for the ignored real-S3 conformance test. |
