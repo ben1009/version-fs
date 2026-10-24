@@ -1046,17 +1046,7 @@ where
                 logs: self.live_roots.logs,
                 artifacts: self.live_roots.artifacts,
             };
-            let barrier = pending_from_stage(
-                self.branch_id,
-                self.revision,
-                self.writer_grant,
-                self.attachment_id,
-                self.volume_epoch,
-                self.live_roots,
-                next_roots,
-                ids,
-                staged,
-            );
+            let barrier = self.pending_from_stage(ids, next_roots, staged);
             self.pending = Some(barrier);
             self.pending_journaled = false;
             self.last_renewal = None;
@@ -1073,6 +1063,30 @@ where
     /// Returns the current live roots observed by this attachment.
     pub const fn live_roots(&self) -> LiveRoots {
         self.live_roots
+    }
+
+    fn pending_from_stage(
+        &self,
+        ids: BarrierIds,
+        next_roots: LiveRoots,
+        staged: StagedVolume,
+    ) -> PendingBarrier {
+        PendingBarrier {
+            operation_id: ids.operation_id,
+            protection_id: ids.protection_id,
+            branch_id: self.branch_id,
+            expected_revision: self.revision,
+            writer_grant: self.writer_grant,
+            attachment_id: self.attachment_id,
+            volume_epoch: self.volume_epoch,
+            previous_roots: self.live_roots,
+            next_roots,
+            dirty_revision: staged.dirty_revision,
+            dirty_extent_refs: staged.dirty_extent_refs,
+            objects: staged.objects,
+            renewal_operation_id: None,
+            renewal_grant: None,
+        }
     }
 
     fn resume_pending(&mut self) -> Result<(), BarrierError> {
@@ -1369,35 +1383,6 @@ where
                 Err(BlockError::UnsupportedOperation(operation))
             }
         }
-    }
-}
-
-fn pending_from_stage(
-    branch_id: BranchId,
-    expected_revision: u64,
-    writer_grant: WriterGrant,
-    attachment_id: AttachmentId,
-    volume_epoch: u64,
-    previous_roots: LiveRoots,
-    next_roots: LiveRoots,
-    ids: BarrierIds,
-    staged: StagedVolume,
-) -> PendingBarrier {
-    PendingBarrier {
-        operation_id: ids.operation_id,
-        protection_id: ids.protection_id,
-        branch_id,
-        expected_revision,
-        writer_grant,
-        attachment_id,
-        volume_epoch,
-        previous_roots,
-        next_roots,
-        dirty_revision: staged.dirty_revision,
-        dirty_extent_refs: staged.dirty_extent_refs,
-        objects: staged.objects,
-        renewal_operation_id: None,
-        renewal_grant: None,
     }
 }
 
@@ -2116,21 +2101,12 @@ mod tests {
             .journal
             .reserve_barrier_ids()
             .expect("reserve barrier IDs");
-        let mut pending = pending_from_stage(
-            worker.branch_id,
-            worker.revision,
-            worker.writer_grant,
-            worker.attachment_id,
-            worker.volume_epoch,
-            worker.live_roots,
-            LiveRoots {
-                volume: staged.volume_root,
-                logs: worker.live_roots.logs,
-                artifacts: worker.live_roots.artifacts,
-            },
-            ids,
-            staged,
-        );
+        let next_roots = LiveRoots {
+            volume: staged.volume_root,
+            logs: worker.live_roots.logs,
+            artifacts: worker.live_roots.artifacts,
+        };
+        let mut pending = worker.pending_from_stage(ids, next_roots, staged);
         let renewal_id = worker
             .journal
             .reserve_operation_id()
@@ -2200,21 +2176,12 @@ mod tests {
             .journal
             .reserve_barrier_ids()
             .expect("reserve barrier IDs");
-        let mut pending = pending_from_stage(
-            worker.branch_id,
-            worker.revision,
-            worker.writer_grant,
-            worker.attachment_id,
-            worker.volume_epoch,
-            worker.live_roots,
-            LiveRoots {
-                volume: staged.volume_root,
-                logs: worker.live_roots.logs,
-                artifacts: worker.live_roots.artifacts,
-            },
-            ids,
-            staged,
-        );
+        let next_roots = LiveRoots {
+            volume: staged.volume_root,
+            logs: worker.live_roots.logs,
+            artifacts: worker.live_roots.artifacts,
+        };
+        let mut pending = worker.pending_from_stage(ids, next_roots, staged);
         let expired_renewal_id = worker
             .journal
             .reserve_operation_id()
