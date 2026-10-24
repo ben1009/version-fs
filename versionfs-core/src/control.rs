@@ -1070,6 +1070,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         *expires_at = now.saturating_add_nanos(READER_PROTECTION_NANOS);
                         *expires_at
                     }
+                    ProtectionRecord::Retired { .. } => return Err(reject("not_found")),
                     _ => return Err(reject("expired")),
                 };
                 txn.put(
@@ -1182,15 +1183,16 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                                 &gkey,
                                 &encode_generation(&generation).map_err(to_metadata_error)?,
                             )?;
-                            txn.delete(&pkey)?;
+                            retire_protection(txn, self.workspace_id, protection_id)?;
                         }
                         return Ok(Vec::new());
                     }
                     ProtectionRecord::Preparation { .. } => {
                         return Err(reject("invalid_transition"));
                     }
+                    ProtectionRecord::Retired { .. } => return Err(reject("not_found")),
                 }
-                txn.delete(&pkey)?;
+                retire_protection(txn, self.workspace_id, protection_id)?;
                 Ok(Vec::new())
             },
         )?;
@@ -1806,7 +1808,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             operation.commit_fingerprint = Some(fp);
             operation.status = StoredOperationStatus::Committed(encoded.clone());
             if let Some(protection_id) = protection_id {
-                txn.delete(&protection_key(self.workspace_id, protection_id))?;
+                retire_protection(txn, self.workspace_id, protection_id)?;
             }
             let encoded = encode_operation(&operation).map_err(to_metadata_error)?;
             txn.put(&key, &encoded)?;
@@ -1998,7 +2000,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             decrement(branch.pending_mutation_preparations)?;
                     }
                     txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
-                    txn.delete(&pkey)?;
+                    retire_protection(txn, self.workspace_id, protection_id)?;
                     record.status = StoredOperationStatus::Aborted;
                     let encoded = encode_operation(&record).map_err(to_metadata_error)?;
                     txn.put(&key, &encoded)?;
@@ -2121,7 +2123,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     decrement(branch.pending_mutation_preparations)?;
             }
             txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
-            txn.delete(&pkey)?;
+            retire_protection(txn, self.workspace_id, protection_id)?;
             record.status = StoredOperationStatus::Aborted;
             let encoded = encode_operation(&record).map_err(to_metadata_error)?;
             txn.put(&key, &encoded)?;
@@ -2441,6 +2443,9 @@ impl StoredOperation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProtectionRecord {
+    Retired {
+        id: ProtectionId,
+    },
     AttachmentBase {
         id: ProtectionId,
         branch_id: BranchId,
@@ -2590,13 +2595,6 @@ fn decode_operation(bytes: &[u8]) -> Result<StoredOperation, ControlError> {
             if capture != expected_roots.is_none() {
                 return Err(ControlError::CorruptRecord(
                     "inconsistent preparation roots".into(),
-                ));
-            }
-            if branch_id == BranchId::from_bytes([0; 16])
-                || protection_id == ProtectionId::from_bytes([0; 16])
-            {
-                return Err(ControlError::CorruptRecord(
-                    "invalid preparation identity".into(),
                 ));
             }
             StoredOperationStatus::Preparing {
@@ -2802,6 +2800,10 @@ fn decode_owner(bytes: &[u8]) -> Result<u64, FormatError> {
 fn encode_protection(record: &ProtectionRecord) -> Result<Vec<u8>, FormatError> {
     let mut e = CanonicalEncoder::new();
     match record {
+        ProtectionRecord::Retired { id } => {
+            e.u8(5);
+            e.fixed(id.as_bytes());
+        }
         ProtectionRecord::AttachmentBase {
             id,
             branch_id,
@@ -2884,6 +2886,9 @@ fn decode_protection(bytes: &[u8]) -> Result<ProtectionRecord, ControlError> {
     }
     let mut d = CanonicalDecoder::new(payload);
     let record = match d.u8().map_err(corrupt)? {
+        5 => ProtectionRecord::Retired {
+            id: ProtectionId::from_bytes(d.fixed().map_err(corrupt)?),
+        },
         1 => ProtectionRecord::AttachmentBase {
             id: ProtectionId::from_bytes(d.fixed().map_err(corrupt)?),
             branch_id: BranchId::from_bytes(d.fixed().map_err(corrupt)?),
@@ -3493,7 +3498,7 @@ fn fence_attachment(
                 && generation_id == attachment.base_generation => {}
             _ => return Err(reject("corrupt_record")),
         }
-        txn.delete(&pkey)?;
+        retire_protection(txn, workspace, attachment.protection_id)?;
         branch.volume_epoch = increment(branch.volume_epoch)?;
         branch.stream_epoch = increment(branch.stream_epoch)?;
     }
@@ -3524,7 +3529,7 @@ fn release_attachment(
                 && generation_id == attachment.base_generation => {}
             _ => return Err(reject("corrupt_record")),
         }
-        txn.delete(&pkey)?;
+        retire_protection(txn, workspace, attachment.protection_id)?;
         branch.volume_epoch = increment(branch.volume_epoch)?;
         branch.stream_epoch = increment(branch.stream_epoch)?;
     }
@@ -3552,8 +3557,20 @@ fn close_protection(
             return Err(reject("invalid_transition"));
         }
         ProtectionRecord::LiveLogRead { .. } => {}
+        ProtectionRecord::Retired { .. } => return Err(reject("not_found")),
     }
-    txn.delete(&key)
+    retire_protection(txn, workspace, id)
+}
+
+fn retire_protection(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    id: ProtectionId,
+) -> Result<(), MetadataError> {
+    txn.put(
+        &protection_key(workspace, id),
+        &encode_protection(&ProtectionRecord::Retired { id }).map_err(to_metadata_error)?,
+    )
 }
 
 fn require_expired(

@@ -282,6 +282,10 @@ fn core_protocol_replays_operations_and_rejects_stale_attachment_epochs() {
     control
         .detach_volume(op(22), branch(1), attachment(1), 1, protection(1), writer)
         .expect("detach volume");
+    assert_eq!(
+        control.attach_volume(op(31), branch(1), 1, writer, attachment(1), protection(1)),
+        Err(ControlError::Conflict)
+    );
     let current = control
         .attach_volume(op(23), branch(1), 1, writer, attachment(1), protection(2))
         .expect("reattach same device identity");
@@ -482,6 +486,16 @@ fn core_protocol_limits_each_preparation_to_its_view_root() {
         control
             .abort_operation(operation_id)
             .expect("abort root-scope preparation");
+    }
+    for (operation_id, protection_id) in [
+        (op(46), protection(3)),
+        (op(47), protection(4)),
+        (op(48), protection(5)),
+    ] {
+        assert_eq!(
+            control.open_generation(operation_id, generation(1), protection_id),
+            Err(ControlError::Conflict)
+        );
     }
 }
 

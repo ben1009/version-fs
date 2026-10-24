@@ -233,6 +233,8 @@ claiming reliable barriers until P6 is qualified.
   delayed request cannot target a replacement that reuses an attachment ID.
 - [x] Implement retention eligibility guards, pins, read/live-log protections,
   attachment bases, and shared preparation/renewal state from the start.
+  Retire protections into rootless workspace-lifetime tombstones; delayed requests
+  cannot act on a new protection that reuses an ID across any protection kind.
 - [x] Add checkpoint capture-token admission: block other head/live mutations,
   wait for ordinary mutation preparations to resolve, allow only identified
   VolumeBarrier drain-flush children, and retain independent renew/query/abort
@@ -260,7 +262,8 @@ active-preparation renewal under a refreshed writer grant, exact attachment epoc
 and protection expiry, capture exclusion/admission/sealing/abort, preparation
 renewal and expiry cleanup, direct abort and retry of an unstarted capture child,
 reserved-ID conflicts, cross-principal capture rejection, per-preparation root
-scope, pin/read/live-log protection, and retention eligibility
+scope, opaque zero-ID preparation cleanup, retired protection-ID rejection,
+pin/read/live-log protection, and retention eligibility
 after close or expiry. This qualifies the backend-neutral P5 control protocol through
 the MVP adapter; it does not qualify live block-device durability, Generation
 publication, or device fencing integration, which remain in P6/P7/P9.

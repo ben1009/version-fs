@@ -450,7 +450,7 @@ precommit hook.
 | Name / retention indexes | Point-key name bindings and per-Generation eligibility guards, updated atomically with their referenced records. |
 | Generation | Descriptor reference, publication operation, retention deadline, lifecycle state. |
 | Operation | ID, request fingerprint, phase, allocated identities, prepared dependencies, terminal result. |
-| Protection | Pins, reader leases, attachment base roots, and preparation dependencies, including capture/flush children. |
+| Protection | Pins, reader leases, attachment base roots, preparation dependencies including capture/flush children, and rootless retirement tombstones. |
 | Capture-child reservation | Point-key binding from an authorized child operation ID to its capture and branch, allowing direct abort to release the exact pending-child slot without a scan. |
 | GC report | Report ID, root snapshot/time, inventory window, completeness, and candidate summary/pages. |
 
@@ -465,6 +465,14 @@ its live volume, log map, or artifact map. Lease-only renewal does not change
 this revision.
 Writer ownership changes advance the writer epoch. Comparing only head
 Generation IDs is insufficient for CAS.
+
+Protection IDs are unique for the workspace lifetime across all protection kinds.
+Close, expiry, detach/fencing, and preparation completion release their references
+and replace the active protection with a permanent retirement tombstone. That
+tombstone retains no Generation, root, or dependency; it prevents a delayed close
+or renewal from acting on a new protection that reuses the ID. New protection
+acquisition requires a fresh ID. Opaque fixed-width IDs reserve no all-zero
+sentinel; encoding and decoding accept the same values.
 
 Normal transactions read and validate their branch, owner, operation, and
 retention/index keys, then buffer all required changes in one `transact` call.
@@ -525,6 +533,8 @@ Generation expires. v0 provides replay-safe idempotency for the workspace
 lifetime at this storage cost. Bounded deduplication windows and safe result
 expiry are deferred; metadata capacity must be provisioned and exhaustion
 handled explicitly.
+Rootless protection retirement records also remain for the workspace lifetime,
+adding to cumulative metadata growth.
 
 `get_operation(id)` reads authoritative state. A timeout means unknown outcome.
 Even `NotFound` does not prove the original request cannot arrive later: retry
@@ -1298,9 +1308,10 @@ path may block later writes through commit to avoid keeping multiple dirty epoch
 
 Before admission return Busy/capacity errors. After admission preserve identified
 outcomes/protection or record a definite abort. Report budget exhaustion does not
-block writers. Both unreclaimed S3 objects and workspace-lifetime operation records
-(including durability barriers and heartbeats) grow cumulatively in v0. Expiry or
-trim cannot be used to erase deduplication records or enable physical deletion.
+block writers. Unreclaimed S3 objects, workspace-lifetime operation records
+(including durability barriers and heartbeats), and rootless protection retirement
+records grow cumulatively in v0. Expiry or trim cannot erase identity/deduplication
+records or enable physical deletion.
 
 ### 14.3 Benchmark report
 

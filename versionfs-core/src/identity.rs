@@ -10,6 +10,7 @@ macro_rules! fixed_id {
 
         impl $name {
             /// Creates an identity from its fixed-width byte representation.
+            /// All bit patterns are valid; absence is represented separately.
             pub const fn from_bytes(bytes: [u8; $bytes]) -> Self {
                 Self(bytes)
             }
@@ -85,7 +86,7 @@ fixed_id!(
 fixed_id!(
     ProtectionId,
     16,
-    "A stable identity for one retention or in-progress protection."
+    "A workspace-lifetime unique identity for one retention or in-progress protection."
 );
 fixed_id!(
     PinId,

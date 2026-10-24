@@ -128,6 +128,172 @@ impl TestEnv {
 }
 
 #[test]
+fn retired_protection_ids_cannot_be_rebound_or_release_another_reader() {
+    let env = TestEnv::new();
+    env.control
+        .register_generation(op(10), seed(2))
+        .expect("register retained Generation");
+    env.control
+        .open_generation(op(11), generation(2), protection(10))
+        .expect("open original reader");
+    env.control
+        .close_protection(op(12), protection(10))
+        .expect("close original reader");
+    assert_eq!(
+        env.control
+            .open_generation(op(13), generation(1), protection(10)),
+        Err(ControlError::Conflict)
+    );
+    assert_eq!(
+        env.control
+            .open_live_log(op(14), branch(1), 1, roots(1).logs, protection(10)),
+        Err(ControlError::Conflict)
+    );
+
+    env.control
+        .open_generation(op(15), generation(2), protection(11))
+        .expect("open fresh reader identity");
+    assert_eq!(
+        env.control.close_protection(op(16), protection(10)),
+        Err(ControlError::NotFound)
+    );
+    assert_eq!(
+        env.control.renew_protection(op(17), protection(10)),
+        Err(ControlError::NotFound)
+    );
+    assert_eq!(
+        env.control
+            .mark_generation_unretained(op(18), generation(2)),
+        Err(ControlError::Busy)
+    );
+
+    let deadline = env
+        .control
+        .open_live_log(op(19), branch(1), 1, roots(1).logs, protection(12))
+        .expect("open live-log reader");
+    env.clock.set(deadline.as_nanos());
+    env.control
+        .expire_protection(op(20), protection(12))
+        .expect("expire live-log reader");
+    assert_eq!(
+        env.control
+            .open_generation(op(21), generation(1), protection(12)),
+        Err(ControlError::Conflict)
+    );
+    env.control
+        .expire_protection(op(22), protection(11))
+        .expect("expire Generation reader");
+    assert_eq!(
+        env.control
+            .open_generation(op(23), generation(1), protection(11)),
+        Err(ControlError::Conflict)
+    );
+    env.control
+        .mark_generation_unretained(op(24), generation(2))
+        .expect("reader counters were released exactly once");
+}
+
+#[test]
+fn zero_preparation_identities_remain_queryable_and_cleanup_releases_admission() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let preparing = env
+        .control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(30),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(0),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("zero protection ID is an opaque identity");
+    assert_eq!(env.control.get_operation(op(30)), Ok(preparing));
+    assert_eq!(
+        env.control.abort_operation(op(30)),
+        Ok(OperationState::Aborted)
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control
+            .open_generation(op(31), generation(1), protection(0)),
+        Err(ControlError::Conflict)
+    );
+
+    env.control
+        .create_branch(op(32), branch(0), "zero", generation(1))
+        .expect("create zero branch identity");
+    let zero_grant = env
+        .control
+        .acquire_writer(op(33), branch(0), 1, 0)
+        .expect("acquire zero branch writer");
+    env.control
+        .attach_volume(
+            op(34),
+            branch(0),
+            1,
+            zero_grant,
+            attachment(0),
+            protection(34),
+        )
+        .expect("attach zero branch");
+    let preparing = env
+        .control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(35),
+            branch_id: branch(0),
+            expected_revision: 1,
+            grant: zero_grant,
+            attachment_id: attachment(0),
+            volume_epoch: 1,
+            protection_id: protection(35),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(replace_volume_root(roots(1), 35)),
+            dependencies: vec![],
+        })
+        .expect("zero branch ID survives preparation decoding");
+    assert_eq!(env.control.get_operation(op(35)), Ok(preparing.clone()));
+    let OperationState::Preparing {
+        expires_at,
+        branch_id,
+        ..
+    } = preparing
+    else {
+        panic!("expected preparation");
+    };
+    assert_eq!(branch_id, branch(0));
+    env.clock.set(expires_at.as_nanos());
+    assert_eq!(
+        env.control.expire_preparation(op(35)),
+        Ok(OperationState::Aborted)
+    );
+    assert_eq!(
+        env.control
+            .get_branch(branch(0))
+            .unwrap()
+            .pending_mutation_preparations,
+        0
+    );
+    assert_eq!(
+        env.control
+            .open_generation(op(36), generation(1), protection(35)),
+        Err(ControlError::Conflict)
+    );
+    env.control
+        .expire_protection(op(37), protection(34))
+        .expect("expire attachment after preparation cleanup");
+    assert_eq!(
+        env.control
+            .open_generation(op(38), generation(1), protection(34)),
+        Err(ControlError::Conflict)
+    );
+}
+
+#[test]
 fn capture_children_and_cleanup_keep_the_original_principal_scope() {
     let env = TestEnv::new();
     let grant = env.writer_and_attachment();
@@ -455,6 +621,11 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
         .expect("publish durable branch roots");
     assert_eq!(committed.revision, 2);
     assert_eq!(committed.volume_root, next_roots.volume);
+    assert_eq!(
+        env.control
+            .open_generation(op(18), generation(1), protection(2)),
+        Err(ControlError::Conflict)
+    );
     assert_eq!(
         env.control
             .commit_live_roots(op(5), 1, grant, next_roots, None)
@@ -972,6 +1143,10 @@ fn owner_restart_fences_old_grants_and_expired_read_protections_release_retentio
         .acquire_writer(op(5), branch(1), 1, old_grant.writer_epoch)
         .expect("new owner takes fenced branch");
     assert!(new_grant.writer_epoch > old_grant.writer_epoch);
+    assert_eq!(
+        next_control.open_generation(op(30), generation(1), protection(1)),
+        Err(ControlError::Conflict)
+    );
     assert!(
         next_control
             .get_branch(branch(1))
