@@ -1324,12 +1324,42 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         grant,
                         self.owner_incarnation,
                     )?;
+                    let reservation_key = capture_child_reservation_key(
+                        self.workspace_id,
+                        self.principal_id,
+                        operation_id,
+                    );
+                    let reservation_bytes = txn
+                        .get(&reservation_key)?
+                        .ok_or_else(|| reject("corrupt_record"))?;
+                    let reservation = decode_capture_child_reservation(&reservation_bytes)
+                        .map_err(to_metadata_error)?;
+                    if reservation
+                        != (CaptureChildReservation {
+                            capture_id: token.operation_id,
+                            branch_id,
+                        })
+                    {
+                        return Err(reject("corrupt_record"));
+                    }
+                    txn.delete(&reservation_key)?;
                 }
                 (None, false) => {
                     branch.pending_mutation_preparations =
                         increment(branch.pending_mutation_preparations)?;
                 }
                 _ => return Err(reject("busy")),
+            }
+            if let Some(roots) = expected_roots {
+                validate_preparation_root_scope(
+                    kind,
+                    LiveRoots {
+                        volume: branch.volume_root,
+                        logs: branch.logs_root,
+                        artifacts: branch.artifacts_root,
+                    },
+                    roots,
+                )?;
             }
             let pkey = protection_key(self.workspace_id, protection_id);
             if txn.get(&pkey)?.is_some() {
@@ -1577,8 +1607,21 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 if txn.get(&self.operation_key(child_id))?.is_some() {
                     return Err(MetadataError::Conflict);
                 }
+                let reservation_key =
+                    capture_child_reservation_key(self.workspace_id, self.principal_id, child_id);
+                if txn.get(&reservation_key)?.is_some() {
+                    return Err(MetadataError::Conflict);
+                }
                 capture.pending_child = Some(child_id);
                 txn.put(&key, &encode_branch(&branch).map_err(to_metadata_error)?)?;
+                txn.put(
+                    &reservation_key,
+                    &encode_capture_child_reservation(CaptureChildReservation {
+                        capture_id,
+                        branch_id: grant.branch_id,
+                    })
+                    .map_err(to_metadata_error)?,
+                )?;
                 Ok(Vec::new())
             },
         )?;
@@ -1690,6 +1733,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if branch.revision != expected_revision {
                 return Err(MetadataError::Conflict);
             }
+            validate_preparation_root_scope(
+                prepared_kind,
+                LiveRoots {
+                    volume: branch.volume_root,
+                    logs: branch.logs_root,
+                    artifacts: branch.artifacts_root,
+                },
+                roots,
+            )?;
             match (&mut branch.capture, capture_child) {
                 (None, None) => {
                     branch.pending_mutation_preparations =
@@ -1827,6 +1879,29 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let outcome = self.transact_with_outcome(&outcome_key, |txn| {
             self.require_current_owner(txn)?;
             let Some(bytes) = txn.get(&key)? else {
+                let reservation_key = capture_child_reservation_key(
+                    self.workspace_id,
+                    self.principal_id,
+                    operation_id,
+                );
+                if let Some(reservation_bytes) = txn.get(&reservation_key)? {
+                    let reservation = decode_capture_child_reservation(&reservation_bytes)
+                        .map_err(to_metadata_error)?;
+                    let bkey = branch_key(self.workspace_id, reservation.branch_id);
+                    let mut branch = read_branch(txn, &bkey)?;
+                    let capture = branch
+                        .capture
+                        .as_mut()
+                        .ok_or_else(|| reject("corrupt_record"))?;
+                    if capture.operation_id != reservation.capture_id
+                        || capture.pending_child != Some(operation_id)
+                    {
+                        return Err(reject("corrupt_record"));
+                    }
+                    capture.pending_child = None;
+                    txn.put(&bkey, &encode_branch(&branch).map_err(to_metadata_error)?)?;
+                    txn.delete(&reservation_key)?;
+                }
                 let tombstone = StoredOperation::aborted(OP_TOMBSTONE, [0; 32]);
                 let encoded = encode_operation(&tombstone).map_err(to_metadata_error)?;
                 txn.put(&key, &encoded)?;
@@ -1873,7 +1948,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             return Err(reject("corrupt_record"));
                         }
                         if let Some(child_id) = token.pending_child {
-                            self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
+                            self.retire_unstarted_capture_child(
+                                txn,
+                                branch_id,
+                                operation_id,
+                                grant,
+                                child_id,
+                            )?;
                         }
                         branch.capture = None;
                     } else if let Some(token) = &mut branch.capture {
@@ -1985,7 +2066,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     return Err(reject("corrupt_record"));
                 }
                 if let Some(child_id) = token.pending_child {
-                    self.retire_unstarted_capture_child(txn, branch_id, grant, child_id)?;
+                    self.retire_unstarted_capture_child(
+                        txn,
+                        branch_id,
+                        operation_id,
+                        grant,
+                        child_id,
+                    )?;
                 }
                 branch.capture = None;
             } else if let Some(token) = &mut branch.capture {
@@ -2029,16 +2116,33 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         &self,
         txn: &mut dyn MetadataTxn,
         branch_id: BranchId,
+        capture_id: OperationId,
         grant: WriterGrant,
         child_id: OperationId,
     ) -> Result<(), MetadataError> {
         let key = self.operation_key(child_id);
         let Some(bytes) = txn.get(&key)? else {
+            let reservation_key =
+                capture_child_reservation_key(self.workspace_id, self.principal_id, child_id);
+            let reservation_bytes = txn
+                .get(&reservation_key)?
+                .ok_or_else(|| reject("corrupt_record"))?;
+            let reservation =
+                decode_capture_child_reservation(&reservation_bytes).map_err(to_metadata_error)?;
+            if reservation
+                != (CaptureChildReservation {
+                    capture_id,
+                    branch_id,
+                })
+            {
+                return Err(reject("corrupt_record"));
+            }
             let tombstone = StoredOperation::aborted(OP_TOMBSTONE, [0; 32]);
             txn.put(
                 &key,
                 &encode_operation(&tombstone).map_err(to_metadata_error)?,
             )?;
+            txn.delete(&reservation_key)?;
             return Ok(());
         };
 
@@ -2802,6 +2906,37 @@ struct PinRecord {
     active: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CaptureChildReservation {
+    capture_id: OperationId,
+    branch_id: BranchId,
+}
+
+fn encode_capture_child_reservation(
+    reservation: CaptureChildReservation,
+) -> Result<Vec<u8>, FormatError> {
+    let mut e = CanonicalEncoder::new();
+    e.fixed(reservation.capture_id.as_bytes());
+    e.fixed(reservation.branch_id.as_bytes());
+    encode_metadata_record(MetadataRecordType::CaptureChildReservation, &e.finish())
+}
+
+fn decode_capture_child_reservation(bytes: &[u8]) -> Result<CaptureChildReservation, FormatError> {
+    let (record_type, payload) = decode_metadata_record(bytes)?;
+    if record_type != MetadataRecordType::CaptureChildReservation {
+        return Err(FormatError::InvalidEnvelope(
+            "wrong capture child reservation type",
+        ));
+    }
+    let mut d = CanonicalDecoder::new(payload);
+    let reservation = CaptureChildReservation {
+        capture_id: OperationId::from_bytes(d.fixed()?),
+        branch_id: BranchId::from_bytes(d.fixed()?),
+    };
+    d.finish()?;
+    Ok(reservation)
+}
+
 fn encode_pin(pin: PinRecord) -> Result<Vec<u8>, FormatError> {
     let mut e = CanonicalEncoder::new();
     e.fixed(pin.generation_id.as_bytes());
@@ -3047,6 +3182,32 @@ fn validate_object_ref_type(reference: ObjectRef, expected: ObjectType) -> Resul
         return Err(FormatError::ObjectReferenceMismatch);
     }
     Ok(())
+}
+
+fn validate_preparation_root_scope(
+    kind: PreparationKind,
+    current: LiveRoots,
+    next: LiveRoots,
+) -> Result<(), MetadataError> {
+    let valid = match kind {
+        PreparationKind::VolumeBarrier => {
+            next.logs == current.logs && next.artifacts == current.artifacts
+        }
+        PreparationKind::LogMutation => {
+            next.volume == current.volume && next.artifacts == current.artifacts
+        }
+        PreparationKind::ArtifactMutation => {
+            next.volume == current.volume && next.logs == current.logs
+        }
+        PreparationKind::CheckpointCapture => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(reject(
+            "invalid_request: preparation kind may replace only its own live root",
+        ))
+    }
 }
 
 fn decode_preparation_kind(value: u8) -> Result<PreparationKind, FormatError> {
@@ -3481,6 +3642,20 @@ fn branch_name_key(workspace: WorkspaceId, name: &str) -> Vec<u8> {
     key.extend_from_slice(&(name.len() as u16).to_be_bytes());
     key.extend_from_slice(name.as_bytes());
     key
+}
+fn capture_child_reservation_key(
+    workspace: WorkspaceId,
+    principal: PrincipalId,
+    child: OperationId,
+) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"capture-child/",
+        workspace.as_bytes(),
+        principal.as_bytes(),
+        child.as_bytes(),
+    ]
+    .concat()
 }
 fn generation_key(workspace: WorkspaceId, generation: GenerationId) -> Vec<u8> {
     [

@@ -211,6 +211,14 @@ fn roots(marker: u8) -> LiveRoots {
     }
 }
 
+fn replace_volume_root(current: LiveRoots, marker: u8) -> LiveRoots {
+    LiveRoots {
+        volume: object(ObjectType::VolumeRoot, marker),
+        logs: current.logs,
+        artifacts: current.artifacts,
+    }
+}
+
 fn seed(marker: u8) -> GenerationSeed {
     GenerationSeed {
         generation_id: generation(marker),
@@ -294,7 +302,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
         Err(ControlError::Busy)
     );
 
-    let next_roots = roots(9);
+    let next_roots = replace_volume_root(roots(1), 9);
     let preparation = env
         .control
         .begin_preparation(PreparationRequest {
@@ -451,7 +459,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
             volume_epoch: reattached.volume_epoch,
             protection_id: protection(15),
             kind: PreparationKind::VolumeBarrier,
-            expected_roots: Some(roots(15)),
+            expected_roots: Some(replace_volume_root(next_roots, 15)),
             dependencies: vec![],
         })
         .expect("accept the current attachment epoch");
@@ -508,13 +516,19 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             volume_epoch: 1,
             protection_id: protection(5),
             kind: PreparationKind::VolumeBarrier,
-            expected_roots: Some(roots(12)),
+            expected_roots: Some(replace_volume_root(roots(1), 12)),
             dependencies: vec![],
         })
         .expect("register admitted child preparation");
     let after_child = env
         .control
-        .commit_live_roots(op(12), 1, grant, roots(12), Some((op(10), op(12))))
+        .commit_live_roots(
+            op(12),
+            1,
+            grant,
+            replace_volume_root(roots(1), 12),
+            Some((op(10), op(12))),
+        )
         .expect("commit admitted drain child");
     assert_eq!(after_child.revision, 2);
     let sealed = env
@@ -523,7 +537,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
         .expect("seal exact final capture boundary");
     assert!(sealed.sealed);
     assert_eq!(sealed.sealed_revision, Some(2));
-    assert_eq!(sealed.sealed_roots, Some(roots(12)));
+    assert_eq!(sealed.sealed_roots, Some(replace_volume_root(roots(1), 12)));
 
     assert_eq!(
         env.control
@@ -559,7 +573,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
 fn capture_waits_for_mutation_preparations_and_renewed_writer_can_finish_one() {
     let env = TestEnv::new();
     let grant = env.writer_and_attachment();
-    let roots = roots(60);
+    let roots = replace_volume_root(roots(1), 60);
     env.control
         .begin_preparation(PreparationRequest {
             operation_id: op(60),
@@ -741,17 +755,40 @@ fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
         .expect("authorize child before worker starts it");
     assert_eq!(
         env.control
-            .abort_operation(op(40))
-            .expect("abort capture and retire absent child"),
+            .abort_operation(op(42))
+            .expect("abort unseen child and release its reservation"),
         OperationState::Aborted
     );
-    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control
+            .get_branch(branch(1))
+            .unwrap()
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.pending_child),
+        None
+    );
     assert_eq!(
         env.control.get_operation(op(42)).unwrap(),
         OperationState::Aborted
     );
+
+    env.control
+        .authorize_capture_child(op(43), op(40), op(44), grant)
+        .expect("authorize another child after releasing the first reservation");
     assert_eq!(
-        begin_child(op(42), protection(42)),
+        env.control
+            .abort_operation(op(40))
+            .expect("abort capture and retire its unseen child"),
+        OperationState::Aborted
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_none());
+    assert_eq!(
+        env.control.get_operation(op(44)).unwrap(),
+        OperationState::Aborted
+    );
+    assert_eq!(
+        begin_child(op(44), protection(44)),
         Err(ControlError::Aborted)
     );
 

@@ -224,6 +224,30 @@ fn roots(marker: u8) -> LiveRoots {
     }
 }
 
+fn replace_volume_root(current: LiveRoots, marker: u8) -> LiveRoots {
+    LiveRoots {
+        volume: object(ObjectType::VolumeRoot, marker),
+        logs: current.logs,
+        artifacts: current.artifacts,
+    }
+}
+
+fn replace_log_root(current: LiveRoots, marker: u8) -> LiveRoots {
+    LiveRoots {
+        volume: current.volume,
+        logs: object(ObjectType::LogMapRoot, marker),
+        artifacts: current.artifacts,
+    }
+}
+
+fn replace_artifact_root(current: LiveRoots, marker: u8) -> LiveRoots {
+    LiveRoots {
+        volume: current.volume,
+        logs: current.logs,
+        artifacts: object(ObjectType::ArtifactMapRoot, marker),
+    }
+}
+
 fn seed(marker: u8) -> GenerationSeed {
     GenerationSeed {
         generation_id: generation(marker),
@@ -323,8 +347,91 @@ fn core_protocol_rejects_non_volume_capture_children() {
         }),
         Err(ControlError::Busy)
     );
+    assert_eq!(control.abort_operation(op(34)), Ok(OperationState::Aborted));
+    assert_eq!(
+        control
+            .get_branch(branch(1))
+            .expect("read capture after child abort")
+            .capture
+            .expect("capture remains open")
+            .pending_child,
+        None
+    );
+    assert!(
+        control
+            .seal_capture(op(35), op(32), 1, writer)
+            .expect("seal after aborting unstarted child")
+            .sealed
+    );
     control
         .abort_operation(op(32))
         .expect("abort capture and tombstone child");
     assert_eq!(control.get_operation(op(34)), Ok(OperationState::Aborted));
+}
+
+#[test]
+fn core_protocol_limits_each_preparation_to_its_view_root() {
+    let control = control();
+    let writer = control
+        .acquire_writer(op(40), branch(1), 1, 0)
+        .expect("acquire writer");
+    control
+        .attach_volume(op(41), branch(1), 1, writer, attachment(1), protection(1))
+        .expect("attach volume");
+    let initial = roots(1);
+
+    assert!(matches!(
+        control.begin_preparation(PreparationRequest {
+            operation_id: op(42),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant: writer,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(2),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(roots(2)),
+            dependencies: vec![],
+        }),
+        Err(ControlError::InvalidRequest(_))
+    ));
+
+    for (operation_id, protection_id, kind, next) in [
+        (
+            op(43),
+            protection(3),
+            PreparationKind::VolumeBarrier,
+            replace_volume_root(initial, 3),
+        ),
+        (
+            op(44),
+            protection(4),
+            PreparationKind::LogMutation,
+            replace_log_root(initial, 4),
+        ),
+        (
+            op(45),
+            protection(5),
+            PreparationKind::ArtifactMutation,
+            replace_artifact_root(initial, 5),
+        ),
+    ] {
+        control
+            .begin_preparation(PreparationRequest {
+                operation_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant: writer,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id,
+                kind,
+                expected_roots: Some(next),
+                dependencies: vec![],
+            })
+            .expect("accept preparation scoped to its view root");
+        control
+            .abort_operation(operation_id)
+            .expect("abort root-scope preparation");
+    }
 }

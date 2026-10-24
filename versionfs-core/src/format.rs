@@ -109,6 +109,8 @@ pub enum MetadataRecordType {
     BranchNameIndex = 7,
     /// Explicit Generation pin metadata.
     Pin = 8,
+    /// Point-key index binding an authorized capture child to its capture.
+    CaptureChildReservation = 9,
 }
 
 impl TryFrom<u16> for MetadataRecordType {
@@ -124,6 +126,7 @@ impl TryFrom<u16> for MetadataRecordType {
             6 => Ok(Self::AuthorityOwner),
             7 => Ok(Self::BranchNameIndex),
             8 => Ok(Self::Pin),
+            9 => Ok(Self::CaptureChildReservation),
             other => Err(FormatError::UnknownMetadataRecordType(other)),
         }
     }

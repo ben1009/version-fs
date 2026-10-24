@@ -237,6 +237,12 @@ claiming reliable barriers until P6 is qualified.
   paths. Preparations bind the exact volume epoch and live attachment-base
   protection at admission and commit. Definite expiry/fencing resolves token
   cleanup safely.
+- [x] Persist an exact capture-child reservation when authorizing a drain child.
+  Direct abort of an unstarted child clears the pending slot and tombstones its
+  ID atomically; parent abort/expiry retires the same reservation without scans.
+- [x] Enforce preparation root scope at admission and commit: volume barriers
+  replace only VolumeRoot, log mutations only the log root, and artifact
+  mutations only the artifact root.
 
 Use the RFC's lease/renewal defaults centrally. Every new heartbeat has an operation
 ID; replay returns its old deadline. Keep terminal fingerprints/results for the
@@ -247,7 +253,8 @@ adapter. They exercise duplicate results and changed-payload rejection, concurre
 absent-key branch-name claims, writer/attachment acquisition and restart fencing,
 active-preparation renewal under a refreshed writer grant, exact attachment epochs
 and protection expiry, capture exclusion/admission/sealing/abort, preparation
-renewal and expiry cleanup, pin/read/live-log protection, and retention eligibility
+renewal and expiry cleanup, direct abort and retry of an unstarted capture child,
+per-preparation root scope, pin/read/live-log protection, and retention eligibility
 after close or expiry. This qualifies the backend-neutral P5 control protocol through
 the MVP adapter; it does not qualify live block-device durability, Generation
 publication, or device fencing integration, which remain in P6/P7/P9.
