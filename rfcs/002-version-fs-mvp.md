@@ -634,8 +634,9 @@ reset, detach/replacement, and ownership handover fence the previous attachment.
 Every protected preparation carries the exact volume epoch and validates the
 current attachment-base protection when it begins, renews, and commits. Reusing
 an attachment ID after detach cannot make a preparation from the prior epoch
-valid. Detach and writer release are rejected until ordinary mutation
-preparations commit, abort, or expire.
+valid. Detach and writer release return `busy` while any mutation preparation
+(including a volume barrier) or capture is pending. These operations do not
+resolve pending work; callers must resolve or let it expire before retrying.
 
 Attachment-base renewal and detach bind the exact attachment ID, volume epoch,
 and protection ID in their request and fingerprint. A delayed request for an
@@ -1197,7 +1198,7 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 | `create_branch` / `get_branch` | Retained base and identified create, or stable ID/name lookup; returns head, live roots, revisions, epochs, and attachment state. |
 | `acquire_writer` / `renew_writer` / `release_writer` | Identified request and exact grant/epoch/handover policy; returns original grant/deadline or release result. |
 | `attach_volume` | Operation ID, branch ID/revision, exact grant; returns fenced attachment ID, protected base, live VolumeRoot/geometry, and device setup inputs. |
-| `renew_base_protection` / `detach_volume` | Operation ID, exact attachment ID/volume epoch/protection ID, and writer grant; detach requires unmounted/drained state, resolves pending barriers/capture, and releases protection. It must flush unless explicit discard is requested. |
+| `renew_base_protection` / `detach_volume` | Operation ID, exact attachment ID/volume epoch/protection ID, and writer grant; detach requires an unmounted, drained device and returns `busy` while a mutation preparation (including a barrier) or capture is pending. Callers must resolve pending work before retrying. Successful detach releases the attachment-base protection; callers must flush dirty state first or explicitly discard it. |
 | `flush_volume` | Internal operation ID, exact attachment/epoch/grant, covered I/O boundary, sealed dirty version, and expected live revision; returns durable volume boundary/root/revision. |
 | `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
 | `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |
