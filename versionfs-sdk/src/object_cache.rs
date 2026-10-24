@@ -196,6 +196,7 @@ struct CapacityReservation<'a> {
     cache: &'a WorkspaceObjectCache,
     bytes: u64,
     victims: Vec<Option<CacheVictim>>,
+    owned_path: Option<PathBuf>,
     active: bool,
 }
 
@@ -255,6 +256,13 @@ impl Drop for CapacityReservation<'_> {
         if !self.active {
             return;
         }
+        let released = self
+            .owned_path
+            .as_ref()
+            .is_none_or(|path| match fs::remove_file(path) {
+                Ok(()) => true,
+                Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+            });
         let mut state = self
             .cache
             .state
@@ -270,15 +278,11 @@ impl Drop for CapacityReservation<'_> {
                 state.entries.insert(victim.key, victim.entry);
             }
         }
-        state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
-    }
-}
-
-struct TemporaryPath(PathBuf);
-
-impl Drop for TemporaryPath {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Keep undeleted bytes charged until the exclusively owned cache is
+        // reopened and rebuilds its byte budget.
+        if released {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(self.bytes);
+        }
     }
 }
 
@@ -288,7 +292,8 @@ impl Drop for TemporaryPath {
 /// coordination deduplicates concurrent misses while unrelated object reads
 /// proceed independently. Cache I/O never holds the shared index lock. The
 /// cache stores immutable objects only; dirty block and control state use
-/// separate caller-owned storage.
+/// separate caller-owned storage. Incomplete fills whose files cannot be removed
+/// retain their capacity reservation until the cache is reopened.
 pub struct WorkspaceObjectCache {
     workspace_id: WorkspaceId,
     store_scope: ObjectStoreScopeId,
@@ -511,8 +516,8 @@ impl WorkspaceObjectCache {
         let temp_path = self
             .directory
             .join(format!(".tmp-{}-{temp_id}", std::process::id()));
-        let _temp_path_guard = TemporaryPath(temp_path.clone());
         let mut temp = create_new_file(&temp_path)?;
+        reservation.owned_path = Some(temp_path.clone());
         temp.write_all(bytes).map_err(|source| CacheError::Io {
             path: temp_path.clone(),
             source,
@@ -526,6 +531,7 @@ impl WorkspaceObjectCache {
             path: path.clone(),
             source,
         })?;
+        reservation.owned_path = Some(path);
         reservation.commit(object_id, encoded_len)
     }
 
@@ -608,6 +614,7 @@ impl WorkspaceObjectCache {
             cache: self,
             bytes: incoming_bytes,
             victims,
+            owned_path: None,
             active: true,
         }))
     }
@@ -1160,6 +1167,48 @@ mod tests {
         assert_eq!(object_bytes, capacity);
         assert!(!cache.object_path(first_ref.object_id).exists());
         assert_eq!(cache.lock_state().unwrap().encoded_bytes, capacity);
+    }
+
+    #[test]
+    fn failed_temporary_cleanup_keeps_capacity_reserved_until_reopen() {
+        let directory = TestDirectory::new();
+        let workspace = WorkspaceId::from_bytes([0x4D; 16]);
+        let (reference, bytes) = encoded_object(0xB5);
+        let capacity = bytes.len() as u64;
+        let cache =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
+        let mut reservation = cache
+            .reserve_install(reference.object_id, capacity)
+            .unwrap()
+            .unwrap();
+
+        // A directory at the cleanup path makes unlink fail even as root. Its
+        // payload stands in for the temporary bytes that could not be removed.
+        let blocked_path = cache.directory.join(".tmp-blocked");
+        fs::create_dir(&blocked_path).unwrap();
+        let payload_path = blocked_path.join("payload");
+        fs::write(&payload_path, &bytes).unwrap();
+        reservation.owned_path = Some(blocked_path.clone());
+        drop(reservation);
+
+        assert_eq!(cache.lock_state().unwrap().reserved_bytes, capacity);
+        assert_eq!(fetch(&cache, reference, &bytes), bytes);
+        assert!(!cache.object_path(reference.object_id).exists());
+        assert_eq!(fs::read(&payload_path).unwrap(), bytes);
+
+        // Recover access to the residual regular file before reopening, as
+        // would happen when a transient directory permission failure clears.
+        let orphan_path = cache.directory.join(".tmp-orphan");
+        fs::rename(&payload_path, &orphan_path).unwrap();
+        fs::remove_dir(&blocked_path).unwrap();
+        drop(cache);
+        let reopened =
+            WorkspaceObjectCache::open(&directory.0, workspace, STORE_SCOPE, capacity).unwrap();
+        assert!(!orphan_path.exists());
+        assert_eq!(fetch(&reopened, reference, &bytes), bytes);
+        let state = reopened.lock_state().unwrap();
+        assert_eq!(state.encoded_bytes, capacity);
+        assert_eq!(state.reserved_bytes, 0);
     }
 
     #[test]

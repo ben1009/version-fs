@@ -26,6 +26,8 @@ Cache handles identify both their workspace and object-store scope. A cached
 map store requires its cache scope to match the backing store's `proof_scope`;
 reopening a directory for another scope removes the previous scope's clean
 objects before serving reads.
+If temporary-file cleanup fails, its capacity stays reserved until reopening
+removes the leftover file. Verified backing reads remain available in the meantime.
 
 Validated view handles seal without reading their map nodes. Imported volume
 handles can retain the result of `VolumeExtentMap::validate` to check metadata

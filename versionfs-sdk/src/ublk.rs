@@ -2,6 +2,7 @@
 
 use crate::volume::{BlockError, BlockRequest, BlockResponse, DirtyVolume};
 use libublk::ctrl::UblkCtrlBuilder;
+use libublk::helpers::IoBuf;
 use libublk::io::{BufDesc, BufDescList, UblkDev, UblkQueue};
 use libublk::{UblkError, UblkFlags, UblkIORes};
 use std::cell::RefCell;
@@ -146,10 +147,13 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
     queue_start_error: Arc<Mutex<Option<UblkError>>>,
     initialize_queue: QueueInitializer,
 ) {
-    let buffers = Rc::new(RefCell::new(device.alloc_queue_io_bufs()));
-    let queue = match initialize_queue(queue_id, device).and_then(|queue| {
-        queue.submit_fetch_commands_unified(BufDescList::Slices(Some(&buffers.borrow())))
-    }) {
+    let setup = check_queue_buffer_allocations(device.alloc_queue_io_bufs()).and_then(|buffers| {
+        let buffers = Rc::new(RefCell::new(buffers));
+        let queue = initialize_queue(queue_id, device)?
+            .submit_fetch_commands_unified(BufDescList::Slices(Some(&buffers.borrow())))?;
+        Ok((queue, buffers))
+    });
+    let (queue, buffers) = match setup {
         Ok(queue) => queue,
         Err(error) => {
             eprintln!("failed to start ublk queue: {error}");
@@ -193,6 +197,22 @@ fn serve_queue<S: MapObjectStore + Send + 'static>(
     // the device queue stops. Notify the control loop so an unexpected exit
     // cannot leave `run_device` waiting indefinitely for explicit shutdown.
     let _ = queue_errors.send(());
+}
+
+fn check_queue_buffer_allocations(buffers: Vec<IoBuf<u8>>) -> Result<Vec<IoBuf<u8>>, UblkError> {
+    if buffers.iter().any(|buffer| buffer.as_ptr().is_null()) {
+        // libublk 0.4.8 silently skips null buffers during registration and its
+        // IoBuf destructor unconditionally deallocates the pointer. Discard
+        // those failed allocations without running that destructor.
+        for buffer in buffers {
+            if buffer.as_ptr().is_null() {
+                std::mem::forget(buffer);
+            }
+        }
+        return Err(UblkError::OtherError(-libc::ENOMEM));
+    }
+
+    Ok(buffers)
 }
 
 fn dispatch_request<S: MapObjectStore + Send>(
@@ -307,6 +327,40 @@ mod tests {
             self.0.insert(id, bytes);
             Ok(())
         }
+    }
+
+    #[test]
+    fn queue_buffer_allocation_check_preserves_buffers() {
+        let buffers = vec![IoBuf::<u8>::new(4096), IoBuf::<u8>::new(8192)];
+        let pointers: Vec<_> = buffers.iter().map(IoBuf::as_ptr).collect();
+
+        let checked = check_queue_buffer_allocations(buffers).unwrap();
+
+        assert_eq!(checked.len(), 2);
+        assert_eq!(checked[0].len(), 4096);
+        assert_eq!(checked[1].len(), 8192);
+        assert_eq!(
+            checked.iter().map(IoBuf::as_ptr).collect::<Vec<_>>(),
+            pointers
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn failpoint_queue_buffer_allocation_failure_returns_enomem() {
+        // A 4 EiB layout is valid but exceeds even five-level x86-64 userspace
+        // addressing. Sanitizer runs skip failpoint_ tests because their
+        // allocators abort on this oversized request instead of returning null.
+        let failed_size = 1_usize << 62;
+        assert!(std::alloc::Layout::from_size_align(failed_size, 4096).is_ok());
+        let failed = IoBuf::<u8>::new(failed_size);
+        assert!(failed.as_ptr().is_null());
+        let buffers = vec![IoBuf::<u8>::new(4096), failed, IoBuf::<u8>::new(8192)];
+
+        assert!(matches!(
+            check_queue_buffer_allocations(buffers),
+            Err(UblkError::OtherError(error)) if error == -libc::ENOMEM
+        ));
     }
 
     #[test]
