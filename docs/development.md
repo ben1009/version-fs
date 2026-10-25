@@ -45,6 +45,12 @@ imported base once and reconstructs the candidate from journaled dirty extents;
 it checks that the reconstructed root matches the saved root before publishing.
 A different authoritative base root requires fresh metadata validation.
 
+The local barrier journal atomically publishes its initial ID state and pending
+records. If replacement returns an error after rename, the worker keeps the exact
+replacement and retries it before remote work resumes. Instance-scoped failure
+points exercise interruptions before publication and between rename and directory
+sync.
+
 ## Setup and tools
 
 Install Rust through rustup. `rust-toolchain.toml` selects the dated nightly and

@@ -4,13 +4,17 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use versionfs_core::control::{
     AttachmentState, BranchState, ControlError, GenerationSeed, LiveRoots, OperationState,
     PreparationKind, PreparationRequest, WorkspaceControl, WriterGrant,
 };
+use versionfs_core::fault::{FailureInjector, FailurePoint, NoFailures};
 use versionfs_core::format::{
     CaptureMode, GenerationDescriptor, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
 };
@@ -102,6 +106,8 @@ pub trait BarrierJournal {
     fn persist_pending(&mut self, barrier: &PendingBarrier) -> Result<(), String>;
 
     /// Atomically replaces one exact terminal pending barrier with its retry.
+    /// An uncertain result must be retried with the same IDs and record. An
+    /// already identical replacement must be synchronized and accepted.
     fn replace_pending(
         &mut self,
         expected_operation_id: OperationId,
@@ -136,14 +142,23 @@ pub struct FileBarrierJournal {
     _lock: File,
     nonce: [u8; 8],
     next_counter: u64,
+    failures: Arc<dyn FailureInjector>,
 }
 
 impl FileBarrierJournal {
     /// Opens or initializes one journal directory.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_with(directory, Arc::new(NoFailures))
+    }
+
+    /// Opens a journal with instance-scoped storage fault injection.
+    pub fn open_with(
+        directory: impl AsRef<Path>,
+        failures: Arc<dyn FailureInjector>,
+    ) -> Result<Self, String> {
         #[cfg(not(unix))]
         {
-            let _ = directory;
+            let _ = (directory, failures);
             return Err(
                 "FileBarrierJournal requires Unix private permissions; provide another BarrierJournal implementation".to_owned(),
             );
@@ -151,12 +166,12 @@ impl FileBarrierJournal {
 
         #[cfg(unix)]
         {
-            Self::open_unix(directory.as_ref())
+            Self::open_unix(directory.as_ref(), failures)
         }
     }
 
     #[cfg(unix)]
-    fn open_unix(directory: &Path) -> Result<Self, String> {
+    fn open_unix(directory: &Path, failures: Arc<dyn FailureInjector>) -> Result<Self, String> {
         let directory = directory.to_path_buf();
         fs::create_dir_all(&directory).map_err(journal_io("create journal directory"))?;
         restrict_journal_directory(&directory)?;
@@ -183,24 +198,10 @@ impl FileBarrierJournal {
                 getrandom::fill(&mut nonce)
                     .map_err(|error| format!("generate journal ID namespace: {error}"))?;
                 let bytes = encode_ids(nonce, 0);
-                let mut ids_options = OpenOptions::new();
-                ids_options.write(true).create_new(true);
-                set_private_creation_mode(&mut ids_options, 0o600);
-                match ids_options.open(&ids_path) {
-                    Ok(mut file) => {
-                        file.write_all(&bytes)
-                            .map_err(journal_io("initialize journal IDs"))?;
-                        file.sync_all()
-                            .map_err(journal_io("sync initialized journal IDs"))?;
-                        sync_directory(&directory)?;
-                        (nonce, 0)
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => decode_ids(
-                        &fs::read(&ids_path)
-                            .map_err(journal_io("read concurrently initialized journal IDs"))?,
-                    )?,
-                    Err(error) => return Err(format!("create journal ID state: {error}")),
-                }
+                // The exclusive journal lock covers initialization too. Only
+                // a complete, synced temporary record reaches this path.
+                atomic_replace(&directory, &ids_path, &bytes, failures.as_ref())?;
+                (nonce, 0)
             }
             Err(error) => return Err(format!("read journal ID state: {error}")),
         };
@@ -212,6 +213,7 @@ impl FileBarrierJournal {
             _lock: lock,
             nonce,
             next_counter,
+            failures,
         })
     }
 
@@ -226,6 +228,7 @@ impl FileBarrierJournal {
             &self.directory,
             &self.ids_path,
             &encode_ids(self.nonce, end),
+            self.failures.as_ref(),
         )?;
         let ids = (self.next_counter..end)
             .map(|counter| {
@@ -272,7 +275,12 @@ impl BarrierJournal for FileBarrierJournal {
             return Err("another barrier is already pending in this journal".to_owned());
         }
         let bytes = encode_pending_file(barrier)?;
-        atomic_replace(&self.directory, &self.pending_path, &bytes)
+        atomic_replace(
+            &self.directory,
+            &self.pending_path,
+            &bytes,
+            self.failures.as_ref(),
+        )
     }
 
     fn replace_pending(
@@ -282,12 +290,18 @@ impl BarrierJournal for FileBarrierJournal {
     ) -> Result<(), String> {
         validate_pending(replacement)?;
         match self.load_pending()? {
-            Some(existing) if existing.operation_id == expected_operation_id => {}
+            Some(existing)
+                if existing.operation_id == expected_operation_id || existing == *replacement => {}
             Some(_) => return Err("cannot replace a different pending barrier".to_owned()),
             None => return Err("cannot replace a missing pending barrier".to_owned()),
         }
         let bytes = encode_pending_file(replacement)?;
-        atomic_replace(&self.directory, &self.pending_path, &bytes)
+        atomic_replace(
+            &self.directory,
+            &self.pending_path,
+            &bytes,
+            self.failures.as_ref(),
+        )
     }
 
     fn finish_pending(&mut self, operation_id: OperationId) -> Result<(), String> {
@@ -604,7 +618,12 @@ fn decode_checked<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], Stri
     Ok(&bytes[16..checksum_start])
 }
 
-fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+fn atomic_replace(
+    directory: &Path,
+    destination: &Path,
+    bytes: &[u8],
+    failures: &dyn FailureInjector,
+) -> Result<(), String> {
     let (temporary, mut file) = loop {
         let sequence = NEXT_TEMP_FILE.fetch_add(1, Ordering::Relaxed);
         let temporary = directory.join(format!(
@@ -628,6 +647,11 @@ fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<
                 .map_err(journal_io("sync temporary barrier journal"))
         });
     drop(file);
+    let write_result = write_result.and_then(|()| {
+        failures
+            .check(FailurePoint::JournalBeforePublish)
+            .map_err(|error| error.to_string())
+    });
     if let Err(error) = write_result {
         let _ = fs::remove_file(&temporary);
         return Err(error);
@@ -636,6 +660,9 @@ fn atomic_replace(directory: &Path, destination: &Path, bytes: &[u8]) -> Result<
         let _ = fs::remove_file(&temporary);
         return Err(format!("publish barrier journal file: {error}"));
     }
+    failures
+        .check(FailurePoint::JournalAfterRenameBeforeDirectorySync)
+        .map_err(|error| error.to_string())?;
     sync_directory(directory)
 }
 
@@ -1042,6 +1069,8 @@ pub struct DurableVolume<S, C, J> {
     // Retains the trusted builder's metadata validation across uploads/retries.
     // Recovery reconstructs this handle from the validated base and dirty delta.
     pending_map: Option<VolumeExtentMap>,
+    // Keeps the exact transition stable until its local publication is durable.
+    pending_replaces: Option<OperationId>,
     pending_journaled: bool,
     last_renewal: Option<Instant>,
 }
@@ -1114,6 +1143,7 @@ where
             pending_journaled: pending.is_some(),
             pending,
             pending_map: None,
+            pending_replaces: None,
             last_renewal: None,
         };
         if volume.pending.is_some() {
@@ -1182,6 +1212,7 @@ where
                 capture_authorization_id,
             );
             self.pending = Some(barrier);
+            self.pending_replaces = None;
             self.pending_journaled = false;
             self.last_renewal = None;
         }
@@ -1523,6 +1554,7 @@ where
                 .map_err(BarrierError::Journal)?;
             self.pending = None;
             self.pending_map = None;
+            self.pending_replaces = None;
             self.pending_journaled = false;
             self.last_renewal = None;
             return Ok(());
@@ -1534,9 +1566,16 @@ where
             return Ok(());
         }
         let pending = self.pending.as_ref().ok_or(BarrierError::Conflict)?;
-        self.journal
-            .persist_pending(pending)
-            .map_err(BarrierError::Journal)?;
+        if let Some(previous_operation_id) = self.pending_replaces {
+            self.journal
+                .replace_pending(previous_operation_id, pending)
+                .map_err(BarrierError::Journal)?;
+        } else {
+            self.journal
+                .persist_pending(pending)
+                .map_err(BarrierError::Journal)?;
+        }
+        self.pending_replaces = None;
         self.pending_journaled = true;
         Ok(())
     }
@@ -1646,6 +1685,7 @@ where
                 .map_err(BarrierError::Journal)?;
             self.pending = None;
             self.pending_map = None;
+            self.pending_replaces = None;
             self.pending_journaled = false;
             self.last_renewal = None;
             return Ok(true);
@@ -1664,13 +1704,14 @@ where
             capture_id,
             capture_authorization_id,
         );
-        self.journal
-            .replace_pending(old_operation_id, &replacement)
-            .map_err(BarrierError::Journal)?;
+        // Keep the exact replacement in memory even when rename/sync returns
+        // an error: the old or new record may now be the visible journal state.
         self.pending = Some(replacement);
         self.pending_map = Some(map);
-        self.pending_journaled = true;
+        self.pending_replaces = Some(old_operation_id);
+        self.pending_journaled = false;
         self.last_renewal = None;
+        self.ensure_pending_journaled()?;
         Ok(false)
     }
 
@@ -1775,6 +1816,7 @@ where
             .map_err(BarrierError::Journal)?;
         self.pending = None;
         self.pending_map = None;
+        self.pending_replaces = None;
         self.pending_journaled = false;
         self.last_renewal = None;
         Ok(())
@@ -1877,6 +1919,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use versionfs_core::control::{OwnerIncarnation, WriterGrant};
+    use versionfs_core::fault::OneShotFailures;
     use versionfs_core::format::{EXTENT_BYTES, ObjectType};
     use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, WorkspaceId};
     use versionfs_core::metadata::MetadataError;
@@ -1899,6 +1942,49 @@ mod tests {
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct FailingReplacementJournal {
+        inner: FileBarrierJournal,
+        failures: Arc<OneShotFailures>,
+        fail_next_replace: Option<FailurePoint>,
+        attempts: Vec<(OperationId, PendingBarrier)>,
+    }
+
+    impl BarrierJournal for FailingReplacementJournal {
+        fn reserve_barrier_ids(&mut self) -> Result<BarrierIds, String> {
+            self.inner.reserve_barrier_ids()
+        }
+
+        fn reserve_operation_id(&mut self) -> Result<OperationId, String> {
+            self.inner.reserve_operation_id()
+        }
+
+        fn load_pending(&mut self) -> Result<Option<PendingBarrier>, String> {
+            self.inner.load_pending()
+        }
+
+        fn persist_pending(&mut self, barrier: &PendingBarrier) -> Result<(), String> {
+            self.inner.persist_pending(barrier)
+        }
+
+        fn replace_pending(
+            &mut self,
+            expected_operation_id: OperationId,
+            replacement: &PendingBarrier,
+        ) -> Result<(), String> {
+            self.attempts
+                .push((expected_operation_id, replacement.clone()));
+            if let Some(point) = self.fail_next_replace.take() {
+                self.failures.arm(point);
+            }
+            self.inner
+                .replace_pending(expected_operation_id, replacement)
+        }
+
+        fn finish_pending(&mut self, operation_id: OperationId) -> Result<(), String> {
+            self.inner.finish_pending(operation_id)
         }
     }
 
@@ -2391,6 +2477,36 @@ mod tests {
             first.protection_id.as_bytes(),
             second.operation_id.as_bytes()
         );
+    }
+
+    #[test]
+    fn file_journal_reopens_after_interrupted_id_initialization() {
+        for point in [
+            FailurePoint::JournalBeforePublish,
+            FailurePoint::JournalAfterRenameBeforeDirectorySync,
+        ] {
+            let directory = TestDir::new();
+            let failures = Arc::new(OneShotFailures::default());
+            failures.arm(point);
+            assert!(FileBarrierJournal::open_with(&directory.0, failures).is_err());
+            let ids_path = directory.0.join("barrier-ids.v1");
+            if point == FailurePoint::JournalBeforePublish {
+                assert!(!ids_path.exists());
+            } else {
+                decode_ids(&fs::read(&ids_path).unwrap()).expect("complete published ID state");
+            }
+
+            let first = FileBarrierJournal::open(&directory.0)
+                .unwrap()
+                .reserve_barrier_ids()
+                .unwrap();
+            let second = FileBarrierJournal::open(&directory.0)
+                .unwrap()
+                .reserve_barrier_ids()
+                .unwrap();
+            assert_ne!(first.operation_id, second.operation_id);
+            assert_ne!(first.protection_id, second.protection_id);
+        }
     }
 
     #[test]
@@ -2943,6 +3059,66 @@ mod tests {
             Some(&OperationState::Aborted)
         );
         assert_eq!(state.branch.revision, 3);
+    }
+
+    #[test]
+    fn pending_replacement_retries_the_exact_record_after_local_io_failure() {
+        for point in [
+            FailurePoint::JournalAfterRenameBeforeDirectorySync,
+            FailurePoint::JournalBeforePublish,
+        ] {
+            let environment = TestEnvironment::new();
+            let failures = Arc::new(OneShotFailures::default());
+            let journal = FailingReplacementJournal {
+                inner: FileBarrierJournal::open_with(&environment._directory.0, failures.clone())
+                    .unwrap(),
+                failures,
+                fail_next_replace: Some(point),
+                attempts: Vec::new(),
+            };
+            let mut worker = DurableVolume::open(
+                environment.store.clone(),
+                environment.control.clone(),
+                journal,
+                environment.branch_id,
+                environment.grant,
+                environment.attachment_id,
+                EXTENT_BYTES as usize,
+            )
+            .unwrap();
+            worker.inner.write(4096, &[0xD8; 4096]).unwrap();
+            environment
+                .store
+                .fail_next_upload
+                .store(true, Ordering::SeqCst);
+            assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+            let old_operation_id = worker.pending.as_ref().unwrap().operation_id;
+            environment.control.0.lock().unwrap().branch.revision += 1;
+
+            assert!(matches!(worker.flush(), Err(BarrierError::Journal(_))));
+            assert_eq!(environment.control.0.lock().unwrap().commit_count, 0);
+            assert!(matches!(
+                worker.dispatch(BlockRequest::Write {
+                    offset: 0,
+                    data: &[0; 4096],
+                    fua: false,
+                }),
+                Err(BlockError::BarrierUnresolved)
+            ));
+            worker
+                .flush()
+                .expect("retry the uncertain local replacement");
+
+            let [first_attempt, retry] = worker.journal.attempts.as_slice() else {
+                panic!("one replacement and one exact retry are required");
+            };
+            assert_eq!(first_attempt.0, old_operation_id);
+            assert_ne!(first_attempt.1.operation_id, old_operation_id);
+            assert_eq!(first_attempt, retry);
+            assert_eq!(worker.inner.read(4096, 4096).unwrap(), vec![0xD8; 4096]);
+            assert!(worker.pending.is_none());
+            assert_eq!(environment.control.0.lock().unwrap().commit_count, 1);
+        }
     }
 
     #[test]
