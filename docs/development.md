@@ -31,6 +31,9 @@ Cache handles identify both their workspace and object-store scope. A cached
 map store requires its cache scope to match the backing store's `proof_scope`;
 reopening a directory for another scope removes the previous scope's clean
 objects before serving reads.
+S3 scopes include the effective endpoint, region, addressing style, bucket, and
+deployment prefix. An explicit local-emulator endpoint overrides both generic
+and S3-specific environment endpoints.
 If temporary-file cleanup fails, its capacity stays reserved until reopening
 removes the leftover file. Verified backing reads remain available in the meantime.
 
@@ -50,6 +53,10 @@ records. If replacement returns an error after rename, the worker keeps the exac
 replacement and retries it before remote work resumes. Instance-scoped failure
 points exercise interruptions before publication and between rename and directory
 sync.
+Branch reads reconcile a pending Metadata Authority outcome before reading fresh
+state, allowing barrier retries and worker reopen to pass the toy-kv outcome
+gate. A clean worker validates its writer and attachment identity before clearing
+an unused capture child.
 
 ## Setup and tools
 

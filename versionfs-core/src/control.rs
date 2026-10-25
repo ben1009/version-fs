@@ -578,12 +578,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         decode_branch(&result)
     }
 
-    /// Reads a branch by stable ID.
+    /// Reads a branch by stable ID, reconciling a blocked authority outcome first.
     pub fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError> {
-        let bytes = self
-            .authority
-            .get(&branch_key(self.workspace_id, branch_id))?
-            .ok_or(ControlError::NotFound)?;
+        let bytes = read_authoritative_point(
+            self.authority.as_ref(),
+            &branch_key(self.workspace_id, branch_id),
+        )?
+        .ok_or(ControlError::NotFound)?;
         let branch = decode_branch(&bytes)?;
         if branch.deleted {
             return Err(ControlError::NotFound);
@@ -594,10 +595,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     /// Resolves a branch name through its deterministic point-key index.
     pub fn branch_by_name(&self, name: &str) -> Result<BranchState, ControlError> {
         validate_name(name)?;
-        let bytes = self
-            .authority
-            .get(&branch_name_key(self.workspace_id, name))?
-            .ok_or(ControlError::NotFound)?;
+        let bytes = read_authoritative_point(
+            self.authority.as_ref(),
+            &branch_name_key(self.workspace_id, name),
+        )?
+        .ok_or(ControlError::NotFound)?;
         self.get_branch(decode_name_binding(&bytes)?)
     }
 
@@ -3286,6 +3288,22 @@ fn decode_deadline(bytes: &[u8]) -> Result<MonotonicTime, ControlError> {
         .try_into()
         .map_err(|_| ControlError::CorruptRecord("invalid deadline result".into()))?;
     Ok(MonotonicTime::from_nanos(u64::from_le_bytes(raw)))
+}
+
+fn read_authoritative_point<A: MetadataAuthority>(
+    authority: &A,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, ControlError> {
+    match authority.get(key) {
+        Err(MetadataError::ReconciliationRequired { operation_id }) => {
+            // The backend exposes its exact encoded outcome key. Resolve that
+            // gate before retrying a fresh read, including when the caller has
+            // no local pending operation (for example a no-op drain cleanup).
+            reconcile_outcome(authority, &operation_id)?;
+            authority.get(key).map_err(map_metadata_error)
+        }
+        result => result.map_err(map_metadata_error),
+    }
 }
 
 fn reconcile_outcome<A: MetadataAuthority>(

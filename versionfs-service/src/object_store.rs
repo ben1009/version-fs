@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey, S3ConditionalPut};
 use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use object_store::path::Path;
 use object_store::{Error as S3Error, GetOptions, ObjectStore as S3Store, PutMode, PutOptions};
@@ -367,6 +367,13 @@ impl S3ObjectStore {
     /// With the `s3-emulator` feature, a test-only endpoint may instead use
     /// plain HTTP if it is bound to `127.0.0.1`.
     pub fn connect(config: S3ObjectStoreConfig) -> Result<Self, ObjectStoreError> {
+        Self::connect_with_builder(config, AmazonS3Builder::from_env())
+    }
+
+    fn connect_with_builder(
+        config: S3ObjectStoreConfig,
+        builder: AmazonS3Builder,
+    ) -> Result<Self, ObjectStoreError> {
         let deployment_prefix = normalize_prefix(&config.deployment_prefix)?;
         if config.bucket.is_empty() {
             return Err(ObjectStoreError::InvalidConfiguration(
@@ -383,25 +390,19 @@ impl S3ObjectStore {
             validate_local_emulator_endpoint(endpoint)?;
         }
 
-        #[cfg(feature = "s3-emulator")]
-        let backend_namespace = match config.local_emulator_endpoint.as_deref() {
-            Some(endpoint) => format!(
-                "s3-emulator://{}/{}/{}",
-                endpoint, config.bucket, deployment_prefix
-            ),
-            None => format!("s3://{}/{}", config.bucket, deployment_prefix),
-        };
-        #[cfg(not(feature = "s3-emulator"))]
-        let backend_namespace = format!("s3://{}/{}", config.bucket, deployment_prefix);
-
-        let mut builder = AmazonS3Builder::from_env()
+        let mut builder = builder
             .with_bucket_name(config.bucket)
             .with_allow_http(false)
             .with_s3_express(false)
             .with_conditional_put(S3ConditionalPut::ETagMatch);
         #[cfg(feature = "s3-emulator")]
         if let Some(endpoint) = config.local_emulator_endpoint.as_deref() {
-            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+            // The service-specific endpoint takes precedence over the generic
+            // endpoint, including when it came from the environment.
+            builder = builder
+                .with_endpoint(endpoint)
+                .with_config(AmazonS3ConfigKey::S3Endpoint, endpoint)
+                .with_allow_http(true);
         }
         #[cfg(feature = "s3-emulator")]
         let request_server_side_encryption = config.local_emulator_endpoint.is_none();
@@ -430,6 +431,7 @@ impl S3ObjectStore {
                 ));
             }
         };
+        let backend_namespace = s3_backend_namespace(&builder, &deployment_prefix);
         let backend = builder
             .build()
             .map_err(|error| ObjectStoreError::InvalidConfiguration(error.to_string()))?;
@@ -712,6 +714,38 @@ impl ObjectStore for S3ObjectStore {
             next_cursor,
         })
     }
+}
+
+fn s3_backend_namespace(builder: &AmazonS3Builder, deployment_prefix: &str) -> String {
+    // Match the builder's endpoint precedence and default region. Bucket and
+    // prefix alone do not identify a namespace when endpoints are configurable.
+    let endpoint = builder
+        .get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint))
+        .unwrap_or_default();
+    let region = builder
+        .get_config_value(&AmazonS3ConfigKey::Region)
+        .unwrap_or_else(|| "us-east-1".to_owned());
+    let bucket = builder
+        .get_config_value(&AmazonS3ConfigKey::Bucket)
+        .unwrap_or_default();
+    let virtual_hosted = builder
+        .get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest)
+        .unwrap_or_else(|| "false".to_owned());
+    let mut digest = Sha256::new();
+    for component in [
+        "versionfs-s3-namespace-v1",
+        endpoint.as_str(),
+        region.as_str(),
+        virtual_hosted.as_str(),
+        bucket.as_str(),
+        deployment_prefix,
+    ] {
+        digest.update((component.len() as u64).to_le_bytes());
+        digest.update(component.as_bytes());
+    }
+
+    format!("s3://{:x}", digest.finalize())
 }
 
 #[cfg(feature = "s3-emulator")]
@@ -1208,6 +1242,64 @@ mod tests {
             store.get(workspace(3), first.object_ref).await,
             Err(ObjectStoreError::NotFound { .. })
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proof_scope_binds_the_effective_s3_destination() {
+        let config = S3ObjectStoreConfig::new("scope-bucket", "deployment");
+        let builder = AmazonS3Builder::new()
+            .with_access_key_id("test")
+            .with_secret_access_key("test");
+        let scope = |config, builder| {
+            let store = Arc::new(S3ObjectStore::connect_with_builder(config, builder).unwrap());
+            BlockingS3MapObjectStore::new(store, workspace(1), Handle::current()).proof_scope()
+        };
+        let first = builder
+            .clone()
+            .with_config(AmazonS3ConfigKey::Endpoint, "https://first.invalid");
+        let second = builder
+            .clone()
+            .with_config(AmazonS3ConfigKey::Endpoint, "https://second.invalid");
+        assert_ne!(
+            scope(config.clone(), first.clone()),
+            scope(config.clone(), second.clone())
+        );
+        assert_eq!(
+            scope(
+                config.clone(),
+                first
+                    .clone()
+                    .with_config(AmazonS3ConfigKey::S3Endpoint, "https://second.invalid")
+            ),
+            scope(config.clone(), second)
+        );
+        assert_ne!(
+            scope(config.clone(), first.clone()),
+            scope(
+                config.clone(),
+                first.clone().with_virtual_hosted_style_request(true)
+            )
+        );
+        assert_ne!(
+            scope(config.clone(), builder.clone().with_region("us-east-1")),
+            scope(config.clone(), builder.clone().with_region("cn-north-1"))
+        );
+        assert_eq!(
+            scope(config.clone(), builder.clone()),
+            scope(config.clone(), builder.clone().with_region("us-east-1"))
+        );
+
+        #[cfg(feature = "s3-emulator")]
+        {
+            let local = config.with_local_emulator_endpoint("http://127.0.0.1:9000");
+            assert_eq!(
+                scope(local.clone(), builder),
+                scope(
+                    local,
+                    first.with_config(AmazonS3ConfigKey::S3Endpoint, "https://ambient.invalid")
+                )
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

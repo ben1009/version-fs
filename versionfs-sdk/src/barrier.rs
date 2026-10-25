@@ -1173,6 +1173,13 @@ where
         if self.pending.is_none() {
             if self.inner.dirty_extent_count() == 0 {
                 let branch = self.control.get_branch(self.branch_id)?;
+                self.writer_grant = validate_attachment(
+                    &branch,
+                    self.branch_id,
+                    self.attachment_id,
+                    self.volume_epoch,
+                    self.writer_grant,
+                )?;
                 if let Some(child_id) = branch
                     .capture
                     .as_ref()
@@ -2876,6 +2883,38 @@ mod tests {
                 .pending_child,
             None
         );
+    }
+
+    #[test]
+    fn clean_flush_cannot_abort_a_replacement_attachments_capture_child() {
+        let environment = TestEnvironment::new();
+        let mut stale_worker = environment.open();
+        let child_id = OperationId::from_bytes([42; 16]);
+        {
+            let mut state = environment.control.0.lock().unwrap();
+            state.branch.volume_epoch += 1;
+            let volume_epoch = state.branch.volume_epoch;
+            let attachment = state.branch.attachment.as_mut().unwrap();
+            attachment.attachment_id = AttachmentId::from_bytes([43; 16]);
+            attachment.volume_epoch = volume_epoch;
+            state.branch.capture = Some(versionfs_core::control::CaptureState {
+                operation_id: OperationId::from_bytes([40; 16]),
+                principal_id: versionfs_core::identity::PrincipalId::from_bytes([41; 16]),
+                protection_id: ProtectionId::from_bytes([44; 16]),
+                expected_revision: 1,
+                sealed: false,
+                pending_child: Some(child_id),
+                sealed_revision: None,
+                sealed_roots: None,
+            });
+        }
+        assert!(matches!(stale_worker.flush(), Err(BarrierError::Fenced)));
+        let state = environment.control.0.lock().unwrap();
+        assert_eq!(
+            state.branch.capture.as_ref().unwrap().pending_child,
+            Some(child_id)
+        );
+        assert!(!state.operations.contains_key(&child_id));
     }
 
     #[test]
