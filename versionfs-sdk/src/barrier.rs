@@ -1073,6 +1073,8 @@ pub struct DurableVolume<S, C, J> {
     pending_replaces: Option<OperationId>,
     pending_journaled: bool,
     last_renewal: Option<Instant>,
+    // Known ownership loss cannot be reversed beneath a mounted filesystem.
+    fenced: bool,
 }
 
 impl<S, C, J> DurableVolume<S, C, J>
@@ -1145,6 +1147,7 @@ where
             pending_map: None,
             pending_replaces: None,
             last_renewal: None,
+            fenced: false,
         };
         if volume.pending.is_some() {
             volume.resume_pending()?;
@@ -1169,7 +1172,27 @@ where
     }
 
     /// Persists all currently dirty writes and advances the authoritative live root.
+    ///
+    /// Once attachment fencing or terminal lease expiry is observed, this worker
+    /// rejects further writes and barriers while retaining its recovery state.
     pub fn flush(&mut self) -> Result<(), BarrierError> {
+        if self.fenced {
+            return Err(BarrierError::Fenced);
+        }
+        let result = self.flush_inner();
+        // A raw ControlError::Fenced can also mean that a concurrent heartbeat
+        // refreshed the exact grant. Stable attachment/epoch validation detects
+        // ownership loss without turning that recoverable race into a fence.
+        if matches!(
+            &result,
+            Err(BarrierError::Fenced | BarrierError::Control(ControlError::Expired))
+        ) {
+            self.fenced = true;
+        }
+        result
+    }
+
+    fn flush_inner(&mut self) -> Result<(), BarrierError> {
         if self.pending.is_none() {
             if self.inner.dirty_extent_count() == 0 {
                 let branch = self.control.get_branch(self.branch_id)?;
@@ -1798,6 +1821,13 @@ where
         let operation_id = pending.operation_id;
         let dirty_revision = pending.dirty_revision;
         let branch = self.control.get_branch(self.branch_id)?;
+        let grant = validate_attachment(
+            &branch,
+            pending.branch_id,
+            pending.attachment_id,
+            pending.volume_epoch,
+            pending.writer_grant,
+        )?;
         let map = if branch.volume_root == self.live_roots.volume {
             self.inner.base_map()
         } else if branch.volume_root == pending.next_roots.volume {
@@ -1815,9 +1845,7 @@ where
         }
         self.live_roots = roots(&branch);
         self.revision = branch.revision;
-        if let Some(grant) = branch.writer {
-            self.writer_grant = grant;
-        }
+        self.writer_grant = grant;
         self.journal
             .finish_pending(operation_id)
             .map_err(BarrierError::Journal)?;
@@ -1850,6 +1878,9 @@ where
                 self.inner.read(offset, length).map(BlockResponse::Read)
             }
             BlockRequest::Write { offset, data, fua } => {
+                if self.fenced {
+                    return Err(BlockError::Barrier(BarrierError::Fenced.to_string()));
+                }
                 if self.pending.is_some() {
                     return Err(BlockError::BarrierUnresolved);
                 }
@@ -2091,6 +2122,7 @@ mod tests {
         renewals: HashMap<OperationId, (MonotonicTime, WriterGrant)>,
         expire_next_renewal: bool,
         lose_next_commit_reply: bool,
+        branch_after_committed_read: Option<BranchState>,
         commit_count: usize,
     }
 
@@ -2279,13 +2311,18 @@ mod tests {
         }
 
         fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
-            self.0
-                .lock()
-                .map_err(|_| ControlError::InvalidTransition)?
+            let mut state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
+            let operation = state
                 .operations
                 .get(&operation_id)
                 .cloned()
-                .ok_or(ControlError::NotFound)
+                .ok_or(ControlError::NotFound)?;
+            if matches!(operation, OperationState::Committed(_))
+                && let Some(branch) = state.branch_after_committed_read.take()
+            {
+                state.branch = branch;
+            }
+            Ok(operation)
         }
 
         fn abort_operation(
@@ -2373,6 +2410,7 @@ mod tests {
                 renewals: HashMap::new(),
                 expire_next_renewal: false,
                 lose_next_commit_reply: false,
+                branch_after_committed_read: None,
                 commit_count: 0,
             })));
             Self {
@@ -2915,6 +2953,96 @@ mod tests {
             Some(child_id)
         );
         assert!(!state.operations.contains_key(&child_id));
+    }
+
+    #[test]
+    fn known_fencing_stops_writes_and_preserves_dirty_state() {
+        for dirty in [false, true] {
+            let environment = TestEnvironment::new();
+            let mut worker = environment.open();
+            if dirty {
+                worker
+                    .dispatch(BlockRequest::Write {
+                        offset: 4096,
+                        data: &[0xA8; 4096],
+                        fua: false,
+                    })
+                    .unwrap();
+            }
+            let original = environment.control.0.lock().unwrap().branch.clone();
+            environment.control.0.lock().unwrap().branch.attachment = None;
+            assert!(matches!(worker.flush(), Err(BarrierError::Fenced)));
+            assert!(matches!(
+                worker.dispatch(BlockRequest::Write {
+                    offset: 8192,
+                    data: &[0xB9; 4096],
+                    fua: false,
+                }),
+                Err(BlockError::Barrier(_))
+            ));
+            assert_eq!(worker.inner.read(8192, 4096).unwrap(), vec![0; 4096]);
+            assert_eq!(
+                worker.inner.read(4096, 4096).unwrap(),
+                vec![if dirty { 0xA8 } else { 0 }; 4096]
+            );
+            // A fenced device cannot resume even if an adapter later presents
+            // the prior identity; recovery requires a fresh attachment.
+            environment.control.0.lock().unwrap().branch = original;
+            assert!(matches!(worker.flush(), Err(BarrierError::Fenced)));
+        }
+    }
+
+    #[test]
+    fn committed_recovery_rejects_takeover_before_adopting_a_new_root() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        let original_roots = worker.live_roots;
+        worker
+            .dispatch(BlockRequest::Write {
+                offset: 4096,
+                data: &[0xCA; 4096],
+                fua: false,
+            })
+            .unwrap();
+        environment.control.0.lock().unwrap().lose_next_commit_reply = true;
+        assert!(matches!(
+            worker.flush(),
+            Err(BarrierError::Control(ControlError::Metadata(
+                MetadataError::UnknownOutcome { .. }
+            )))
+        ));
+        let pending = worker.pending.as_ref().unwrap().clone();
+        {
+            let mut state = environment.control.0.lock().unwrap();
+            let mut replacement = state.branch.clone();
+            replacement.writer_epoch += 1;
+            replacement.volume_epoch += 1;
+            replacement.revision += 1;
+            replacement.volume_root = original_roots.volume;
+            replacement.writer = Some(WriterGrant {
+                writer_epoch: replacement.writer_epoch,
+                grant_id: OperationId::from_bytes([0xCB; 16]),
+                ..environment.grant
+            });
+            let attachment = replacement.attachment.as_mut().unwrap();
+            attachment.writer_epoch = replacement.writer_epoch;
+            attachment.volume_epoch = replacement.volume_epoch;
+            state.branch_after_committed_read = Some(replacement);
+        }
+        assert!(matches!(worker.flush(), Err(BarrierError::Fenced)));
+        assert_eq!(worker.writer_grant, environment.grant);
+        assert_eq!(worker.live_roots, original_roots);
+        assert_eq!(worker.inner.read(4096, 4096).unwrap(), vec![0xCA; 4096]);
+        assert_eq!(worker.pending.as_ref(), Some(&pending));
+        assert_eq!(worker.journal.load_pending().unwrap(), Some(pending));
+        assert!(matches!(
+            worker.dispatch(BlockRequest::Write {
+                offset: 8192,
+                data: &[0xDB; 4096],
+                fua: false,
+            }),
+            Err(BlockError::Barrier(_))
+        ));
     }
 
     #[test]

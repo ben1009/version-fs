@@ -53,11 +53,12 @@ impl Drop for TestDirectory {
     }
 }
 
-struct FixedClock;
+#[derive(Default)]
+struct TestClock(AtomicU64);
 
-impl Clock for FixedClock {
+impl Clock for TestClock {
     fn now(&self) -> MonotonicTime {
-        MonotonicTime::from_nanos(0)
+        MonotonicTime::from_nanos(self.0.load(Ordering::SeqCst))
     }
 }
 
@@ -109,6 +110,7 @@ struct Fixture {
     owner: OwnerIncarnation,
     store: MemoryObjects,
     grant: WriterGrant,
+    clock: Arc<TestClock>,
     journal_path: PathBuf,
     _directory: TestDirectory,
 }
@@ -117,10 +119,11 @@ impl Fixture {
     fn new() -> Self {
         let directory = TestDirectory::new();
         let mut store = MemoryObjects::default();
+        let clock = Arc::new(TestClock::default());
         let authority = Arc::new(
             ToyKvMetadataAuthority::open_with(
                 directory.0.join("metadata"),
-                Arc::new(FixedClock),
+                clock.clone(),
                 store.failures.clone(),
             )
             .unwrap(),
@@ -149,6 +152,7 @@ impl Fixture {
             owner,
             store,
             grant: initialized.writer_grant,
+            clock,
             journal_path: directory.0.join("journal"),
             _directory: directory,
         }
@@ -193,6 +197,63 @@ fn branch() -> BranchId {
 
 fn attachment() -> AttachmentId {
     AttachmentId::from_bytes([1; 16])
+}
+
+#[test]
+fn terminal_writer_expiry_stops_the_worker_and_keeps_its_recovery_data() {
+    let fixture = Fixture::new();
+    let mut worker = fixture.open();
+    worker
+        .dispatch(BlockRequest::Write {
+            offset: 4096,
+            data: &[0xEA; 4096],
+            fua: false,
+        })
+        .unwrap();
+    fixture
+        .clock
+        .0
+        .store(fixture.grant.expires_at.as_nanos(), Ordering::SeqCst);
+    assert!(matches!(
+        worker.flush(),
+        Err(BarrierError::Control(ControlError::Expired))
+    ));
+    assert!(
+        worker
+            .dispatch(BlockRequest::Write {
+                offset: 8192,
+                data: &[0xFB; 4096],
+                fua: false,
+            })
+            .is_err()
+    );
+    assert!(matches!(worker.flush(), Err(BarrierError::Fenced)));
+    assert_eq!(
+        worker
+            .dispatch(BlockRequest::Read {
+                offset: 4096,
+                length: 4096
+            })
+            .unwrap(),
+        BlockResponse::Read(vec![0xEA; 4096])
+    );
+    assert_eq!(
+        worker
+            .dispatch(BlockRequest::Read {
+                offset: 8192,
+                length: 4096
+            })
+            .unwrap(),
+        BlockResponse::Read(vec![0; 4096])
+    );
+    drop(worker);
+    assert!(
+        FileBarrierJournal::open(&fixture.journal_path)
+            .unwrap()
+            .load_pending()
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

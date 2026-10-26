@@ -57,6 +57,10 @@ Branch reads reconcile a pending Metadata Authority outcome before reading fresh
 state, allowing barrier retries and worker reopen to pass the toy-kv outcome
 gate. A clean worker validates its writer and attachment identity before clearing
 an unused capture child.
+Once stable attachment fencing or terminal lease expiry is observed, the worker
+rejects further writes and barriers. Dirty data and pending journal records remain
+available for salvage. Committed-barrier recovery revalidates the original
+attachment before changing its local base or clearing its journal.
 
 ## Setup and tools
 
