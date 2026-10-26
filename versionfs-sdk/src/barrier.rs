@@ -2050,6 +2050,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_builder_rejects_a_missing_dependency() {
+        let mut store = MemoryStore::default();
+        let geometry =
+            VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).expect("valid test geometry");
+        let parent = create_empty_generation(
+            &mut store,
+            GenerationId::from_bytes([1; 16]),
+            VolumeBoundaryId::from_bytes([2; 16]),
+            geometry,
+            10,
+        )
+        .expect("create parent Generation");
+
+        assert!(
+            store
+                .objects
+                .lock()
+                .expect("lock object store")
+                .remove(&parent.roots.volume.object_id)
+                .is_some(),
+            "parent volume root should exist before removal"
+        );
+
+        assert!(
+            create_generation(
+                &mut store,
+                GenerationId::from_bytes([3; 16]),
+                Some(parent.generation_id),
+                parent.roots,
+                CaptureMode::FilesystemCleanUnmount,
+                VolumeBoundaryId::from_bytes([4; 16]),
+                20,
+            )
+            .is_err()
+        );
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {

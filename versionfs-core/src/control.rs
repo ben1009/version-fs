@@ -2132,20 +2132,47 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 let mut parent = read_generation(txn, &parent_key)?;
                 parent.branch_refs = decrement(parent.branch_refs)?;
                 new_generation_record.branch_refs = 1;
-                move_attachment_base(
-                    txn,
-                    self.workspace_id,
-                    &mut branch,
-                    generation.generation_id,
-                    generation.roots,
-                    &mut new_generation_record,
-                )?;
+                let attachment_base = branch
+                    .attachment
+                    .ok_or_else(|| reject("fenced"))?
+                    .base_generation;
+                if attachment_base == expected_parent {
+                    move_attachment_base(
+                        txn,
+                        self.workspace_id,
+                        &mut branch,
+                        generation.generation_id,
+                        generation.roots,
+                        &mut parent,
+                        &mut new_generation_record,
+                    )?;
+                    txn.put(
+                        &parent_key,
+                        &encode_generation(&parent).map_err(to_metadata_error)?,
+                    )?;
+                } else {
+                    let attachment_base_key = generation_key(self.workspace_id, attachment_base);
+                    let mut attachment_base_record = read_generation(txn, &attachment_base_key)?;
+                    move_attachment_base(
+                        txn,
+                        self.workspace_id,
+                        &mut branch,
+                        generation.generation_id,
+                        generation.roots,
+                        &mut attachment_base_record,
+                        &mut new_generation_record,
+                    )?;
+                    txn.put(
+                        &parent_key,
+                        &encode_generation(&parent).map_err(to_metadata_error)?,
+                    )?;
+                    txn.put(
+                        &attachment_base_key,
+                        &encode_generation(&attachment_base_record).map_err(to_metadata_error)?,
+                    )?;
+                }
                 branch.head = generation.generation_id;
                 branch.revision = increment(branch.revision)?;
-                txn.put(
-                    &parent_key,
-                    &encode_generation(&parent).map_err(to_metadata_error)?,
-                )?;
             }
 
             branch.capture = None;
@@ -3903,16 +3930,14 @@ fn move_attachment_base(
     branch: &mut BranchState,
     generation_id: GenerationId,
     roots: LiveRoots,
+    old_generation: &mut GenerationRecord,
     generation: &mut GenerationRecord,
 ) -> Result<(), MetadataError> {
     let mut attachment = branch.attachment.ok_or_else(|| reject("fenced"))?;
-    let old_generation_key = generation_key(workspace, attachment.base_generation);
-    let mut old_generation = read_generation(txn, &old_generation_key)?;
+    if old_generation.seed.generation_id != attachment.base_generation {
+        return Err(reject("corrupt_record"));
+    }
     old_generation.attachment_refs = decrement(old_generation.attachment_refs)?;
-    txn.put(
-        &old_generation_key,
-        &encode_generation(&old_generation).map_err(to_metadata_error)?,
-    )?;
 
     let protection_key = protection_key(workspace, attachment.protection_id);
     let protection_bytes = txn

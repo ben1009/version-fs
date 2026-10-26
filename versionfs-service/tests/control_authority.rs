@@ -761,6 +761,14 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
             .expect("read published branch"),
         published.branch
     );
+    let renewed_attachment = env
+        .control
+        .renew_attachment_base(op(32), branch(1), attachment(1), 1, protection(1), grant)
+        .expect("renew the attachment protection on the published Generation");
+    assert_eq!(renewed_attachment.base_generation, generation(2));
+    env.control
+        .mark_generation_unretained(op(33), generation(1))
+        .expect("old head has no remaining branch or attachment references");
     assert_eq!(
         env.control
             .publish_capture(
