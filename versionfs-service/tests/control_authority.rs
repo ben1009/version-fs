@@ -1,6 +1,7 @@
 //! Control-protocol integration tests against the toy-kv Metadata Authority.
 
 use std::{
+    collections::HashMap,
     env,
     path::PathBuf,
     sync::{
@@ -16,14 +17,18 @@ use versionfs_core::{
         PreparationRequest, WorkspaceControl, start_authority_owner,
     },
     fault::{FailureInjector, FailurePoint, OneShotFailures},
-    format::{FormatError, ObjectRef, ObjectType, encode_object},
-    identity::{
-        AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
-        WorkspaceId,
+    format::{
+        CaptureMode, EXTENT_BYTES, FormatError, ObjectRef, ObjectType, VolumeGeometry,
+        encode_object,
     },
+    identity::{
+        AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
+        PrincipalId, ProtectionId, VolumeBoundaryId, WorkspaceId,
+    },
+    persistent_map::{DurableObjectStore, MapObjectStore},
     time::{Clock, MonotonicTime},
 };
-use versionfs_sdk::barrier::VolumeBarrierControl;
+use versionfs_sdk::barrier::{VolumeBarrierControl, create_empty_generation, create_generation};
 use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +47,42 @@ impl TestDir {
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Default)]
+struct TestObjectStore(HashMap<ObjectId, Vec<u8>>);
+
+impl MapObjectStore for TestObjectStore {
+    fn proof_scope(&self) -> ObjectStoreScopeId {
+        ObjectStoreScopeId::from_bytes([0xD4; 16])
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.0.get(&id).cloned())
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        self.0.insert(id, bytes);
+        Ok(())
+    }
+}
+
+impl DurableObjectStore for TestObjectStore {
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        reference
+            .verify(encoded)
+            .map_err(|error| format!("invalid durable test object: {error}"))?;
+        match self.0.get(&reference.object_id) {
+            Some(existing) if existing != encoded => {
+                Err("immutable test object ID was reused with different bytes".to_owned())
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.0.insert(reference.object_id, encoded.to_vec());
+                Ok(())
+            }
+        }
     }
 }
 
@@ -73,6 +114,10 @@ struct TestEnv {
 
 impl TestEnv {
     fn new() -> Self {
+        Self::with_initial_seed(seed(1))
+    }
+
+    fn with_initial_seed(initial_seed: GenerationSeed) -> Self {
         let dir = TestDir::new();
         let clock = Arc::new(TestClock::default());
         let failures = Arc::new(OneShotFailures::default());
@@ -94,7 +139,7 @@ impl TestEnv {
         let principal_id = principal(1);
         let control = control_for(Arc::clone(&authority), workspace_id, principal_id, owner);
         control
-            .create_workspace(op(1), branch(1), "main", 60_000, seed(1))
+            .create_workspace(op(1), branch(1), "main", 60_000, initial_seed)
             .expect("create initial workspace");
         Self {
             _dir: dir,
@@ -136,8 +181,8 @@ impl TestEnv {
         capture_id: OperationId,
         protection_id: ProtectionId,
         grant: versionfs_core::control::WriterGrant,
+        roots: LiveRoots,
     ) {
-        let roots = roots(1);
         self.control
             .begin_preparation(PreparationRequest {
                 operation_id: capture_id,
@@ -521,6 +566,21 @@ fn seed(marker: u8) -> GenerationSeed {
     }
 }
 
+fn empty_generation(
+    store: &mut TestObjectStore,
+    generation_id: GenerationId,
+    boundary_id: u8,
+) -> GenerationSeed {
+    create_empty_generation(
+        store,
+        generation_id,
+        VolumeBoundaryId::from_bytes(id(boundary_id)),
+        VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).expect("valid test geometry"),
+        u64::from(boundary_id),
+    )
+    .expect("create verified empty Generation graph")
+}
+
 #[test]
 fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() {
     let env = TestEnv::new();
@@ -583,15 +643,79 @@ fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() 
 
 #[test]
 fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
-    let env = TestEnv::new();
+    let mut object_store = TestObjectStore::default();
+    let initial = empty_generation(&mut object_store, generation(1), 30);
+    let new_generation = create_generation(
+        &mut object_store,
+        generation(2),
+        Some(initial.generation_id),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(31)),
+        31,
+    )
+    .expect("create verified child Generation");
+    let env = TestEnv::with_initial_seed(initial);
     let grant = env.writer_and_attachment();
     let capture_id = op(30);
-    env.start_sealed_capture(capture_id, protection(30), grant);
-    let new_generation = GenerationSeed {
-        generation_id: generation(2),
-        descriptor: object(ObjectType::GenerationDescriptor, 2),
-        roots: roots(1),
-    };
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+
+    let wrong_parent = create_generation(
+        &mut object_store,
+        generation(4),
+        Some(generation(9)),
+        initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(32)),
+        32,
+    )
+    .expect("create verified Generation with wrong lineage");
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            wrong_parent,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    );
+
+    let different_roots = create_empty_generation(
+        &mut object_store,
+        generation(5),
+        VolumeBoundaryId::from_bytes(id(33)),
+        VolumeGeometry::new(u64::from(EXTENT_BYTES) * 8).expect("valid alternate geometry"),
+        33,
+    )
+    .expect("create alternate valid Generation graph")
+    .roots;
+    let wrong_roots = create_generation(
+        &mut object_store,
+        generation(6),
+        Some(generation(1)),
+        different_roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(34)),
+        34,
+    )
+    .expect("create verified Generation with different sealed roots");
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            wrong_roots,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    ));
 
     env.failures
         .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
@@ -603,7 +727,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
             grant,
             attachment(1),
             1,
-            new_generation,
+            new_generation.clone(),
             true,
         ),
         Err(ControlError::Metadata(
@@ -620,7 +744,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
             grant,
             attachment(1),
             1,
-            new_generation,
+            new_generation.clone(),
             true,
         )
         .expect("reconcile the committed publication");
@@ -646,7 +770,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
                 grant,
                 attachment(1),
                 1,
-                new_generation,
+                new_generation.clone(),
                 true,
             )
             .expect("replay publication"),
@@ -660,7 +784,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
             grant,
             attachment(1),
             1,
-            new_generation,
+            new_generation.clone(),
             false,
         ),
         Err(ControlError::OperationMismatch)
@@ -679,15 +803,22 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
 
 #[test]
 fn detached_capture_publication_retains_generation_without_rebasing_branch() {
-    let env = TestEnv::new();
+    let mut object_store = TestObjectStore::default();
+    let initial = empty_generation(&mut object_store, generation(1), 40);
+    let new_generation = create_generation(
+        &mut object_store,
+        generation(3),
+        Some(initial.generation_id),
+        initial.roots,
+        CaptureMode::FilesystemFrozen,
+        VolumeBoundaryId::from_bytes(id(41)),
+        41,
+    )
+    .expect("create verified detached Generation");
+    let env = TestEnv::with_initial_seed(initial);
     let grant = env.writer_and_attachment();
     let capture_id = op(40);
-    env.start_sealed_capture(capture_id, protection(40), grant);
-    let new_generation = GenerationSeed {
-        generation_id: generation(3),
-        descriptor: object(ObjectType::GenerationDescriptor, 3),
-        roots: roots(1),
-    };
+    env.start_sealed_capture(capture_id, protection(40), grant, initial.roots);
 
     let published = env
         .control

@@ -36,7 +36,7 @@ pub enum GraphError {
 #[derive(Clone)]
 pub struct DependencyProof {
     descriptor: ObjectRef,
-    capture_mode: CaptureMode,
+    generation_descriptor: GenerationDescriptor,
     root: Arc<VerifiedNode>,
     index: Arc<ProofIndex>,
     store_scope: ObjectStoreScopeId,
@@ -48,7 +48,7 @@ impl std::fmt::Debug for DependencyProof {
         formatter
             .debug_struct("DependencyProof")
             .field("descriptor", &self.descriptor)
-            .field("capture_mode", &self.capture_mode)
+            .field("capture_mode", &self.generation_descriptor.capture_mode)
             .field("store_scope", &self.store_scope)
             .finish_non_exhaustive()
     }
@@ -62,7 +62,12 @@ impl DependencyProof {
 
     /// Returns the exact capture mode recorded in the verified descriptor.
     pub const fn capture_mode(&self) -> CaptureMode {
-        self.capture_mode
+        self.generation_descriptor.capture_mode
+    }
+
+    /// Returns the exact descriptor payload validated by this proof.
+    pub const fn generation_descriptor(&self) -> GenerationDescriptor {
+        self.generation_descriptor
     }
 
     /// Returns the exact strong dependency closure in deterministic ID order.
@@ -116,7 +121,7 @@ enum VerifiedSummary {
         end_seq: u64,
     },
     Descriptor {
-        capture_mode: CaptureMode,
+        descriptor: GenerationDescriptor,
     },
     Payload {
         payload_len: u64,
@@ -398,8 +403,8 @@ pub fn verify_generation_with_reuse<S: MapObjectStore>(
         in_progress: HashSet::new(),
     };
     let descriptor_node = verifier.verify_descriptor(descriptor_ref)?;
-    let capture_mode = match &descriptor_node.summary {
-        VerifiedSummary::Descriptor { capture_mode } => *capture_mode,
+    let generation_descriptor = match &descriptor_node.summary {
+        VerifiedSummary::Descriptor { descriptor } => *descriptor,
         _ => return Err(FormatError::ObjectReferenceMismatch.into()),
     };
 
@@ -413,7 +418,7 @@ pub fn verify_generation_with_reuse<S: MapObjectStore>(
 
     Ok(DependencyProof {
         descriptor: descriptor_ref,
-        capture_mode,
+        generation_descriptor,
         root: descriptor_node,
         index,
         store_scope,
@@ -504,9 +509,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         let artifacts = self.verify_artifacts(descriptor.artifacts_root)?;
         Ok(self.finish(
             reference,
-            VerifiedSummary::Descriptor {
-                capture_mode: descriptor.capture_mode,
-            },
+            VerifiedSummary::Descriptor { descriptor },
             vec![volume, logs, artifacts],
         ))
     }

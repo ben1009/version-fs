@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use versionfs_core::control::{
     AttachmentState, BranchState, ControlError, GenerationSeed, LiveRoots, OperationState,
-    PreparationKind, PreparationRequest, WorkspaceControl, WriterGrant,
+    PreparationKind, PreparationRequest, VerifiedGenerationSeed, WorkspaceControl, WriterGrant,
 };
 use versionfs_core::fault::{FailureInjector, FailurePoint, NoFailures};
 use versionfs_core::format::{
@@ -1016,7 +1016,7 @@ pub fn create_generation<S: DurableObjectStore>(
     capture_mode: CaptureMode,
     boundary_id: VolumeBoundaryId,
     created_at_unix_ms: u64,
-) -> Result<GenerationSeed, BarrierError> {
+) -> Result<VerifiedGenerationSeed, BarrierError> {
     let descriptor = GenerationDescriptor {
         generation_id,
         parent_generation_id,
@@ -1032,12 +1032,8 @@ pub fn create_generation<S: DurableObjectStore>(
     store
         .put_durable(descriptor_ref, &descriptor)
         .map_err(BarrierError::ObjectStore)?;
-    verify_generation(store, descriptor_ref)?;
-    Ok(GenerationSeed {
-        generation_id,
-        descriptor: descriptor_ref,
-        roots,
-    })
+    let proof = verify_generation(store, descriptor_ref)?;
+    Ok(VerifiedGenerationSeed::from_proof(proof))
 }
 
 /// Creates a zero-volume workspace, acquires a writer, and protects its base.
@@ -2034,13 +2030,14 @@ mod tests {
             20,
         )
         .expect("create and verify captured Generation");
+        let child_seed = child.seed();
         let descriptor_bytes = store
-            .get(child.descriptor.object_id)
+            .get(child_seed.descriptor.object_id)
             .expect("read descriptor")
             .expect("descriptor exists");
         let descriptor =
             GenerationDescriptor::decode(&descriptor_bytes).expect("canonical descriptor");
-        assert_eq!(descriptor.generation_id, child.generation_id);
+        assert_eq!(descriptor.generation_id, child_seed.generation_id);
         assert_eq!(descriptor.parent_generation_id, Some(parent.generation_id));
         assert_eq!(descriptor.capture_mode, CaptureMode::FilesystemCleanUnmount);
         assert_eq!(
@@ -2049,7 +2046,7 @@ mod tests {
                 logs: descriptor.logs_root,
                 artifacts: descriptor.artifacts_root,
             },
-            child.roots
+            child_seed.roots
         );
     }
 

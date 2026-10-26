@@ -11,9 +11,10 @@ use thiserror::Error;
 
 use crate::{
     format::{
-        CanonicalDecoder, CanonicalEncoder, FormatError, MetadataRecordType, ObjectRef, ObjectType,
-        decode_metadata_record, encode_metadata_record,
+        CanonicalDecoder, CanonicalEncoder, FormatError, GenerationDescriptor, MetadataRecordType,
+        ObjectRef, ObjectType, decode_metadata_record, encode_metadata_record,
     },
+    graph::DependencyProof,
     identity::{
         AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
         WorkspaceId,
@@ -231,7 +232,7 @@ pub struct LiveRoots {
     pub artifacts: ObjectRef,
 }
 
-/// A trusted Generation catalog entry supplied only after its graph is durable.
+/// The Generation catalog fields recorded by the authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationSeed {
     /// Immutable Generation identity.
@@ -240,6 +241,50 @@ pub struct GenerationSeed {
     pub descriptor: ObjectRef,
     /// Complete roots captured by the descriptor.
     pub roots: LiveRoots,
+}
+
+/// A Generation seed derived from a verified immutable descriptor graph.
+///
+/// This value can only be constructed from a [`DependencyProof`], so publication
+/// cannot accept catalog fields that disagree with the verified descriptor.
+/// The proof establishes graph integrity and readability, not durability; callers
+/// must ensure every referenced object is durably stored before publication.
+#[derive(Clone, Debug)]
+pub struct VerifiedGenerationSeed {
+    seed: GenerationSeed,
+    proof: DependencyProof,
+}
+
+impl VerifiedGenerationSeed {
+    /// Derives the catalog fields from a complete verified descriptor graph.
+    ///
+    /// The caller remains responsible for ensuring that all objects in the graph
+    /// are durably stored before publishing this seed.
+    pub fn from_proof(proof: DependencyProof) -> Self {
+        let descriptor = proof.generation_descriptor();
+        Self {
+            seed: GenerationSeed {
+                generation_id: descriptor.generation_id,
+                descriptor: proof.descriptor(),
+                roots: LiveRoots {
+                    volume: descriptor.volume_root,
+                    logs: descriptor.logs_root,
+                    artifacts: descriptor.artifacts_root,
+                },
+            },
+            proof,
+        }
+    }
+
+    /// Returns the catalog fields derived from the verified descriptor.
+    pub const fn seed(&self) -> GenerationSeed {
+        self.seed
+    }
+
+    /// Returns the descriptor payload validated by the retained proof.
+    pub const fn descriptor(&self) -> GenerationDescriptor {
+        self.proof.generation_descriptor()
+    }
 }
 
 /// Result of atomically publishing a sealed checkpoint capture.
@@ -1907,10 +1952,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     ///
     /// `capture_id` is the operation ID used by `begin_preparation` with
     /// `PreparationKind::CheckpointCapture`. The caller must build and verify the
-    /// complete immutable descriptor graph before calling this method. The
-    /// authority transaction checks that the supplied roots are exactly the
-    /// roots sealed by the capture. When `advance_head` is false, the Generation
-    /// is retained by ID without changing the branch head or attachment base.
+    /// complete immutable descriptor graph and durably store all objects before
+    /// calling this method. Its seed is derived from the graph proof, and its
+    /// descriptor parent must match the branch head being captured. The authority
+    /// transaction also checks that the verified roots are exactly the roots
+    /// sealed by the capture. When `advance_head` is false, the Generation is
+    /// retained by ID without changing the branch head or attachment base.
     #[allow(clippy::too_many_arguments)]
     pub fn publish_capture(
         &self,
@@ -1920,9 +1967,16 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         grant: WriterGrant,
         attachment_id: AttachmentId,
         volume_epoch: u64,
-        generation: GenerationSeed,
+        generation: VerifiedGenerationSeed,
         advance_head: bool,
     ) -> Result<PublishedGeneration, ControlError> {
+        if generation.descriptor().parent_generation_id != Some(expected_parent) {
+            return Err(ControlError::InvalidTransition);
+        }
+        let VerifiedGenerationSeed {
+            seed: generation,
+            proof: _,
+        } = generation;
         validate_generation_seed(generation)?;
         let mut payload = CanonicalEncoder::new();
         payload.u64_le(expected_revision);
