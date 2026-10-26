@@ -58,10 +58,12 @@ const OP_COMMIT_LIVE_ROOTS: u16 = 20;
 const OP_SEAL_CAPTURE: u16 = 21;
 const OP_MARK_UNRETAINED: u16 = 23;
 const OP_EXPIRE_PROTECTION: u16 = 24;
+const OP_PUBLISH_CAPTURE: u16 = 25;
 const TRANSITION_BEGIN: u16 = 1;
 const TRANSITION_COMMIT_LIVE_ROOTS: u16 = 2;
 const TRANSITION_ABORT: u16 = 3;
 const TRANSITION_EXPIRE_PREPARATION: u16 = 4;
+const TRANSITION_PUBLISH_CAPTURE: u16 = 5;
 const OP_TOMBSTONE: u16 = u16::MAX;
 
 /// A durable authority-owner incarnation. Every owner restart advances it.
@@ -238,6 +240,17 @@ pub struct GenerationSeed {
     pub descriptor: ObjectRef,
     /// Complete roots captured by the descriptor.
     pub roots: LiveRoots,
+}
+
+/// Result of atomically publishing a sealed checkpoint capture.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishedGeneration {
+    /// The Generation made durable and visible by this operation.
+    pub generation_id: GenerationId,
+    /// Branch state after the capture token has been released.
+    pub branch: BranchState,
+    /// Whether publication advanced the branch head and attachment base.
+    pub head_advanced: bool,
 }
 
 /// Durable operation state returned by query and abort APIs.
@@ -1890,6 +1903,233 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         decode_capture_result(&result)
     }
 
+    /// Publishes a Generation from one sealed capture and resolves its preparation.
+    ///
+    /// `capture_id` is the operation ID used by `begin_preparation` with
+    /// `PreparationKind::CheckpointCapture`. The caller must build and verify the
+    /// complete immutable descriptor graph before calling this method. The
+    /// authority transaction checks that the supplied roots are exactly the
+    /// roots sealed by the capture. When `advance_head` is false, the Generation
+    /// is retained by ID without changing the branch head or attachment base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_capture(
+        &self,
+        capture_id: OperationId,
+        expected_revision: u64,
+        expected_parent: GenerationId,
+        grant: WriterGrant,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        generation: GenerationSeed,
+        advance_head: bool,
+    ) -> Result<PublishedGeneration, ControlError> {
+        validate_generation_seed(generation)?;
+        let mut payload = CanonicalEncoder::new();
+        payload.u64_le(expected_revision);
+        payload.fixed(expected_parent.as_bytes());
+        encode_writer_grant(&mut payload, grant);
+        payload.fixed(attachment_id.as_bytes());
+        payload.u64_le(volume_epoch);
+        encode_generation_seed(&mut payload, generation);
+        payload.u8(u8::from(advance_head));
+        let fingerprint = fingerprint(OP_PUBLISH_CAPTURE, &payload.finish());
+        let operation_key = self.operation_key(capture_id);
+        let outcome_key = self.transition_key(capture_id, TRANSITION_PUBLISH_CAPTURE);
+
+        if let Some(bytes) = reconcile_outcome(self.authority.as_ref(), &outcome_key)? {
+            return decode_committed_capture(
+                &bytes,
+                fingerprint,
+                generation.generation_id,
+                expected_parent,
+                advance_head,
+            );
+        }
+
+        let outcome = self.transact_with_outcome(&outcome_key, |txn| {
+            let mut preparation = txn
+                .get(&operation_key)?
+                .map(|bytes| decode_operation(&bytes).map_err(to_metadata_error))
+                .transpose()?
+                .ok_or_else(|| reject("not_found"))?;
+            if preparation.kind != OP_BEGIN_PREPARATION {
+                return Err(reject("invalid_transition"));
+            }
+            match &preparation.status {
+                StoredOperationStatus::Committed(_) => {
+                    if preparation.commit_fingerprint != Some(fingerprint) {
+                        return Err(reject("operation_mismatch"));
+                    }
+                    return encode_operation(&preparation).map_err(to_metadata_error);
+                }
+                StoredOperationStatus::Aborted => return Err(reject("aborted")),
+                StoredOperationStatus::Preparing { .. } => {}
+            }
+
+            let (
+                branch_id,
+                protection_id,
+                prepared_grant,
+                prepared_kind,
+                prepared_revision,
+                prepared_roots,
+                preparation_expires_at,
+                is_capture,
+            ) = match &preparation.status {
+                StoredOperationStatus::Preparing {
+                    branch_id,
+                    protection_id,
+                    grant,
+                    kind,
+                    expected_revision,
+                    expected_roots,
+                    expires_at,
+                    capture,
+                } => (
+                    *branch_id,
+                    *protection_id,
+                    *grant,
+                    *kind,
+                    *expected_revision,
+                    expected_roots.as_deref().copied(),
+                    *expires_at,
+                    *capture,
+                ),
+                StoredOperationStatus::Committed(_) | StoredOperationStatus::Aborted => {
+                    return Err(reject("invalid_transition"));
+                }
+            };
+            if branch_id != grant.branch_id
+                || !same_grant_identity(prepared_grant, grant)
+                || prepared_kind != PreparationKind::CheckpointCapture
+                || prepared_roots.is_some()
+                || !is_capture
+            {
+                return Err(reject("invalid_transition"));
+            }
+
+            self.require_current_owner(txn)?;
+            let branch_key = branch_key(self.workspace_id, branch_id);
+            let mut branch = read_branch(txn, &branch_key)?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
+            if branch.revision != expected_revision || branch.head != expected_parent {
+                return Err(MetadataError::Conflict);
+            }
+            validate_attachment_protection(
+                txn,
+                self.workspace_id,
+                &branch,
+                attachment_id,
+                volume_epoch,
+                grant,
+                self.owner_incarnation,
+            )?;
+
+            let capture = branch.capture.as_ref().ok_or_else(|| reject("not_found"))?;
+            validate_capture_principal(capture, self.principal_id)?;
+            if capture.operation_id != capture_id
+                || capture.protection_id != protection_id
+                || capture.expected_revision != prepared_revision
+                || !capture.sealed
+                || capture.pending_child.is_some()
+                || capture.sealed_revision != Some(expected_revision)
+                || capture.sealed_roots != Some(generation.roots)
+                || branch_live_roots(&branch) != generation.roots
+            {
+                return Err(reject("invalid_transition"));
+            }
+
+            let preparation_protection_key = protection_key(self.workspace_id, protection_id);
+            let protection_bytes = txn
+                .get(&preparation_protection_key)?
+                .ok_or_else(|| reject("expired"))?;
+            match decode_protection(&protection_bytes).map_err(to_metadata_error)? {
+                ProtectionRecord::Preparation {
+                    id,
+                    operation_id,
+                    branch_id: protected_branch,
+                    attachment_id: protected_attachment,
+                    volume_epoch: protected_volume_epoch,
+                    grant: protected_grant,
+                    owner_incarnation,
+                    expires_at,
+                    ..
+                } if id == protection_id
+                    && operation_id == capture_id
+                    && protected_branch == branch_id
+                    && protected_attachment == attachment_id
+                    && protected_volume_epoch == volume_epoch
+                    && protected_grant == prepared_grant
+                    && same_grant_identity(protected_grant, grant)
+                    && owner_incarnation == self.owner_incarnation
+                    && expires_at == preparation_expires_at
+                    && expires_at > txn.now() => {}
+                _ => return Err(reject("expired")),
+            }
+
+            let new_generation_key = generation_key(self.workspace_id, generation.generation_id);
+            if txn.get(&new_generation_key)?.is_some() {
+                return Err(MetadataError::Conflict);
+            }
+            let mut new_generation_record = GenerationRecord::new(generation, true);
+
+            if advance_head {
+                let parent_key = generation_key(self.workspace_id, expected_parent);
+                let mut parent = read_generation(txn, &parent_key)?;
+                parent.branch_refs = decrement(parent.branch_refs)?;
+                new_generation_record.branch_refs = 1;
+                move_attachment_base(
+                    txn,
+                    self.workspace_id,
+                    &mut branch,
+                    generation.generation_id,
+                    generation.roots,
+                    &mut new_generation_record,
+                )?;
+                branch.head = generation.generation_id;
+                branch.revision = increment(branch.revision)?;
+                txn.put(
+                    &parent_key,
+                    &encode_generation(&parent).map_err(to_metadata_error)?,
+                )?;
+            }
+
+            branch.capture = None;
+            let encoded_branch = encode_branch(&branch).map_err(to_metadata_error)?;
+            txn.put(
+                &new_generation_key,
+                &encode_generation(&new_generation_record).map_err(to_metadata_error)?,
+            )?;
+            txn.put(&branch_key, &encoded_branch)?;
+
+            retire_protection(txn, self.workspace_id, protection_id)?;
+            preparation.commit_fingerprint = Some(fingerprint);
+            preparation.status = StoredOperationStatus::Committed(encoded_branch);
+            let encoded_preparation = encode_operation(&preparation).map_err(to_metadata_error)?;
+            txn.put(&operation_key, &encoded_preparation)?;
+            Ok(encoded_preparation)
+        });
+
+        let bytes = match outcome {
+            Ok(bytes) => bytes,
+            Err(ControlError::Conflict) => {
+                if let Some(bytes) = reconcile_outcome(self.authority.as_ref(), &outcome_key)? {
+                    bytes
+                } else {
+                    return Err(ControlError::Conflict);
+                }
+            }
+            Err(error) => return Err(error),
+        };
+        decode_committed_capture(
+            &bytes,
+            fingerprint,
+            generation.generation_id,
+            expected_parent,
+            advance_head,
+        )
+    }
+
     /// Reads or reconciles an operation outcome after an uncertain response.
     pub fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         let key = self.operation_key(operation_id);
@@ -3360,6 +3600,42 @@ fn decode_committed_live_roots(
     }
 }
 
+fn decode_committed_capture(
+    bytes: &[u8],
+    expected_fingerprint: [u8; 32],
+    generation_id: GenerationId,
+    expected_parent: GenerationId,
+    head_advanced: bool,
+) -> Result<PublishedGeneration, ControlError> {
+    let record = decode_operation(bytes)?;
+    if record.kind != OP_BEGIN_PREPARATION
+        || record.commit_fingerprint != Some(expected_fingerprint)
+    {
+        return Err(ControlError::OperationMismatch);
+    }
+    let branch_bytes = match record.status {
+        StoredOperationStatus::Committed(result) => result,
+        StoredOperationStatus::Aborted => return Err(ControlError::Aborted),
+        StoredOperationStatus::Preparing { .. } => return Err(ControlError::InProgress),
+    };
+    let branch = decode_branch(&branch_bytes)?;
+    let expected_head = if head_advanced {
+        generation_id
+    } else {
+        expected_parent
+    };
+    if branch.capture.is_some() || branch.head != expected_head {
+        return Err(ControlError::CorruptRecord(
+            "published capture result does not match its branch transition".into(),
+        ));
+    }
+    Ok(PublishedGeneration {
+        generation_id,
+        branch,
+        head_advanced,
+    })
+}
+
 fn decode_bool(value: u8) -> Result<bool, ControlError> {
     match value {
         0 => Ok(false),
@@ -3382,6 +3658,14 @@ fn ensure_live_branch(branch: &BranchState) -> Result<(), MetadataError> {
         Err(reject("not_found"))
     } else {
         Ok(())
+    }
+}
+
+fn branch_live_roots(branch: &BranchState) -> LiveRoots {
+    LiveRoots {
+        volume: branch.volume_root,
+        logs: branch.logs_root,
+        artifacts: branch.artifacts_root,
     }
 }
 
@@ -3556,6 +3840,67 @@ fn release_attachment(
         branch.volume_epoch = increment(branch.volume_epoch)?;
         branch.stream_epoch = increment(branch.stream_epoch)?;
     }
+    Ok(())
+}
+
+fn move_attachment_base(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch: &mut BranchState,
+    generation_id: GenerationId,
+    roots: LiveRoots,
+    generation: &mut GenerationRecord,
+) -> Result<(), MetadataError> {
+    let mut attachment = branch.attachment.ok_or_else(|| reject("fenced"))?;
+    let old_generation_key = generation_key(workspace, attachment.base_generation);
+    let mut old_generation = read_generation(txn, &old_generation_key)?;
+    old_generation.attachment_refs = decrement(old_generation.attachment_refs)?;
+    txn.put(
+        &old_generation_key,
+        &encode_generation(&old_generation).map_err(to_metadata_error)?,
+    )?;
+
+    let protection_key = protection_key(workspace, attachment.protection_id);
+    let protection_bytes = txn
+        .get(&protection_key)?
+        .ok_or_else(|| reject("corrupt_record"))?;
+    let (owner_incarnation, expires_at) =
+        match decode_protection(&protection_bytes).map_err(to_metadata_error)? {
+            ProtectionRecord::AttachmentBase {
+                id,
+                branch_id,
+                attachment_id,
+                generation_id: protected_generation,
+                owner_incarnation,
+                expires_at,
+                ..
+            } if id == attachment.protection_id
+                && branch_id == branch.branch_id
+                && attachment_id == attachment.attachment_id
+                && protected_generation == attachment.base_generation
+                && expires_at == attachment.protection_expires_at =>
+            {
+                (owner_incarnation, expires_at)
+            }
+            _ => return Err(reject("corrupt_record")),
+        };
+
+    generation.attachment_refs = increment(generation.attachment_refs)?;
+    let protection = ProtectionRecord::AttachmentBase {
+        id: attachment.protection_id,
+        branch_id: branch.branch_id,
+        attachment_id: attachment.attachment_id,
+        generation_id,
+        roots,
+        owner_incarnation,
+        expires_at,
+    };
+    txn.put(
+        &protection_key,
+        &encode_protection(&protection).map_err(to_metadata_error)?,
+    )?;
+    attachment.base_generation = generation_id;
+    branch.attachment = Some(attachment);
     Ok(())
 }
 

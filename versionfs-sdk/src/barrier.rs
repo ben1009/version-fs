@@ -18,6 +18,7 @@ use versionfs_core::fault::{FailureInjector, FailurePoint, NoFailures};
 use versionfs_core::format::{
     CaptureMode, GenerationDescriptor, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
 };
+use versionfs_core::graph::{GraphError, verify_generation};
 use versionfs_core::identity::{
     AttachmentId, BranchId, GenerationId, ObjectId, OperationId, ProtectionId, VolumeBoundaryId,
 };
@@ -926,6 +927,9 @@ pub enum BarrierError {
     /// The durable root or object graph is malformed.
     #[error(transparent)]
     View(#[from] ViewError),
+    /// The complete Generation dependency graph could not be proven.
+    #[error(transparent)]
+    Graph(#[from] GraphError),
     /// The root object failed typed validation.
     #[error(transparent)]
     Format(#[from] versionfs_core::format::FormatError),
@@ -992,7 +996,48 @@ pub fn create_empty_generation<S: DurableObjectStore>(
             .map_err(BarrierError::ObjectStore)?;
     }
 
+    verify_generation(store, seed.descriptor)?;
+
     Ok(seed)
+}
+
+/// Creates, durably stores, and verifies a descriptor for already durable roots.
+///
+/// The roots must be the exact sealed roots produced by the checkpoint
+/// coordinator. Verification reads the descriptor's complete strong dependency
+/// graph before the returned seed can be passed to the authority publication
+/// transaction.
+#[allow(clippy::too_many_arguments)]
+pub fn create_generation<S: DurableObjectStore>(
+    store: &mut S,
+    generation_id: GenerationId,
+    parent_generation_id: Option<GenerationId>,
+    roots: LiveRoots,
+    capture_mode: CaptureMode,
+    boundary_id: VolumeBoundaryId,
+    created_at_unix_ms: u64,
+) -> Result<GenerationSeed, BarrierError> {
+    let descriptor = GenerationDescriptor {
+        generation_id,
+        parent_generation_id,
+        volume_root: roots.volume,
+        logs_root: roots.logs,
+        artifacts_root: roots.artifacts,
+        capture_mode,
+        volume_boundary_id: boundary_id,
+        created_at_unix_ms,
+    }
+    .encode()?;
+    let descriptor_ref = ObjectRef::from_encoded(&descriptor)?;
+    store
+        .put_durable(descriptor_ref, &descriptor)
+        .map_err(BarrierError::ObjectStore)?;
+    verify_generation(store, descriptor_ref)?;
+    Ok(GenerationSeed {
+        generation_id,
+        descriptor: descriptor_ref,
+        roots,
+    })
 }
 
 /// Creates a zero-volume workspace, acquires a writer, and protects its base.
@@ -1964,6 +2009,49 @@ mod tests {
     use versionfs_core::time::MonotonicTime;
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn generation_builder_persists_the_established_capture_mode_and_proves_roots() {
+        let mut store = MemoryStore::default();
+        let geometry =
+            VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).expect("valid test geometry");
+        let parent = create_empty_generation(
+            &mut store,
+            GenerationId::from_bytes([1; 16]),
+            VolumeBoundaryId::from_bytes([2; 16]),
+            geometry,
+            10,
+        )
+        .expect("create and verify parent Generation");
+
+        let child = create_generation(
+            &mut store,
+            GenerationId::from_bytes([3; 16]),
+            Some(parent.generation_id),
+            parent.roots,
+            CaptureMode::FilesystemCleanUnmount,
+            VolumeBoundaryId::from_bytes([4; 16]),
+            20,
+        )
+        .expect("create and verify captured Generation");
+        let descriptor_bytes = store
+            .get(child.descriptor.object_id)
+            .expect("read descriptor")
+            .expect("descriptor exists");
+        let descriptor =
+            GenerationDescriptor::decode(&descriptor_bytes).expect("canonical descriptor");
+        assert_eq!(descriptor.generation_id, child.generation_id);
+        assert_eq!(descriptor.parent_generation_id, Some(parent.generation_id));
+        assert_eq!(descriptor.capture_mode, CaptureMode::FilesystemCleanUnmount);
+        assert_eq!(
+            LiveRoots {
+                volume: descriptor.volume_root,
+                logs: descriptor.logs_root,
+                artifacts: descriptor.artifacts_root,
+            },
+            child.roots
+        );
+    }
 
     struct TestDir(PathBuf);
 

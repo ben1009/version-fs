@@ -298,6 +298,11 @@ using P3's formats and normal durability/graph validation, not placeholder diges
 The descriptor and capture protocol already include native-view slots; P8 supplies
 their mutation protocols and connects them to this same coordinator.
 
+- [x] Build and verify complete Generation descriptor graphs, then atomically
+  publish an attached or detached Generation from an exact sealed capture. Attached
+  publication moves the head, branch reference, and attachment-base protection in
+  the same authority transaction; both modes reconcile unknown outcomes by the
+  capture operation ID.
 - [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
 - [ ] Close local admission, read authoritative revision/live roots together,

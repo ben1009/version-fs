@@ -15,7 +15,7 @@ use versionfs_core::{
         ControlError, GenerationSeed, LiveRoots, OperationState, PreparationKind,
         PreparationRequest, WorkspaceControl, start_authority_owner,
     },
-    fault::NoFailures,
+    fault::{FailureInjector, FailurePoint, OneShotFailures},
     format::{FormatError, ObjectRef, ObjectType, encode_object},
     identity::{
         AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
@@ -67,6 +67,7 @@ struct TestEnv {
     workspace_id: WorkspaceId,
     principal_id: PrincipalId,
     owner: versionfs_core::control::OwnerIncarnation,
+    failures: Arc<OneShotFailures>,
     control: WorkspaceControl<ToyKvMetadataAuthority>,
 }
 
@@ -74,11 +75,13 @@ impl TestEnv {
     fn new() -> Self {
         let dir = TestDir::new();
         let clock = Arc::new(TestClock::default());
+        let failures = Arc::new(OneShotFailures::default());
+        let failure_injector: Arc<dyn FailureInjector> = failures.clone();
         let authority = Arc::new(
             ToyKvMetadataAuthority::open_with(
                 &dir.0,
                 Arc::clone(&clock) as Arc<dyn Clock>,
-                Arc::new(NoFailures),
+                failure_injector,
             )
             .expect("open toy-kv authority"),
         );
@@ -100,6 +103,7 @@ impl TestEnv {
             workspace_id,
             principal_id,
             owner,
+            failures,
             control,
         }
     }
@@ -125,6 +129,32 @@ impl TestEnv {
             .attach_volume(op(3), branch(1), 1, grant, attachment(1), protection(1))
             .expect("attach volume");
         grant
+    }
+
+    fn start_sealed_capture(
+        &self,
+        capture_id: OperationId,
+        protection_id: ProtectionId,
+        grant: versionfs_core::control::WriterGrant,
+    ) {
+        let roots = roots(1);
+        self.control
+            .begin_preparation(PreparationRequest {
+                operation_id: capture_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id,
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![roots.volume, roots.logs, roots.artifacts],
+            })
+            .expect("begin protected capture");
+        self.control
+            .seal_capture(op(251), capture_id, 1, grant)
+            .expect("seal capture");
     }
 }
 
@@ -548,6 +578,161 @@ fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() 
             .filter(|result| matches!(result, Err(ControlError::Conflict)))
             .count(),
         1
+    );
+}
+
+#[test]
+fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let capture_id = op(30);
+    env.start_sealed_capture(capture_id, protection(30), grant);
+    let new_generation = GenerationSeed {
+        generation_id: generation(2),
+        descriptor: object(ObjectType::GenerationDescriptor, 2),
+        roots: roots(1),
+    };
+
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation,
+            true,
+        ),
+        Err(ControlError::Metadata(
+            versionfs_core::metadata::MetadataError::UnknownOutcome { .. }
+        ))
+    ));
+
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation,
+            true,
+        )
+        .expect("reconcile the committed publication");
+    assert_eq!(published.generation_id, generation(2));
+    assert!(published.head_advanced);
+    assert_eq!(published.branch.head, generation(2));
+    assert_eq!(published.branch.revision, 2);
+    assert!(published.branch.capture.is_none());
+    let attachment_state = published.branch.attachment.expect("retained attachment");
+    assert_eq!(attachment_state.base_generation, generation(2));
+    assert_eq!(
+        env.control
+            .get_branch(branch(1))
+            .expect("read published branch"),
+        published.branch
+    );
+    assert_eq!(
+        env.control
+            .publish_capture(
+                capture_id,
+                1,
+                generation(1),
+                grant,
+                attachment(1),
+                1,
+                new_generation,
+                true,
+            )
+            .expect("replay publication"),
+        published
+    );
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation,
+            false,
+        ),
+        Err(ControlError::OperationMismatch)
+    );
+    let operation = env.control.get_operation(capture_id);
+    assert!(
+        matches!(operation, Ok(OperationState::Committed(_))),
+        "unexpected publication outcome: {operation:?}"
+    );
+    assert_eq!(
+        env.control
+            .mark_generation_unretained(op(31), generation(2)),
+        Err(ControlError::Busy)
+    );
+}
+
+#[test]
+fn detached_capture_publication_retains_generation_without_rebasing_branch() {
+    let env = TestEnv::new();
+    let grant = env.writer_and_attachment();
+    let capture_id = op(40);
+    env.start_sealed_capture(capture_id, protection(40), grant);
+    let new_generation = GenerationSeed {
+        generation_id: generation(3),
+        descriptor: object(ObjectType::GenerationDescriptor, 3),
+        roots: roots(1),
+    };
+
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation,
+            false,
+        )
+        .expect("publish detached Generation");
+    assert!(!published.head_advanced);
+    assert_eq!(published.branch.head, generation(1));
+    assert_eq!(published.branch.revision, 1);
+    assert!(published.branch.capture.is_none());
+    assert_eq!(
+        published
+            .branch
+            .attachment
+            .expect("attachment remains on original base")
+            .base_generation,
+        generation(1)
+    );
+
+    env.control
+        .open_generation(op(41), generation(3), protection(41))
+        .expect("detached Generation remains retained and readable");
+    assert_eq!(
+        env.control
+            .mark_generation_unretained(op(42), generation(3)),
+        Err(ControlError::Busy)
+    );
+    env.control
+        .close_protection(op(43), protection(41))
+        .expect("release detached Generation reader");
+    env.control
+        .mark_generation_unretained(op(44), generation(3))
+        .expect("allow retention release after reader closes");
+    assert_eq!(
+        env.control
+            .open_generation(op(45), generation(3), protection(45)),
+        Err(ControlError::GenerationExpired)
     );
 }
 
