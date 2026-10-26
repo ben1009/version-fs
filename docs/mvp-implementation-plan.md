@@ -2,7 +2,7 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0–P4 merged; P1 real-S3 run pending; P2 locally qualified; P5 implemented on this branch |
+| Status | P0–P5 merged; P1 real-S3 run pending; P2 locally qualified; P6 implementation in progress; qualification pending |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
@@ -194,12 +194,13 @@ parent separator bytes. Fixtures resolve with ancestor descriptor reads denied.
 
 ### P4. ublk adapter and local data path
 
-- [x] Implement a fixed-size single-queue device with truthful volatile-cache/FUA
-  capability negotiation and checked READ/WRITE dispatch. Reject FLUSH/FUA until
-  P6 supplies durability; reject unsupported I/O and geometry.
+- [x] Implement a fixed-size single-queue device with truthful cache/FUA
+  capability negotiation and checked READ/WRITE dispatch. Reject FLUSH/FUA for
+  volatile devices; reject unsupported I/O and geometry.
 - [x] Implement a bounded dirty-extent overlay, partial-extent read-modify-write,
   single-queue request ordering, and immutable sealed upload versions. Normal writes
-  acknowledge only local volatile state until P6 provides persistence.
+  acknowledge only local volatile state unless backed by a qualified durable
+  device.
 - [x] Implement verified workspace-scoped cache fills, atomic installation, fill
   coordination, clean eviction, and dirty/control-state separation.
 - [x] Implement protected-root range readers and structural extent-range diff.

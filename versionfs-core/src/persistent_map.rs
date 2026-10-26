@@ -29,8 +29,30 @@ pub trait MapObjectStore {
     /// Reads an object by content identity.
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String>;
 
+    /// Reads an object using its complete typed reference.
+    ///
+    /// Backends whose key layout includes the object type should override this
+    /// method. The default preserves compatibility with stores keyed only by
+    /// content identity.
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        self.get(reference.object_id)
+    }
+
     /// Stores bytes under their already-computed content identity.
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String>;
+}
+
+/// Immutable object store whose write acknowledgement means the object is durable.
+///
+/// `put_durable` must verify that `encoded` matches `reference`, conditionally
+/// create or verify identical immutable content, and return only after the
+/// object is durable and readable through the store's typed read path. A local
+/// cache write alone does not satisfy this contract. Each call must have a
+/// finite backend-enforced deadline so callers can renew any enclosing remote-I/O
+/// protection before it expires.
+pub trait DurableObjectStore: MapObjectStore {
+    /// Persist one already-encoded immutable object and verify identical reuse.
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String>;
 }
 
 /// Errors returned while reading or mutating a persistent ordered map.
@@ -129,6 +151,24 @@ impl PersistentBTree {
     /// Returns this map's node object type.
     pub const fn node_type(&self) -> ObjectType {
         self.node_type
+    }
+
+    /// Returns the immediate child nodes of one verified node in this map.
+    ///
+    /// This supports graph walks that stop at already durable shared subtrees
+    /// instead of enumerating the complete map. Leaf nodes return no children.
+    pub fn child_refs<S: MapObjectStore>(
+        &self,
+        store: &S,
+        reference: ObjectRef,
+    ) -> Result<Vec<ObjectRef>, PersistentMapError> {
+        match load_node(store, reference, self.node_type)? {
+            Node::Leaf(_) => Ok(Vec::new()),
+            Node::Internal { children, .. } => Ok(children
+                .into_iter()
+                .map(|(_, reference)| reference)
+                .collect()),
+        }
     }
 
     /// Looks up a key without materializing unrelated subtrees.
@@ -364,7 +404,7 @@ pub(crate) fn load_node<S: MapObjectStore>(
         return Err(FormatError::ObjectReferenceMismatch.into());
     }
     let bytes = store
-        .get(reference.object_id)
+        .get_ref(reference)
         .map_err(PersistentMapError::Store)?
         .ok_or(PersistentMapError::MissingObject(reference.object_id))?;
     let object = reference.verify(&bytes)?;

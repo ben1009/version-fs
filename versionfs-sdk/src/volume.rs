@@ -1,10 +1,13 @@
 //! Fixed-geometry block request handling and a bounded worker-local dirty overlay.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use thiserror::Error;
-use versionfs_core::format::{EXTENT_BYTES, FormatError};
-use versionfs_core::persistent_map::MapObjectStore;
+use versionfs_core::format::{
+    EXTENT_BYTES, FormatError, ObjectRef, ObjectType, VolumeRoot, encode_object,
+};
+use versionfs_core::identity::ObjectId;
+use versionfs_core::persistent_map::{MapObjectStore, PersistentBTree};
 use versionfs_core::views::{ViewError, VolumeExtentMap};
 
 const EXTENT_SIZE: usize = EXTENT_BYTES as usize;
@@ -24,9 +27,15 @@ pub enum BlockError {
     /// A write would exceed the bounded dirty-overlay capacity.
     #[error("dirty overlay is full")]
     DirtyCapacityExceeded,
-    /// The requested barrier cannot be acknowledged before P6 durability exists.
+    /// This block device does not implement durable barriers.
     #[error("durable block barriers are unavailable")]
     DurableBarrierUnavailable,
+    /// A durable barrier is unresolved; dependent writes cannot pass it.
+    #[error("a durable block barrier is unresolved")]
+    BarrierUnresolved,
+    /// A durable barrier failed before it could be acknowledged.
+    #[error("durable block barrier failed: {0}")]
+    Barrier(String),
     /// The block operation is not supported by the fixed v0 device.
     #[error("unsupported block operation {0}")]
     UnsupportedOperation(u32),
@@ -41,13 +50,13 @@ pub enum BlockRequest<'a> {
         /// Number of bytes to read.
         length: u64,
     },
-    /// Writes an aligned byte range. FUA is rejected until P6 is implemented.
+    /// Writes an aligned byte range, optionally requiring FUA durability.
     Write {
         /// First byte to write.
         offset: u64,
         /// Bytes supplied by the block request.
         data: &'a [u8],
-        /// Whether the request requires the P6 durable FUA boundary.
+        /// Whether the request requires its payload to be durable before completion.
         fua: bool,
     },
     /// Requests a durable ordering barrier.
@@ -65,10 +74,23 @@ pub enum BlockResponse {
     Written(usize),
 }
 
+/// Synchronous block-device interface consumed by the Linux ublk transport.
+pub trait BlockDevice {
+    /// Returns the fixed logical geometry exposed to the kernel.
+    fn geometry(&self) -> versionfs_core::format::VolumeGeometry;
+
+    /// Whether the device implements durable FUA requests.
+    fn supports_fua(&self) -> bool;
+
+    /// Dispatches one request in the device's single ordered mutation stream.
+    fn dispatch(&mut self, request: BlockRequest<'_>) -> Result<BlockResponse, BlockError>;
+}
+
 /// A versioned volume with a worker-local, bounded dirty-extent overlay.
 ///
 /// This type models ordinary volatile block I/O. It does not acknowledge FLUSH
-/// or FUA and does not publish roots. P6 adds the remote durability protocol.
+/// or FUA and does not publish roots. [`crate::barrier::DurableVolume`] adds the
+/// remote durability protocol.
 pub struct DirtyVolume<S> {
     store: S,
     base: VolumeExtentMap,
@@ -109,6 +131,10 @@ impl<S: MapObjectStore> DirtyVolume<S> {
     /// Returns bytes currently held in the dirty overlay.
     pub fn dirty_bytes(&self) -> usize {
         self.dirty.len() * EXTENT_SIZE
+    }
+
+    pub(crate) fn store_mut(&mut self) -> &mut S {
+        &mut self.store
     }
 
     /// Reads a checked byte range, resolving dirty extents before the base root.
@@ -235,6 +261,24 @@ impl<S: MapObjectStore> DirtyVolume<S> {
         }
     }
 
+    pub(crate) fn load_map(&self, volume_root: ObjectRef) -> Result<VolumeExtentMap, BlockError> {
+        load_map_from_store(&self.store, volume_root)
+    }
+
+    pub(crate) const fn base_map(&self) -> VolumeExtentMap {
+        self.base
+    }
+
+    pub(crate) fn replace_base(&mut self, base: VolumeExtentMap) {
+        self.base = base;
+        self.dirty.clear();
+    }
+
+    /// Replaces the authoritative base while preserving the local dirty overlay.
+    pub(crate) fn rebase_base(&mut self, base: VolumeExtentMap) {
+        self.base = base;
+    }
+
     /// Dispatches supported ordinary I/O and rejects unsupported barriers/ops.
     pub fn dispatch(&mut self, request: BlockRequest<'_>) -> Result<BlockResponse, BlockError> {
         match request {
@@ -253,6 +297,250 @@ impl<S: MapObjectStore> DirtyVolume<S> {
                 Err(BlockError::UnsupportedOperation(operation))
             }
         }
+    }
+
+    pub(crate) fn stage_dirty(&self) -> Result<Option<StagedVolume>, BlockError> {
+        if self.dirty.is_empty() {
+            return Ok(None);
+        }
+
+        let mut staging = StagingMapStore::new(&self.store);
+        let mut map = self.base.validate(&staging)?;
+        let mut dirty_extent_refs = Vec::with_capacity(self.dirty.len());
+        for (number, bytes) in &self.dirty {
+            let encoded = encode_object(ObjectType::Extent, bytes.as_slice())?;
+            let reference = ObjectRef::from_encoded(&encoded)?;
+            staging
+                .put(reference.object_id, encoded)
+                .map_err(ViewError::Store)?;
+            map = map.insert_extent(&mut staging, *number, reference)?;
+            dirty_extent_refs.push((*number, reference));
+        }
+
+        let volume_root = map.seal(&mut staging)?;
+        let encoded_root = staging
+            .get_ref(volume_root)
+            .map_err(ViewError::Store)?
+            .ok_or(ViewError::MissingObject(volume_root.object_id))?;
+        let root = VolumeRoot::decode(&encoded_root)?;
+        let tree = PersistentBTree::from_root(root.extent_map_root).map_err(ViewError::from)?;
+        let mut reachable = vec![volume_root];
+        reachable.extend(dirty_extent_refs.iter().map(|(_, reference)| *reference));
+        let mut pending_nodes = vec![root.extent_map_root];
+        let mut visited_nodes = BTreeSet::new();
+        while let Some(reference) = pending_nodes.pop() {
+            if !staging.contains_staged(reference.object_id)
+                || !visited_nodes.insert(reference.object_id)
+            {
+                continue;
+            }
+            reachable.push(reference);
+            pending_nodes.extend(
+                tree.child_refs(&staging, reference)
+                    .map_err(ViewError::from)?,
+            );
+        }
+        let objects = staging.into_objects_referenced(reachable)?;
+        Ok(Some(StagedVolume {
+            map,
+            volume_root,
+            dirty_revision: self.revision,
+            dirty_extent_refs,
+            objects,
+        }))
+    }
+
+    pub(crate) fn commit_durable_map(
+        &mut self,
+        base: VolumeExtentMap,
+        expected_revision: u64,
+    ) -> Result<(), BlockError> {
+        if self.revision != expected_revision {
+            return Err(BlockError::BarrierUnresolved);
+        }
+        self.replace_base(base);
+        Ok(())
+    }
+
+    pub(crate) fn restore_pending_dirty(
+        &mut self,
+        dirty_revision: u64,
+        dirty_extent_refs: &[(u64, ObjectRef)],
+        objects: &[StagedObject],
+    ) -> Result<(), BlockError> {
+        let object_bytes: BTreeMap<_, _> = objects
+            .iter()
+            .map(|object| (object.reference.object_id, object.encoded.as_slice()))
+            .collect();
+        if dirty_extent_refs.len() > self.max_dirty_extents {
+            return Err(BlockError::DirtyCapacityExceeded);
+        }
+        let mut dirty = BTreeMap::new();
+        for (number, reference) in dirty_extent_refs {
+            if reference.object_type != ObjectType::Extent {
+                return Err(FormatError::ObjectReferenceMismatch.into());
+            }
+            let encoded = object_bytes
+                .get(&reference.object_id)
+                .ok_or(FormatError::ObjectReferenceMismatch)?;
+            let object = reference.verify(encoded)?;
+            if object.payload.len() != EXTENT_SIZE {
+                return Err(FormatError::InvalidGeometry(
+                    "allocated extent payload must be exactly 64 KiB",
+                )
+                .into());
+            }
+            let bytes: [u8; EXTENT_SIZE] = object
+                .payload
+                .try_into()
+                .map_err(|_| FormatError::ObjectReferenceMismatch)?;
+            dirty.insert(*number, Arc::new(bytes));
+        }
+        self.dirty = dirty;
+        self.revision = dirty_revision;
+        Ok(())
+    }
+}
+
+fn load_map_from_store<S: MapObjectStore>(
+    store: &S,
+    volume_root: ObjectRef,
+) -> Result<VolumeExtentMap, BlockError> {
+    let encoded = store
+        .get_ref(volume_root)
+        .map_err(ViewError::Store)?
+        .ok_or(ViewError::MissingObject(volume_root.object_id))?;
+    let root = volume_root.verify(&encoded)?;
+    if root.object_type != ObjectType::VolumeRoot {
+        return Err(FormatError::ObjectReferenceMismatch.into());
+    }
+    let decoded = versionfs_core::format::VolumeRoot::decode(&encoded)?;
+    VolumeExtentMap::from_root(decoded)?
+        .validate(store)
+        .map_err(Into::into)
+}
+
+impl<S: MapObjectStore> BlockDevice for DirtyVolume<S> {
+    fn geometry(&self) -> versionfs_core::format::VolumeGeometry {
+        self.geometry()
+    }
+
+    fn supports_fua(&self) -> bool {
+        false
+    }
+
+    fn dispatch(&mut self, request: BlockRequest<'_>) -> Result<BlockResponse, BlockError> {
+        DirtyVolume::dispatch(self, request)
+    }
+}
+
+/// One encoded immutable object created while staging a volume barrier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StagedObject {
+    /// Typed content reference for the encoded object.
+    pub reference: ObjectRef,
+    /// Complete canonical encoded object bytes.
+    pub encoded: Vec<u8>,
+}
+
+/// A complete unpublished replacement for a dirty volume prefix.
+pub(crate) struct StagedVolume {
+    pub(crate) map: VolumeExtentMap,
+    pub(crate) volume_root: ObjectRef,
+    pub(crate) dirty_revision: u64,
+    pub(crate) dirty_extent_refs: Vec<(u64, ObjectRef)>,
+    pub(crate) objects: Vec<StagedObject>,
+}
+
+pub(crate) struct StagingMapStore<'a, S> {
+    base: &'a S,
+    staged: BTreeMap<ObjectId, Vec<u8>>,
+}
+
+impl<'a, S: MapObjectStore> StagingMapStore<'a, S> {
+    pub(crate) fn new(base: &'a S) -> Self {
+        Self {
+            base,
+            staged: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn contains_staged(&self, id: ObjectId) -> bool {
+        self.staged.contains_key(&id)
+    }
+
+    pub(crate) fn into_objects(self) -> Result<Vec<(ObjectRef, Vec<u8>)>, FormatError> {
+        self.staged
+            .into_iter()
+            .map(|(id, encoded)| {
+                let reference = ObjectRef::from_encoded(&encoded)?;
+                if reference.object_id != id {
+                    return Err(FormatError::ObjectReferenceMismatch);
+                }
+                Ok((reference, encoded))
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_objects_referenced(
+        self,
+        references: impl IntoIterator<Item = ObjectRef>,
+    ) -> Result<Vec<StagedObject>, FormatError> {
+        let mut referenced = BTreeMap::new();
+        for reference in references {
+            if referenced
+                .insert(reference.object_id, reference)
+                .is_some_and(|existing| existing != reference)
+            {
+                return Err(FormatError::ObjectReferenceMismatch);
+            }
+        }
+
+        let mut objects = Vec::new();
+        for (id, encoded) in self.staged {
+            let Some(reference) = referenced.get(&id).copied() else {
+                continue;
+            };
+            reference.verify(&encoded)?;
+            objects.push(StagedObject { reference, encoded });
+        }
+        Ok(objects)
+    }
+}
+
+impl<S: MapObjectStore> MapObjectStore for StagingMapStore<'_, S> {
+    fn proof_scope(&self) -> versionfs_core::identity::ObjectStoreScopeId {
+        self.base.proof_scope()
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        if let Some(bytes) = self.staged.get(&id) {
+            return Ok(Some(bytes.clone()));
+        }
+        self.base.get(id)
+    }
+
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        if let Some(bytes) = self.staged.get(&reference.object_id) {
+            reference.verify(bytes).map_err(|error| error.to_string())?;
+            return Ok(Some(bytes.clone()));
+        }
+        self.base.get_ref(reference)
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        let reference = ObjectRef::from_encoded(&bytes).map_err(|error| error.to_string())?;
+        if reference.object_id != id {
+            return Err(FormatError::ObjectReferenceMismatch.to_string());
+        }
+        if let Some(existing) = self.staged.get(&id) {
+            if existing != &bytes {
+                return Err(FormatError::ObjectReferenceMismatch.to_string());
+            }
+            return Ok(());
+        }
+        self.staged.insert(id, bytes);
+        Ok(())
     }
 }
 

@@ -17,9 +17,13 @@ async-trait = "=0.1.92"
 futures-util = "=0.3.33"
 kv-engine = { git = "https://github.com/ben1009/toy-kv-engine", rev = "8b1355849bbc42dc0dea7d7bf8ca60097d42dbfe" }
 object_store = { version = "=0.13.2", default-features = false, features = ["aws", "tls-webpki-roots"] }
+sha2 = "=0.10.9"
 thiserror = "=2.0.21"
 tokio = { version = "=1.53.3", features = ["macros", "rt-multi-thread", "sync", "time"] }
 versionfs-core = { path = "../versionfs-core" }
+
+[dev-dependencies]
+versionfs-sdk = { path = "../versionfs-sdk" }
 
 [lints]
 workspace = true

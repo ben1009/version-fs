@@ -204,7 +204,7 @@ impl VolumeExtentMap {
 
             if let Some(reference) = self.extent(store, extent_number)? {
                 let encoded = store
-                    .get(reference.object_id)
+                    .get_ref(reference)
                     .map_err(ViewError::Store)?
                     .ok_or(ViewError::MissingObject(reference.object_id))?;
                 let object = reference.verify(&encoded)?;
@@ -721,7 +721,7 @@ fn from_typed_map_root(
 
 fn load_verified<S: MapObjectStore>(store: &S, reference: ObjectRef) -> Result<Vec<u8>, ViewError> {
     let bytes = store
-        .get(reference.object_id)
+        .get_ref(reference)
         .map_err(ViewError::Store)?
         .ok_or(ViewError::MissingObject(reference.object_id))?;
     reference.verify(&bytes)?;

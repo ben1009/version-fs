@@ -15,11 +15,14 @@ Authority adapter and its conformance tests. P3 adds persistent copy-on-write
 maps, typed volume/log/artifact roots, and complete Generation graph verification;
 P4 adds the bounded local block overlay, verified workspace object cache,
 protected-root range reads, structural extent diff, and the opt-in single-queue
-ublk adapter. The adapter advertises a volatile cache and rejects FLUSH/FUA until
-P6 provides the remote durability path. P5 adds backend-neutral control records
-and toy-kv-backed integration tests for operation outcomes, grants, attachments,
-protections, and capture preparation. The service and SDK lifecycle that uses
-these protocols remains in progress.
+ublk adapter. P5 adds backend-neutral control records and toy-kv-backed
+integration tests for operation outcomes, grants, attachments, protections, and
+capture preparation. P6 adds a durable barrier coordinator, local recovery
+journal, and S3-backed live-root path; this implementation has not yet been
+qualified against real S3, ublk, or ext4. `DirtyVolume` remains volatile, while
+the generic ublk adapter derives FLUSH/FUA capability from its supplied
+`BlockDevice`. The service and SDK lifecycle that uses these protocols remains
+in progress.
 
 Workspace cache directories have one owner at a time; drop the prior cache
 handle before reopening its directory. An exclusive file lock also prevents
@@ -28,6 +31,9 @@ Cache handles identify both their workspace and object-store scope. A cached
 map store requires its cache scope to match the backing store's `proof_scope`;
 reopening a directory for another scope removes the previous scope's clean
 objects before serving reads.
+S3 scopes include the effective endpoint, region, addressing style, bucket, and
+deployment prefix. An explicit local-emulator endpoint overrides both generic
+and S3-specific environment endpoints.
 If temporary-file cleanup fails, its capacity stays reserved until reopening
 removes the leftover file. Verified backing reads remain available in the meantime.
 
@@ -35,6 +41,26 @@ Validated view handles seal without reading their map nodes. Imported volume
 handles can retain the result of `VolumeExtentMap::validate` to check metadata
 once before later mutations; named-map opens validate entries and retain counts.
 Tooling checks do not qualify any MVP durability gate.
+
+Durable barriers retain the validated candidate map returned by staging, so
+retries and completion reuse its metadata validation. Recovery validates the
+imported base once and reconstructs the candidate from journaled dirty extents;
+it checks that the reconstructed root matches the saved root before publishing.
+A different authoritative base root requires fresh metadata validation.
+
+The local barrier journal atomically publishes its initial ID state and pending
+records. If replacement returns an error after rename, the worker keeps the exact
+replacement and retries it before remote work resumes. Instance-scoped failure
+points exercise interruptions before publication and between rename and directory
+sync.
+Branch reads reconcile a pending Metadata Authority outcome before reading fresh
+state, allowing barrier retries and worker reopen to pass the toy-kv outcome
+gate. A clean worker validates its writer and attachment identity before clearing
+an unused capture child.
+Once stable attachment fencing or terminal lease expiry is observed, the worker
+rejects further writes and barriers. Dirty data and pending journal records remain
+available for salvage. Committed-barrier recovery revalidates the original
+attachment before changing its local base or clearing its journal.
 
 ## Setup and tools
 
@@ -46,8 +72,9 @@ sanitizer jobs.
 
 The ublk binding is pinned to the published `libublk` `0.4.8` crate. Upstream
 `0.5.0` is not yet published in the registry. The `ublk-smoke` feature builds
-only the disposable P0 platform prototype; `ublk-adapter` builds the P4 block
-server, which still has no durable barrier support.
+only the disposable P0 platform prototype; `ublk-adapter` builds the single-
+queue P4 transport, which can accept a P6 durable block device but is not yet
+qualified for durable FLUSH/FUA behavior.
 
 `./dev` runs from the repository root even when invoked from another directory.
 It installs cargo-make if missing, then forwards arguments to cargo-make. Individual
@@ -98,13 +125,12 @@ after unmount/remount. Set `VERSIONFS_SMOKE_KEEP=1` to retain the request log. I
 cleanup cannot confirm an unmount, it exits with an error and preserves the
 mount, server, and logs for recovery; the diagnostic reports their paths and PID.
 Unfreeze/unmount that temporary filesystem before stopping its server and
-removing the work directory. This
-volatile RAM device verifies request plumbing, ext4 flush progress, freeze
-progress, and kernel device teardown only; `libublk` advertises a volatile cache,
-so the kernel may emulate FUA as WRITE followed by FLUSH. The harness does not
-qualify FUA durability, S3 durability, Generation publication, or recovery of
-durable state after server death. Run it only on a disposable privileged Linux
-host.
+removing the work directory. This volatile RAM device verifies request plumbing,
+ext4 flush progress, freeze progress, and kernel device teardown only; the
+supplied `DirtyVolume` advertises a volatile cache, so the kernel may emulate
+FUA as WRITE followed by FLUSH. The harness does not qualify FUA durability,
+S3 durability, Generation publication, or recovery of durable state after server
+death. Run it only on a disposable privileged Linux host.
 
 The deterministic object-store tests run with `./dev test`. The real-S3 test is
 ignored unless explicitly requested; its dedicated-bucket guard and setup are in

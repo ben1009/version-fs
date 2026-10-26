@@ -778,6 +778,17 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
             .map_err(|error| error.to_string())
     }
 
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        let bytes = self
+            .cache
+            .get_or_fetch_id(reference.object_id, |_| self.backing.get_ref(reference))
+            .map_err(|error| error.to_string())?;
+        if let Some(bytes) = &bytes {
+            reference.verify(bytes).map_err(|error| error.to_string())?;
+        }
+        Ok(bytes)
+    }
+
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
         let reference = ObjectRef::from_encoded(&bytes).map_err(|error| error.to_string())?;
         if reference.object_id != id {
@@ -788,6 +799,17 @@ impl<S: MapObjectStore> MapObjectStore for CachedMapStore<S> {
             Ok(_) | Err(CacheError::Io { .. } | CacheError::Poisoned) => Ok(()),
             Err(error) => Err(error.to_string()),
         }
+    }
+}
+
+impl<S: versionfs_core::persistent_map::DurableObjectStore>
+    versionfs_core::persistent_map::DurableObjectStore for CachedMapStore<S>
+{
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        reference
+            .verify(encoded)
+            .map_err(|error| error.to_string())?;
+        self.backing.put_durable(reference, encoded)
     }
 }
 
@@ -1684,5 +1706,18 @@ mod tests {
         assert_eq!(store.backing().gets.load(Ordering::SeqCst), 0);
         assert_eq!(store.get(ObjectId::from_bytes([0; 32])).unwrap(), None);
         assert_eq!(store.backing().gets.load(Ordering::SeqCst), 1);
+
+        let (uncached_reference, uncached_bytes) = encoded_object(0xB9);
+        store
+            .backing
+            .objects
+            .insert(uncached_reference.object_id, uncached_bytes.clone());
+        assert_eq!(
+            store.get_ref(uncached_reference).unwrap(),
+            Some(uncached_bytes)
+        );
+
+        let (missing_reference, _) = encoded_object(0xC9);
+        assert_eq!(store.get_ref(missing_reference).unwrap(), None);
     }
 }

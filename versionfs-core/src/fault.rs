@@ -21,6 +21,10 @@ pub enum FailurePoint {
     DeviceBeforeExecute,
     /// After device state changes but before request completion.
     DeviceAfterExecuteBeforeCompletion,
+    /// After a journal temporary file is synced but before its atomic publication.
+    JournalBeforePublish,
+    /// After a journal rename becomes visible but before its directory sync succeeds.
+    JournalAfterRenameBeforeDirectorySync,
     /// Before filesystem freeze begins.
     FilesystemFreezeBefore,
     /// After filesystem freeze succeeds but before capture proceeds.

@@ -23,6 +23,7 @@ use versionfs_core::{
     },
     time::{Clock, MonotonicTime},
 };
+use versionfs_sdk::barrier::VolumeBarrierControl;
 use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -783,8 +784,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
     };
     let capture_state = capture_request().expect("begin checkpoint capture");
     assert!(matches!(capture_state, OperationState::Preparing { .. }));
-    env.control
-        .authorize_capture_child(op(11), op(10), op(12), grant)
+    VolumeBarrierControl::authorize_capture_child(&env.control, op(11), op(10), op(12), grant)
         .expect("admit identified drain child");
     assert_eq!(
         env.control.begin_preparation(PreparationRequest {
@@ -801,8 +801,9 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
         }),
         Err(ControlError::Busy)
     );
-    env.control
-        .begin_preparation(PreparationRequest {
+    VolumeBarrierControl::begin_preparation(
+        &env.control,
+        PreparationRequest {
             operation_id: op(12),
             branch_id: branch(1),
             expected_revision: 1,
@@ -813,18 +814,18 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             kind: PreparationKind::VolumeBarrier,
             expected_roots: Some(replace_volume_root(roots(1), 12)),
             dependencies: vec![],
-        })
-        .expect("register admitted child preparation");
-    let after_child = env
-        .control
-        .commit_live_roots(
-            op(12),
-            1,
-            grant,
-            replace_volume_root(roots(1), 12),
-            Some((op(10), op(12))),
-        )
-        .expect("commit admitted drain child");
+        },
+    )
+    .expect("register admitted child preparation");
+    let after_child = VolumeBarrierControl::commit_live_roots(
+        &env.control,
+        op(12),
+        1,
+        grant,
+        replace_volume_root(roots(1), 12),
+        Some(op(10)),
+    )
+    .expect("commit admitted drain child");
     assert_eq!(after_child.revision, 2);
     let sealed = env
         .control
