@@ -836,7 +836,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
 fn capture_publication_rejects_a_verified_graph_from_another_object_namespace() {
     let mut target_store = TestObjectStore::default();
     let initial = empty_generation(&mut target_store, generation(1), 60);
-    let env = TestEnv::with_initial_seed(initial.clone());
+    let env = TestEnv::with_initial_seed(initial);
     let grant = env.writer_and_attachment();
     let capture_id = op(61);
     env.start_sealed_capture(capture_id, protection(61), grant, initial.roots);
