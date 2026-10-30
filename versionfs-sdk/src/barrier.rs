@@ -18,9 +18,12 @@ use versionfs_core::fault::{FailureInjector, FailurePoint, NoFailures};
 use versionfs_core::format::{
     CaptureMode, GenerationDescriptor, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
 };
-use versionfs_core::graph::{GraphError, verify_generation};
+use versionfs_core::graph::{
+    DependencyProof, GraphError, verify_generation, verify_generation_with_reuse,
+};
 use versionfs_core::identity::{
-    AttachmentId, BranchId, GenerationId, ObjectId, OperationId, ProtectionId, VolumeBoundaryId,
+    AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PrincipalId,
+    ProtectionId, VolumeBoundaryId, WorkspaceId,
 };
 use versionfs_core::metadata::MetadataAuthority;
 use versionfs_core::persistent_map::{DurableObjectStore, MapObjectStore};
@@ -43,6 +46,9 @@ pub struct BarrierIds {
 /// Exact local recovery record for one pending durable barrier.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingBarrier {
+    /// Workspace, principal, and object namespace that own these staged bytes.
+    /// `None` identifies a legacy record that needs explicit scope binding.
+    pub scope: Option<BarrierJournalScope>,
     /// Stable operation identity for this barrier.
     pub operation_id: OperationId,
     /// Preparation protection created for this barrier.
@@ -79,6 +85,17 @@ pub struct PendingBarrier {
     pub renewal_grant: Option<WriterGrant>,
 }
 
+/// Stable workspace, caller, and immutable-object namespace for a barrier journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BarrierJournalScope {
+    /// Workspace that owns the branch and operation identities.
+    pub workspace_id: WorkspaceId,
+    /// Authenticated caller whose operation IDs are stored in the journal.
+    pub principal_id: PrincipalId,
+    /// Immutable-object namespace used by this workspace.
+    pub object_store_scope: ObjectStoreScopeId,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResumeStep {
     Continue,
@@ -91,7 +108,8 @@ enum ResumeStep {
 /// Implementations must keep this state outside the exported block volume. ID
 /// allocation must be durable before returning, and persist_pending must make
 /// the complete record durable before any Metadata Authority or object-store
-/// request is sent. [`FileBarrierJournal`] provides the reference local format;
+/// request is sent. New pending records include their workspace, principal, and
+/// object-store scope. [`FileBarrierJournal`] provides the reference local format;
 /// worker hosts may provide another implementation with the same guarantees.
 pub trait BarrierJournal {
     /// Reserves a never-reused barrier operation ID and preparation protection ID.
@@ -121,7 +139,8 @@ pub trait BarrierJournal {
 
 const JOURNAL_IDS_MAGIC: &[u8; 8] = b"VFSBID01";
 const JOURNAL_PENDING_MAGIC_V1: &[u8; 8] = b"VFSPND01";
-const JOURNAL_PENDING_MAGIC: &[u8; 8] = b"VFSPND02";
+const JOURNAL_PENDING_MAGIC_V2: &[u8; 8] = b"VFSPND02";
+const JOURNAL_PENDING_MAGIC: &[u8; 8] = b"VFSPND03";
 const CHECKSUM_BYTES: usize = 32;
 static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
 
@@ -150,6 +169,22 @@ impl FileBarrierJournal {
     /// Opens or initializes one journal directory.
     pub fn open(directory: impl AsRef<Path>) -> Result<Self, String> {
         Self::open_with(directory, Arc::new(NoFailures))
+    }
+
+    /// Binds a legacy pending record after its owner has verified its origin.
+    ///
+    /// Older records contain no workspace identity. Callers must establish the
+    /// correct workspace, principal, and object namespace independently before
+    /// invoking this method. Retrying the same binding synchronizes the record again.
+    pub fn bind_legacy_pending_scope(&mut self, scope: BarrierJournalScope) -> Result<(), String> {
+        let mut pending = self
+            .load_pending()?
+            .ok_or_else(|| "journal has no pending barrier to bind".to_owned())?;
+        if pending.scope.is_some_and(|existing| existing != scope) {
+            return Err("pending barrier is already bound to another workspace".to_owned());
+        }
+        pending.scope = Some(scope);
+        self.persist_pending(&pending)
     }
 
     /// Opens a journal with instance-scoped storage fault injection.
@@ -270,10 +305,13 @@ impl BarrierJournal for FileBarrierJournal {
 
     fn persist_pending(&mut self, barrier: &PendingBarrier) -> Result<(), String> {
         validate_pending(barrier)?;
-        if let Some(existing) = self.load_pending()?
-            && existing.operation_id != barrier.operation_id
-        {
-            return Err("another barrier is already pending in this journal".to_owned());
+        if let Some(existing) = self.load_pending()? {
+            if existing.operation_id != barrier.operation_id {
+                return Err("another barrier is already pending in this journal".to_owned());
+            }
+            if existing.scope.is_some() && existing.scope != barrier.scope {
+                return Err("cannot change a pending barrier's workspace binding".to_owned());
+            }
         }
         let bytes = encode_pending_file(barrier)?;
         atomic_replace(
@@ -292,7 +330,9 @@ impl BarrierJournal for FileBarrierJournal {
         validate_pending(replacement)?;
         match self.load_pending()? {
             Some(existing)
-                if existing.operation_id == expected_operation_id || existing == *replacement => {}
+                if existing.scope == replacement.scope
+                    && (existing.operation_id == expected_operation_id
+                        || existing == *replacement) => {}
             Some(_) => return Err("cannot replace a different pending barrier".to_owned()),
             None => return Err("cannot replace a missing pending barrier".to_owned()),
         }
@@ -344,6 +384,9 @@ fn decode_ids(bytes: &[u8]) -> Result<([u8; 8], u64), String> {
 }
 
 fn encode_pending_file(barrier: &PendingBarrier) -> Result<Vec<u8>, String> {
+    let scope = barrier
+        .scope
+        .ok_or_else(|| "pending barrier has no workspace binding".to_owned())?;
     let mut payload = Vec::new();
     payload.extend_from_slice(barrier.operation_id.as_bytes());
     payload.extend_from_slice(barrier.protection_id.as_bytes());
@@ -386,17 +429,27 @@ fn encode_pending_file(barrier: &PendingBarrier) -> Result<Vec<u8>, String> {
             payload.push(0);
         }
     }
+    payload.extend_from_slice(scope.workspace_id.as_bytes());
+    payload.extend_from_slice(scope.principal_id.as_bytes());
+    payload.extend_from_slice(scope.object_store_scope.as_bytes());
     Ok(encode_checked(JOURNAL_PENDING_MAGIC, &payload))
 }
 
 fn decode_pending_file(bytes: &[u8]) -> Result<PendingBarrier, String> {
-    let (payload, has_capture_fields) = match bytes.get(..8) {
+    let (payload, has_capture_fields, has_scope) = match bytes.get(..8) {
         Some(magic) if magic == JOURNAL_PENDING_MAGIC => {
-            (decode_checked(JOURNAL_PENDING_MAGIC, bytes)?, true)
+            (decode_checked(JOURNAL_PENDING_MAGIC, bytes)?, true, true)
         }
-        Some(magic) if magic == JOURNAL_PENDING_MAGIC_V1 => {
-            (decode_checked(JOURNAL_PENDING_MAGIC_V1, bytes)?, false)
-        }
+        Some(magic) if magic == JOURNAL_PENDING_MAGIC_V2 => (
+            decode_checked(JOURNAL_PENDING_MAGIC_V2, bytes)?,
+            true,
+            false,
+        ),
+        Some(magic) if magic == JOURNAL_PENDING_MAGIC_V1 => (
+            decode_checked(JOURNAL_PENDING_MAGIC_V1, bytes)?,
+            false,
+            false,
+        ),
         _ => return Err("invalid barrier journal header".to_owned()),
     };
     let mut reader = JournalReader::new(payload);
@@ -440,8 +493,18 @@ fn decode_pending_file(bytes: &[u8]) -> Result<PendingBarrier, String> {
         ),
         _ => return Err("invalid pending renewal ID tag".to_owned()),
     };
+    let scope = if has_scope {
+        Some(BarrierJournalScope {
+            workspace_id: WorkspaceId::from_bytes(reader.fixed()?),
+            principal_id: PrincipalId::from_bytes(reader.fixed()?),
+            object_store_scope: ObjectStoreScopeId::from_bytes(reader.fixed()?),
+        })
+    } else {
+        None
+    };
     reader.finish()?;
     let barrier = PendingBarrier {
+        scope,
         operation_id,
         protection_id,
         branch_id,
@@ -790,6 +853,14 @@ impl<'a> JournalReader<'a> {
 /// while this device is open. The barrier coordinator renews preparation
 /// protection during long uploads, but does not run the attachment heartbeat.
 pub trait VolumeBarrierControl: Send + Sync {
+    /// Returns the immutable-object namespace configured for this workspace.
+    /// This identity must stay fixed for the lifetime of the control handle.
+    fn object_store_scope(&self) -> ObjectStoreScopeId;
+
+    /// Returns the caller identity used to scope barrier operation IDs.
+    /// This identity must stay fixed for the lifetime of the control handle.
+    fn principal_id(&self) -> PrincipalId;
+
     /// Reads the latest authoritative branch and live roots.
     fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError>;
 
@@ -837,6 +908,14 @@ pub trait VolumeBarrierControl: Send + Sync {
 }
 
 impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
+    fn object_store_scope(&self) -> ObjectStoreScopeId {
+        WorkspaceControl::object_store_scope(self)
+    }
+
+    fn principal_id(&self) -> PrincipalId {
+        WorkspaceControl::principal_id(self)
+    }
+
     fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError> {
         WorkspaceControl::get_branch(self, branch_id)
     }
@@ -918,6 +997,12 @@ pub enum BarrierError {
     /// The local recovery journal failed.
     #[error("barrier recovery journal failed: {0}")]
     Journal(String),
+    /// The pending barrier belongs to another workspace, caller, or namespace.
+    #[error("pending barrier belongs to another workspace, principal, or object-store namespace")]
+    JournalScopeMismatch,
+    /// A legacy pending record needs an explicit, verified workspace binding.
+    #[error("legacy pending barrier has no workspace binding")]
+    LegacyJournalUnbound,
     /// The branch, grant, or attachment does not match the recorded operation.
     #[error("barrier state no longer matches its branch or attachment")]
     Fenced,
@@ -1007,9 +1092,8 @@ pub fn create_empty_generation<S: DurableObjectStore>(
 /// Creates, durably stores, and verifies a descriptor for already durable roots.
 ///
 /// The roots must be the exact sealed roots produced by the checkpoint
-/// coordinator. Verification reads the descriptor's complete strong dependency
-/// graph before the returned seed can be passed to the authority publication
-/// transaction.
+/// coordinator. This fallback reads the complete strong dependency graph; use
+/// [`create_generation_with_reuse`] when protected proofs are available.
 #[allow(clippy::too_many_arguments)]
 pub fn create_generation<S: DurableObjectStore>(
     store: &mut S,
@@ -1019,6 +1103,35 @@ pub fn create_generation<S: DurableObjectStore>(
     capture_mode: CaptureMode,
     boundary_id: VolumeBoundaryId,
     created_at_unix_ms: u64,
+) -> Result<VerifiedGenerationSeed, BarrierError> {
+    create_generation_with_reuse(
+        store,
+        generation_id,
+        parent_generation_id,
+        roots,
+        capture_mode,
+        boundary_id,
+        created_at_unix_ms,
+        &[],
+    )
+}
+
+/// Creates a Generation while reusing verified, protected immutable subgraphs.
+///
+/// Each supplied proof must belong to this store's scope, and its root must
+/// remain protected until this operation finishes. The caller must also ensure
+/// all referenced objects are durable and remain protected through publication
+/// or a definite abort. Unproven dependencies are read and verified normally.
+#[allow(clippy::too_many_arguments)]
+pub fn create_generation_with_reuse<S: DurableObjectStore>(
+    store: &mut S,
+    generation_id: GenerationId,
+    parent_generation_id: Option<GenerationId>,
+    roots: LiveRoots,
+    capture_mode: CaptureMode,
+    boundary_id: VolumeBoundaryId,
+    created_at_unix_ms: u64,
+    protected_proofs: &[&DependencyProof],
 ) -> Result<VerifiedGenerationSeed, BarrierError> {
     let descriptor = GenerationDescriptor {
         generation_id,
@@ -1035,7 +1148,7 @@ pub fn create_generation<S: DurableObjectStore>(
     store
         .put_durable(descriptor_ref, &descriptor)
         .map_err(BarrierError::ObjectStore)?;
-    let proof = verify_generation(store, descriptor_ref)?;
+    let proof = verify_generation_with_reuse(store, descriptor_ref, protected_proofs)?;
     Ok(VerifiedGenerationSeed::from_proof(proof))
 }
 
@@ -1109,6 +1222,7 @@ pub struct DurableVolume<S, C, J> {
     inner: DirtyVolume<S>,
     control: C,
     journal: J,
+    journal_scope: BarrierJournalScope,
     branch_id: BranchId,
     writer_grant: WriterGrant,
     attachment_id: AttachmentId,
@@ -1143,7 +1257,24 @@ where
         attachment_id: AttachmentId,
         max_dirty_bytes: usize,
     ) -> Result<Self, BarrierError> {
+        let object_store_scope = control.object_store_scope();
+        if store.proof_scope() != object_store_scope {
+            return Err(BarrierError::ObjectStoreScopeMismatch);
+        }
         let branch = control.get_branch(branch_id)?;
+        let journal_scope = BarrierJournalScope {
+            workspace_id: branch.workspace_id,
+            principal_id: control.principal_id(),
+            object_store_scope,
+        };
+        let pending = journal.load_pending().map_err(BarrierError::Journal)?;
+        if let Some(barrier) = &pending {
+            match barrier.scope {
+                Some(scope) if scope == journal_scope => {}
+                Some(_) => return Err(BarrierError::JournalScopeMismatch),
+                None => return Err(BarrierError::LegacyJournalUnbound),
+            }
+        }
         let current_grant = validate_attachment(
             &branch,
             branch_id,
@@ -1154,7 +1285,6 @@ where
         let attachment = branch.attachment.ok_or(BarrierError::Fenced)?;
         let base = load_map(&store, branch.volume_root)?;
         let mut inner = DirtyVolume::new(store, base, max_dirty_bytes)?;
-        let pending = journal.load_pending().map_err(BarrierError::Journal)?;
         if let Some(barrier) = &pending {
             if barrier.branch_id != branch_id
                 || barrier.attachment_id != attachment_id
@@ -1186,6 +1316,7 @@ where
             inner,
             control,
             journal,
+            journal_scope,
             branch_id,
             writer_grant: current_grant,
             attachment_id,
@@ -1338,6 +1469,7 @@ where
         capture_authorization_id: Option<OperationId>,
     ) -> PendingBarrier {
         PendingBarrier {
+            scope: Some(self.journal_scope),
             operation_id: ids.operation_id,
             protection_id: ids.protection_id,
             branch_id: self.branch_id,
@@ -2097,6 +2229,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_builder_reuses_a_protected_graph_without_rereading_payloads() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).unwrap();
+        let initial = create_empty_generation(
+            &mut store,
+            GenerationId::from_bytes([1; 16]),
+            VolumeBoundaryId::from_bytes([2; 16]),
+            geometry,
+            10,
+        )
+        .unwrap();
+        let extent_bytes = versionfs_core::format::encode_object(
+            ObjectType::Extent,
+            &vec![0x5A; EXTENT_BYTES as usize],
+        )
+        .unwrap();
+        let extent = ObjectRef::from_encoded(&extent_bytes).unwrap();
+        store.put_durable(extent, &extent_bytes).unwrap();
+        let volume = VolumeExtentMap::empty(geometry, &mut store)
+            .unwrap()
+            .insert_extent(&mut store, 0, extent)
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+        let roots = LiveRoots {
+            volume,
+            ..initial.roots
+        };
+        let parent = create_generation(
+            &mut store,
+            GenerationId::from_bytes([3; 16]),
+            Some(initial.generation_id),
+            roots,
+            CaptureMode::BlockCut,
+            VolumeBoundaryId::from_bytes([4; 16]),
+            20,
+        )
+        .unwrap();
+
+        store.reads.store(0, Ordering::Relaxed);
+        let child = create_generation_with_reuse(
+            &mut store,
+            GenerationId::from_bytes([5; 16]),
+            Some(parent.seed().generation_id),
+            roots,
+            CaptureMode::BlockCut,
+            VolumeBoundaryId::from_bytes([6; 16]),
+            30,
+            &[parent.dependency_proof()],
+        )
+        .unwrap();
+        assert_eq!(store.reads.load(Ordering::Relaxed), 1);
+        assert!(child.dependency_proof().objects().contains(&extent));
+        assert_eq!(child.seed().roots, roots);
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -2238,7 +2427,7 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct FakeControl(Arc<Mutex<FakeControlState>>);
+    struct FakeControl(Arc<Mutex<FakeControlState>>, PrincipalId);
 
     #[derive(Clone, Copy)]
     enum AuthorizationFailure {
@@ -2259,6 +2448,14 @@ mod tests {
     }
 
     impl VolumeBarrierControl for FakeControl {
+        fn object_store_scope(&self) -> ObjectStoreScopeId {
+            ObjectStoreScopeId::from_bytes([0xA7; 16])
+        }
+
+        fn principal_id(&self) -> PrincipalId {
+            self.1
+        }
+
         fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError> {
             let state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
             if state.branch.branch_id != branch_id {
@@ -2534,17 +2731,20 @@ mod tests {
                 capture: None,
                 deleted: false,
             };
-            let control = FakeControl(Arc::new(Mutex::new(FakeControlState {
-                branch,
-                operations: HashMap::new(),
-                capture_authorizations: HashMap::new(),
-                fail_next_authorization: None,
-                renewals: HashMap::new(),
-                expire_next_renewal: false,
-                lose_next_commit_reply: false,
-                branch_after_committed_read: None,
-                commit_count: 0,
-            })));
+            let control = FakeControl(
+                Arc::new(Mutex::new(FakeControlState {
+                    branch,
+                    operations: HashMap::new(),
+                    capture_authorizations: HashMap::new(),
+                    fail_next_authorization: None,
+                    renewals: HashMap::new(),
+                    expire_next_renewal: false,
+                    lose_next_commit_reply: false,
+                    branch_after_committed_read: None,
+                    commit_count: 0,
+                })),
+                PrincipalId::from_bytes([0xA8; 16]),
+            );
             Self {
                 _directory: TestDir::new(),
                 store,
@@ -2585,6 +2785,11 @@ mod tests {
             typed_object(ObjectType::VolumeRoot, b"new volume root");
         let (extent, extent_bytes) = typed_object(ObjectType::Extent, b"extent bytes");
         PendingBarrier {
+            scope: Some(BarrierJournalScope {
+                workspace_id: WorkspaceId::from_bytes([10; 16]),
+                principal_id: PrincipalId::from_bytes([0xA8; 16]),
+                object_store_scope: ObjectStoreScopeId::from_bytes([0xA7; 16]),
+            }),
             operation_id: OperationId::from_bytes([13; 16]),
             protection_id: ProtectionId::from_bytes([14; 16]),
             branch_id,
@@ -2862,6 +3067,15 @@ mod tests {
         journal
             .persist_pending(&barrier)
             .expect("persist pending barrier");
+        let mut wrong_scope = barrier.clone();
+        wrong_scope.scope.as_mut().unwrap().workspace_id = WorkspaceId::from_bytes([0x99; 16]);
+        assert!(journal.persist_pending(&wrong_scope).is_err());
+        assert!(
+            journal
+                .replace_pending(barrier.operation_id, &wrong_scope)
+                .is_err()
+        );
+        assert_eq!(journal.load_pending().unwrap(), Some(barrier.clone()));
         drop(journal);
 
         let mut reopened = FileBarrierJournal::open(&directory.0).expect("reopen journal");
@@ -2887,20 +3101,155 @@ mod tests {
     }
 
     #[test]
-    fn pending_journal_migrates_the_pre_capture_record_format() {
+    fn legacy_pending_records_remain_readable_without_an_inferred_scope() {
         let barrier = sample_pending();
-        let encoded_v2 = encode_pending_file(&barrier).expect("encode current pending record");
-        let payload = decode_checked(JOURNAL_PENDING_MAGIC, &encoded_v2)
+        let encoded_v3 = encode_pending_file(&barrier).expect("encode current pending record");
+        let payload = decode_checked(JOURNAL_PENDING_MAGIC, &encoded_v3)
             .expect("read current pending payload");
+        let payload_v2 = &payload[..payload.len() - 48];
+        let encoded_v2 = encode_checked(JOURNAL_PENDING_MAGIC_V2, payload_v2);
         let prefix_length = 16 + 16 + 16 + 8 + 56 + 16 + 8;
-        let mut payload_v1 = payload[..prefix_length].to_vec();
-        payload_v1.extend_from_slice(&payload[prefix_length + 2..]);
+        let mut payload_v1 = payload_v2[..prefix_length].to_vec();
+        payload_v1.extend_from_slice(&payload_v2[prefix_length + 2..]);
         let encoded_v1 = encode_checked(JOURNAL_PENDING_MAGIC_V1, &payload_v1);
 
-        let decoded = decode_pending_file(&encoded_v1).expect("decode legacy pending record");
-        assert_eq!(decoded, barrier);
-        assert_eq!(decoded.capture_id, None);
-        assert_eq!(decoded.capture_authorization_id, None);
+        let mut expected = barrier;
+        expected.scope = None;
+        for encoded in [&encoded_v1, &encoded_v2] {
+            let decoded = decode_pending_file(encoded).expect("decode legacy pending record");
+            assert_eq!(decoded, expected);
+            assert_eq!(decoded.capture_id, None);
+            assert_eq!(decoded.capture_authorization_id, None);
+        }
+    }
+
+    #[test]
+    fn pending_barrier_cannot_replay_into_another_workspace() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker.inner.write(4096, &[0xA3; 4096]).unwrap();
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        drop(worker);
+
+        let before = {
+            let mut state = environment.control.0.lock().unwrap();
+            state.branch.workspace_id = WorkspaceId::from_bytes([0x99; 16]);
+            state.branch.clone()
+        };
+        let result = DurableVolume::open(
+            environment.store.clone(),
+            environment.control.clone(),
+            FileBarrierJournal::open(&environment._directory.0).unwrap(),
+            environment.branch_id,
+            environment.grant,
+            environment.attachment_id,
+            EXTENT_BYTES as usize * 4,
+        );
+        assert!(matches!(result, Err(BarrierError::JournalScopeMismatch)));
+        assert_eq!(environment.control.0.lock().unwrap().branch, before);
+        let mut journal = FileBarrierJournal::open(&environment._directory.0).unwrap();
+        assert_eq!(
+            journal
+                .load_pending()
+                .unwrap()
+                .unwrap()
+                .scope
+                .unwrap()
+                .workspace_id,
+            WorkspaceId::from_bytes([6; 16])
+        );
+    }
+
+    #[test]
+    fn pending_barrier_cannot_replay_as_another_principal() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker.inner.write(4096, &[0xA3; 4096]).unwrap();
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        drop(worker);
+
+        let before = environment.control.0.lock().unwrap().branch.clone();
+        let other_principal = FakeControl(
+            Arc::clone(&environment.control.0),
+            PrincipalId::from_bytes([0x99; 16]),
+        );
+        let result = DurableVolume::open(
+            environment.store.clone(),
+            other_principal,
+            FileBarrierJournal::open(&environment._directory.0).unwrap(),
+            environment.branch_id,
+            environment.grant,
+            environment.attachment_id,
+            EXTENT_BYTES as usize * 4,
+        );
+        assert!(matches!(result, Err(BarrierError::JournalScopeMismatch)));
+        assert_eq!(environment.control.0.lock().unwrap().branch, before);
+        let mut journal = FileBarrierJournal::open(&environment._directory.0).unwrap();
+        assert_eq!(
+            journal
+                .load_pending()
+                .unwrap()
+                .unwrap()
+                .scope
+                .unwrap()
+                .principal_id,
+            PrincipalId::from_bytes([0xA8; 16])
+        );
+    }
+
+    #[test]
+    fn legacy_pending_barrier_requires_explicit_binding_before_recovery() {
+        let environment = TestEnvironment::new();
+        let mut worker = environment.open();
+        worker.inner.write(4096, &[0xA3; 4096]).unwrap();
+        environment
+            .store
+            .fail_next_upload
+            .store(true, Ordering::SeqCst);
+        assert!(matches!(worker.flush(), Err(BarrierError::ObjectStore(_))));
+        drop(worker);
+
+        let mut journal = FileBarrierJournal::open(&environment._directory.0).unwrap();
+        let original = journal.load_pending().unwrap().unwrap();
+        let encoded = encode_pending_file(&original).unwrap();
+        let payload = decode_checked(JOURNAL_PENDING_MAGIC, &encoded).unwrap();
+        let legacy = encode_checked(JOURNAL_PENDING_MAGIC_V2, &payload[..payload.len() - 48]);
+        fs::write(&journal.pending_path, legacy).unwrap();
+        drop(journal);
+
+        let result = DurableVolume::open(
+            environment.store.clone(),
+            environment.control.clone(),
+            FileBarrierJournal::open(&environment._directory.0).unwrap(),
+            environment.branch_id,
+            environment.grant,
+            environment.attachment_id,
+            EXTENT_BYTES as usize * 4,
+        );
+        assert!(matches!(result, Err(BarrierError::LegacyJournalUnbound)));
+        let mut journal = FileBarrierJournal::open(&environment._directory.0).unwrap();
+        journal
+            .bind_legacy_pending_scope(original.scope.unwrap())
+            .unwrap();
+        let wrong_scope = BarrierJournalScope {
+            workspace_id: WorkspaceId::from_bytes([0x99; 16]),
+            principal_id: original.scope.unwrap().principal_id,
+            object_store_scope: original.scope.unwrap().object_store_scope,
+        };
+        assert!(journal.bind_legacy_pending_scope(wrong_scope).is_err());
+        assert_eq!(journal.load_pending().unwrap(), Some(original));
+        drop(journal);
+
+        let recovered = environment.open();
+        assert_eq!(recovered.revision(), 2);
     }
 
     #[test]

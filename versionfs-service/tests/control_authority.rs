@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     env,
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{
         Arc, Barrier,
@@ -24,6 +25,10 @@ use versionfs_core::{
     identity::{
         AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
         PrincipalId, ProtectionId, VolumeBoundaryId, WorkspaceId,
+    },
+    metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
     },
     persistent_map::{DurableObjectStore, MapObjectStore},
     time::{Clock, MonotonicTime},
@@ -115,6 +120,93 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&self) -> MonotonicTime {
         MonotonicTime::from_nanos(self.0.load(Ordering::SeqCst))
+    }
+}
+
+// Advances the authority clock after the domain buffers its outcome, just
+// before the final gated lease decision.
+struct AdvanceAtOutcome {
+    inner: Arc<ToyKvMetadataAuthority>,
+    clock: Arc<TestClock>,
+    advance_to: AtomicU64,
+}
+
+struct AdvanceAtOutcomeTxn<'a> {
+    inner: &'a mut dyn MetadataTxn,
+    outcome_key: &'a [u8],
+    clock: &'a TestClock,
+    advance_to: &'a AtomicU64,
+}
+
+impl MetadataTxn for AdvanceAtOutcomeTxn<'_> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+        self.inner.get(key)
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), MetadataError> {
+        self.inner.put(key, value)?;
+        if key == self.outcome_key {
+            let deadline = self.advance_to.swap(0, Ordering::SeqCst);
+            if deadline != 0 {
+                self.clock.set(deadline);
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), MetadataError> {
+        self.inner.delete(key)
+    }
+
+    fn now(&self) -> MonotonicTime {
+        self.inner.now()
+    }
+}
+
+impl MetadataAuthority for AdvanceAtOutcome {
+    type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+        self.inner.get(key)
+    }
+
+    fn transact<R, F>(
+        &self,
+        operation: MutationIdentity<'_>,
+        mut body: F,
+    ) -> Result<R, MetadataError>
+    where
+        F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+    {
+        self.inner.transact(operation, |txn| {
+            body(&mut AdvanceAtOutcomeTxn {
+                inner: txn,
+                outcome_key: operation.outcome_key,
+                clock: &self.clock,
+                advance_to: &self.advance_to,
+            })
+        })
+    }
+
+    fn reconcile_unknown(
+        &self,
+        operation: MutationIdentity<'_>,
+    ) -> Result<ReconciledOutcome, MetadataError> {
+        self.inner.reconcile_unknown(operation)
+    }
+
+    fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+        self.inner.snapshot()
+    }
+
+    fn scan_prefix(
+        &self,
+        snapshot: &Self::Snapshot,
+        prefix: &[u8],
+        cursor: Option<&MetadataCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<MetadataPage, MetadataError> {
+        self.inner.scan_prefix(snapshot, prefix, cursor, limit)
     }
 }
 
@@ -218,6 +310,47 @@ impl TestEnv {
             .seal_capture(op(251), capture_id, 1, grant)
             .expect("seal capture");
     }
+}
+
+fn advancing_control(env: &TestEnv) -> (Arc<AdvanceAtOutcome>, WorkspaceControl<AdvanceAtOutcome>) {
+    let authority = Arc::new(AdvanceAtOutcome {
+        inner: Arc::clone(&env.authority),
+        clock: Arc::clone(&env.clock),
+        advance_to: AtomicU64::new(0),
+    });
+    let control = WorkspaceControl::new(
+        Arc::clone(&authority),
+        env.workspace_id,
+        ObjectStoreScopeId::from_bytes([0xD4; 16]),
+        env.principal_id,
+        env.owner,
+    );
+    (authority, control)
+}
+
+fn maintain_leases(
+    env: &TestEnv,
+    mut grant: versionfs_core::control::WriterGrant,
+    steps: u8,
+    renew_attachment: bool,
+) -> versionfs_core::control::WriterGrant {
+    for step in 1..=steps {
+        env.clock.set(u64::from(step) * 20_000_000_000);
+        grant = env.control.renew_writer(op(100 + step), grant).unwrap();
+        if renew_attachment && step % 14 == 0 {
+            env.control
+                .renew_attachment_base(
+                    op(200 + step / 14),
+                    branch(1),
+                    attachment(1),
+                    1,
+                    protection(1),
+                    grant,
+                )
+                .unwrap();
+        }
+    }
+    grant
 }
 
 #[test]
@@ -829,6 +962,292 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
         env.control
             .mark_generation_unretained(op(31), generation(2)),
         Err(ControlError::Busy)
+    );
+}
+
+#[test]
+fn capture_publication_rechecks_each_lease_after_buffering_its_outcome() {
+    for lease in ["writer", "attachment", "preparation"] {
+        let mut store = TestObjectStore::default();
+        let initial = empty_generation(&mut store, generation(1), 70);
+        let child = create_generation(
+            &mut store,
+            generation(2),
+            Some(generation(1)),
+            initial.roots,
+            CaptureMode::BlockCut,
+            VolumeBoundaryId::from_bytes(id(71)),
+            71,
+        )
+        .unwrap();
+        let env = TestEnv::with_initial_seed(initial);
+        let mut grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+        match lease {
+            "attachment" => grant = maintain_leases(&env, grant, 14, false),
+            "preparation" => grant = maintain_leases(&env, grant, 29, true),
+            _ => {}
+        }
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let preparation_deadline = match env.control.get_operation(capture_id).unwrap() {
+            OperationState::Preparing { expires_at, .. } => expires_at,
+            other => panic!("unexpected capture state: {other:?}"),
+        };
+        let attachment_deadline = before.attachment.unwrap().protection_expires_at;
+        let deadline = match lease {
+            "writer" => grant.expires_at,
+            "attachment" => attachment_deadline,
+            _ => preparation_deadline,
+        };
+        assert_eq!(
+            deadline,
+            grant
+                .expires_at
+                .min(attachment_deadline)
+                .min(preparation_deadline)
+        );
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(deadline.as_nanos(), Ordering::SeqCst);
+
+        assert_eq!(
+            control.publish_capture(
+                capture_id,
+                1,
+                generation(1),
+                grant,
+                attachment(1),
+                1,
+                child,
+                true,
+            ),
+            Err(ControlError::Expired),
+            "{lease} expired before the commit decision"
+        );
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert!(matches!(
+            env.control.get_operation(capture_id),
+            Ok(OperationState::Preparing { .. })
+        ));
+        assert_eq!(
+            env.control
+                .open_generation(op(80), generation(2), protection(80)),
+            Err(ControlError::NotFound)
+        );
+    }
+}
+
+#[test]
+fn committed_capture_replays_after_lease_expiry_when_the_reply_was_lost() {
+    let mut store = TestObjectStore::default();
+    let initial = empty_generation(&mut store, generation(1), 72);
+    let child = create_generation(
+        &mut store,
+        generation(2),
+        Some(generation(1)),
+        initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(73)),
+        73,
+    )
+    .unwrap();
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(30);
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            child.clone(),
+            true
+        ),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+
+    env.clock.set(grant.expires_at.as_nanos());
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            child,
+            true,
+        )
+        .expect("reconcile a committed capture after lease expiry");
+    assert_eq!(published.branch.head, generation(2));
+}
+
+#[test]
+fn live_root_commit_and_child_renewal_recheck_parent_capture_deadlines() {
+    for (parent_capture, renew_child) in [(false, false), (true, false), (true, true)] {
+        let env = TestEnv::new();
+        let mut grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        if parent_capture {
+            env.control
+                .begin_preparation(PreparationRequest {
+                    operation_id: capture_id,
+                    branch_id: branch(1),
+                    expected_revision: 1,
+                    grant,
+                    attachment_id: attachment(1),
+                    volume_epoch: 1,
+                    protection_id: protection(30),
+                    kind: PreparationKind::CheckpointCapture,
+                    expected_roots: None,
+                    dependencies: vec![],
+                })
+                .unwrap();
+            grant = maintain_leases(&env, grant, 29, true);
+            env.control
+                .authorize_capture_child(op(31), capture_id, op(32), grant)
+                .unwrap();
+        }
+        let barrier_id = if parent_capture { op(32) } else { op(5) };
+        let next_roots = replace_volume_root(roots(1), 9);
+        env.control
+            .begin_preparation(PreparationRequest {
+                operation_id: barrier_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(32),
+                kind: PreparationKind::VolumeBarrier,
+                expected_roots: Some(next_roots),
+                dependencies: vec![],
+            })
+            .unwrap();
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let before_operation = env.control.get_operation(barrier_id).unwrap();
+        let deadline = if parent_capture {
+            match env.control.get_operation(capture_id).unwrap() {
+                OperationState::Preparing { expires_at, .. } => expires_at,
+                other => panic!("unexpected capture state: {other:?}"),
+            }
+        } else {
+            grant.expires_at
+        };
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(deadline.as_nanos(), Ordering::SeqCst);
+        let child = parent_capture.then_some((capture_id, barrier_id));
+        let result = if renew_child {
+            control
+                .renew_preparation(op(33), barrier_id, grant)
+                .map(|_| ())
+        } else {
+            control
+                .commit_live_roots(barrier_id, 1, grant, next_roots, child)
+                .map(|_| ())
+        };
+        assert_eq!(result, Err(ControlError::Expired));
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert_eq!(env.control.get_operation(barrier_id), Ok(before_operation));
+    }
+}
+
+#[test]
+fn lease_dependent_control_operations_recheck_after_buffering_outcomes() {
+    for action in [
+        "renew_writer",
+        "begin",
+        "renew_preparation",
+        "authorize",
+        "seal",
+    ] {
+        let env = TestEnv::new();
+        let grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        let request = |operation_id| PreparationRequest {
+            operation_id,
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(30),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        };
+        let existing_capture = !matches!(action, "renew_writer" | "begin");
+        if existing_capture {
+            env.control.begin_preparation(request(capture_id)).unwrap();
+        }
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let previous_capture =
+            existing_capture.then(|| env.control.get_operation(capture_id).unwrap());
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(grant.expires_at.as_nanos(), Ordering::SeqCst);
+        let operation_id = op(40);
+        let result = match action {
+            "renew_writer" => control.renew_writer(operation_id, grant).map(|_| ()),
+            "begin" => control.begin_preparation(request(operation_id)).map(|_| ()),
+            "renew_preparation" => control
+                .renew_preparation(operation_id, capture_id, grant)
+                .map(|_| ()),
+            "authorize" => control.authorize_capture_child(operation_id, capture_id, op(41), grant),
+            "seal" => control
+                .seal_capture(operation_id, capture_id, 1, grant)
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert_eq!(result, Err(ControlError::Expired), "{action}");
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert_eq!(
+            env.control.get_operation(operation_id),
+            Err(ControlError::NotFound)
+        );
+        if let Some(previous) = previous_capture {
+            assert_eq!(env.control.get_operation(capture_id), Ok(previous));
+        }
+    }
+}
+
+#[test]
+fn reader_protection_does_not_open_or_renew_after_its_deadline() {
+    let env = TestEnv::new();
+    let (authority, control) = advancing_control(&env);
+    authority.advance_to.store(
+        versionfs_core::control::READER_PROTECTION_NANOS,
+        Ordering::SeqCst,
+    );
+    assert_eq!(
+        control.open_generation(op(50), generation(1), protection(50)),
+        Err(ControlError::Expired)
+    );
+    let deadline = env
+        .control
+        .open_generation(op(51), generation(1), protection(50))
+        .expect("failed open left no protection claim");
+    authority
+        .advance_to
+        .store(deadline.as_nanos(), Ordering::SeqCst);
+    assert_eq!(
+        control.renew_protection(op(52), protection(50)),
+        Err(ControlError::Expired)
+    );
+    assert_eq!(
+        env.control.get_operation(op(52)),
+        Err(ControlError::NotFound)
     );
 }
 

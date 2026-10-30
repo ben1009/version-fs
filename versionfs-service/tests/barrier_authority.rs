@@ -62,16 +62,34 @@ impl Clock for TestClock {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MemoryObjects {
+    scope: ObjectStoreScopeId,
     objects: Arc<Mutex<HashMap<ObjectId, Vec<u8>>>>,
     failures: Arc<OneShotFailures>,
     arm_on_upload: Arc<Mutex<Option<FailurePoint>>>,
 }
 
+impl Default for MemoryObjects {
+    fn default() -> Self {
+        Self::with_scope(ObjectStoreScopeId::from_bytes([0xA6; 16]))
+    }
+}
+
+impl MemoryObjects {
+    fn with_scope(scope: ObjectStoreScopeId) -> Self {
+        Self {
+            scope,
+            objects: Arc::new(Mutex::new(HashMap::new())),
+            failures: Arc::new(OneShotFailures::default()),
+            arm_on_upload: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 impl MapObjectStore for MemoryObjects {
     fn proof_scope(&self) -> ObjectStoreScopeId {
-        ObjectStoreScopeId::from_bytes([0xA6; 16])
+        self.scope
     }
 
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
@@ -242,6 +260,36 @@ fn workspace_initialization_rejects_a_mismatched_object_store_namespace() {
     assert_eq!(
         mismatched_control.get_branch(BranchId::from_bytes([44; 16])),
         Err(ControlError::NotFound)
+    );
+}
+
+#[test]
+fn volume_open_rejects_a_different_store_even_with_identical_base_objects() {
+    let fixture = Fixture::new();
+    let foreign = MemoryObjects::with_scope(ObjectStoreScopeId::from_bytes([0xA7; 16]));
+    *foreign.objects.lock().unwrap() = fixture.store.objects.lock().unwrap().clone();
+    let workspace_control = control(fixture.authority.clone(), fixture.owner);
+    let before = workspace_control.get_branch(branch()).unwrap();
+    assert!(foreign.get(before.volume_root.object_id).unwrap().is_some());
+
+    let result = DurableVolume::open(
+        foreign,
+        workspace_control,
+        FileBarrierJournal::open(&fixture.journal_path).unwrap(),
+        branch(),
+        fixture.grant,
+        attachment(),
+        EXTENT_BYTES as usize,
+    );
+    assert!(matches!(
+        result,
+        Err(BarrierError::ObjectStoreScopeMismatch)
+    ));
+    assert_eq!(
+        control(fixture.authority.clone(), fixture.owner)
+            .get_branch(branch())
+            .unwrap(),
+        before
     );
 }
 
