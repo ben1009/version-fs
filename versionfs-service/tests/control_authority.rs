@@ -50,20 +50,37 @@ impl Drop for TestDir {
     }
 }
 
-#[derive(Default)]
-struct TestObjectStore(HashMap<ObjectId, Vec<u8>>);
+struct TestObjectStore {
+    objects: HashMap<ObjectId, Vec<u8>>,
+    scope: ObjectStoreScopeId,
+}
+
+impl Default for TestObjectStore {
+    fn default() -> Self {
+        Self::with_scope(ObjectStoreScopeId::from_bytes([0xD4; 16]))
+    }
+}
+
+impl TestObjectStore {
+    fn with_scope(scope: ObjectStoreScopeId) -> Self {
+        Self {
+            objects: HashMap::new(),
+            scope,
+        }
+    }
+}
 
 impl MapObjectStore for TestObjectStore {
     fn proof_scope(&self) -> ObjectStoreScopeId {
-        ObjectStoreScopeId::from_bytes([0xD4; 16])
+        self.scope
     }
 
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.0.get(&id).cloned())
+        Ok(self.objects.get(&id).cloned())
     }
 
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
-        self.0.insert(id, bytes);
+        self.objects.insert(id, bytes);
         Ok(())
     }
 }
@@ -73,13 +90,13 @@ impl DurableObjectStore for TestObjectStore {
         reference
             .verify(encoded)
             .map_err(|error| format!("invalid durable test object: {error}"))?;
-        match self.0.get(&reference.object_id) {
+        match self.objects.get(&reference.object_id) {
             Some(existing) if existing != encoded => {
                 Err("immutable test object ID was reused with different bytes".to_owned())
             }
             Some(_) => Ok(()),
             None => {
-                self.0.insert(reference.object_id, encoded.to_vec());
+                self.objects.insert(reference.object_id, encoded.to_vec());
                 Ok(())
             }
         }
@@ -498,7 +515,13 @@ fn control_for(
     principal_id: PrincipalId,
     owner: versionfs_core::control::OwnerIncarnation,
 ) -> WorkspaceControl<ToyKvMetadataAuthority> {
-    WorkspaceControl::new(authority, workspace_id, principal_id, owner)
+    WorkspaceControl::new(
+        authority,
+        workspace_id,
+        ObjectStoreScopeId::from_bytes([0xD4; 16]),
+        principal_id,
+        owner,
+    )
 }
 
 fn id<const N: usize>(byte: u8) -> [u8; N] {
@@ -807,6 +830,49 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
             .mark_generation_unretained(op(31), generation(2)),
         Err(ControlError::Busy)
     );
+}
+
+#[test]
+fn capture_publication_rejects_a_verified_graph_from_another_object_namespace() {
+    let mut target_store = TestObjectStore::default();
+    let initial = empty_generation(&mut target_store, generation(1), 60);
+    let env = TestEnv::with_initial_seed(initial.clone());
+    let grant = env.writer_and_attachment();
+    let capture_id = op(61);
+    env.start_sealed_capture(capture_id, protection(61), grant, initial.roots);
+
+    let mut foreign_store = TestObjectStore::with_scope(ObjectStoreScopeId::from_bytes([0xD5; 16]));
+    let foreign_initial = empty_generation(&mut foreign_store, generation(1), 60);
+    assert_eq!(foreign_initial.roots, initial.roots);
+    let foreign_generation = create_generation(
+        &mut foreign_store,
+        generation(2),
+        Some(generation(1)),
+        foreign_initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(62)),
+        62,
+    )
+    .expect("verify child Generation in foreign object namespace");
+
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            foreign_generation,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_some());
+    assert!(matches!(
+        env.control.get_operation(capture_id),
+        Ok(OperationState::Preparing { operation_id, .. }) if operation_id == capture_id
+    ));
 }
 
 #[test]

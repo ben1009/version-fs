@@ -55,6 +55,11 @@ impl std::fmt::Debug for DependencyProof {
 }
 
 impl DependencyProof {
+    /// Returns the immutable-object namespace in which the graph was verified.
+    pub const fn store_scope(&self) -> ObjectStoreScopeId {
+        self.store_scope
+    }
+
     /// Returns the verified Generation descriptor object.
     pub const fn descriptor(&self) -> ObjectRef {
         self.descriptor

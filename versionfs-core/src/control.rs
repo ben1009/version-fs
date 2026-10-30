@@ -16,8 +16,8 @@ use crate::{
     },
     graph::DependencyProof,
     identity::{
-        AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
-        WorkspaceId,
+        AttachmentId, BranchId, GenerationId, ObjectStoreScopeId, OperationId, PinId, PrincipalId,
+        ProtectionId, WorkspaceId,
     },
     metadata::{
         MetadataAuthority, MetadataError, MetadataTxn, MutationIdentity, ReconciledOutcome,
@@ -285,6 +285,11 @@ impl VerifiedGenerationSeed {
     pub const fn descriptor(&self) -> GenerationDescriptor {
         self.proof.generation_descriptor()
     }
+
+    /// Returns the immutable-object namespace in which this graph was verified.
+    pub const fn store_scope(&self) -> ObjectStoreScopeId {
+        self.proof.store_scope()
+    }
 }
 
 /// Result of atomically publishing a sealed checkpoint capture.
@@ -439,28 +444,38 @@ fn decode_owner_start_result(
 pub struct WorkspaceControl<A> {
     authority: Arc<A>,
     workspace_id: WorkspaceId,
+    object_store_scope: ObjectStoreScopeId,
     principal_id: PrincipalId,
     owner_incarnation: OwnerIncarnation,
 }
 
 impl<A: MetadataAuthority> WorkspaceControl<A> {
-    /// Creates a client for one workspace, caller scope, and owner epoch.
+    /// Creates a client for one workspace, object namespace, caller, and owner epoch.
     ///
     /// This handle enforces protocol fencing, not user authorization. Callers
     /// must authenticate and authorize the workspace and principal before
-    /// constructing it; its IDs are scope inputs, not credentials.
+    /// constructing it; its IDs are scope inputs, not credentials. The supplied
+    /// object-store scope must identify the immutable namespace configured for
+    /// this workspace.
     pub fn new(
         authority: Arc<A>,
         workspace_id: WorkspaceId,
+        object_store_scope: ObjectStoreScopeId,
         principal_id: PrincipalId,
         owner_incarnation: OwnerIncarnation,
     ) -> Self {
         Self {
             authority,
             workspace_id,
+            object_store_scope,
             principal_id,
             owner_incarnation,
         }
+    }
+
+    /// Returns the immutable-object namespace configured for this workspace.
+    pub const fn object_store_scope(&self) -> ObjectStoreScopeId {
+        self.object_store_scope
     }
 
     /// Creates a workspace and its first branch after the initial Generation is durable.
@@ -1970,6 +1985,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         generation: VerifiedGenerationSeed,
         advance_head: bool,
     ) -> Result<PublishedGeneration, ControlError> {
+        if generation.store_scope() != self.object_store_scope {
+            return Err(ControlError::InvalidTransition);
+        }
         if generation.descriptor().parent_generation_id != Some(expected_parent) {
             return Err(ControlError::InvalidTransition);
         }

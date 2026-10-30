@@ -179,9 +179,18 @@ fn control(
     authority: Arc<ToyKvMetadataAuthority>,
     owner: OwnerIncarnation,
 ) -> WorkspaceControl<ToyKvMetadataAuthority> {
+    control_with_scope(authority, owner, ObjectStoreScopeId::from_bytes([0xA6; 16]))
+}
+
+fn control_with_scope(
+    authority: Arc<ToyKvMetadataAuthority>,
+    owner: OwnerIncarnation,
+    object_store_scope: ObjectStoreScopeId,
+) -> WorkspaceControl<ToyKvMetadataAuthority> {
     WorkspaceControl::new(
         authority,
         WorkspaceId::from_bytes([1; 16]),
+        object_store_scope,
         PrincipalId::from_bytes([1; 16]),
         owner,
     )
@@ -197,6 +206,43 @@ fn branch() -> BranchId {
 
 fn attachment() -> AttachmentId {
     AttachmentId::from_bytes([1; 16])
+}
+
+#[test]
+fn workspace_initialization_rejects_a_mismatched_object_store_namespace() {
+    let fixture = Fixture::new();
+    let mut store = fixture.store.clone();
+    let before = store.objects.lock().unwrap().len();
+    let mismatched_control = control_with_scope(
+        fixture.authority.clone(),
+        fixture.owner,
+        ObjectStoreScopeId::from_bytes([0xA7; 16]),
+    );
+
+    assert!(matches!(
+        initialize_empty_workspace(
+            &mut store,
+            &mismatched_control,
+            op(40),
+            GenerationId::from_bytes([41; 16]),
+            VolumeBoundaryId::from_bytes([42; 16]),
+            VolumeGeometry::new(4 * u64::from(EXTENT_BYTES)).unwrap(),
+            43,
+            BranchId::from_bytes([44; 16]),
+            "wrong-store",
+            60_000,
+            op(45),
+            op(46),
+            AttachmentId::from_bytes([47; 16]),
+            ProtectionId::from_bytes([48; 16]),
+        ),
+        Err(BarrierError::ObjectStoreScopeMismatch)
+    ));
+    assert_eq!(store.objects.lock().unwrap().len(), before);
+    assert_eq!(
+        mismatched_control.get_branch(BranchId::from_bytes([44; 16])),
+        Err(ControlError::NotFound)
+    );
 }
 
 #[test]

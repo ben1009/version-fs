@@ -912,6 +912,9 @@ pub enum BarrierError {
     /// The object store failed to establish durable immutable content.
     #[error("durable object-store write failed: {0}")]
     ObjectStore(String),
+    /// The object store does not match the namespace configured for the workspace.
+    #[error("object-store namespace does not match the workspace")]
+    ObjectStoreScopeMismatch,
     /// The local recovery journal failed.
     #[error("barrier recovery journal failed: {0}")]
     Journal(String),
@@ -1037,6 +1040,8 @@ pub fn create_generation<S: DurableObjectStore>(
 }
 
 /// Creates a zero-volume workspace, acquires a writer, and protects its base.
+/// The object's proof scope must match the scope configured on `control` for
+/// this workspace.
 #[allow(clippy::too_many_arguments)]
 pub fn initialize_empty_workspace<S: DurableObjectStore, A: MetadataAuthority>(
     store: &mut S,
@@ -1054,6 +1059,10 @@ pub fn initialize_empty_workspace<S: DurableObjectStore, A: MetadataAuthority>(
     attachment_id: AttachmentId,
     attachment_protection_id: ProtectionId,
 ) -> Result<InitializedVolumeWorkspace, BarrierError> {
+    if store.proof_scope() != control.object_store_scope() {
+        return Err(BarrierError::ObjectStoreScopeMismatch);
+    }
+
     let initial = create_empty_generation(
         store,
         generation_id,
