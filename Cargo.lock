@@ -2882,7 +2882,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "libublk",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "versionfs-core",
 ]
@@ -2895,7 +2895,7 @@ dependencies = [
  "futures-util",
  "kv-engine",
  "object_store",
- "sha2 0.10.9",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
  "tokio",
  "versionfs-core",
