@@ -6,6 +6,8 @@ use std::fmt;
 
 /// First durable object encoding version. It is independent of the product MVP version.
 pub const FORMAT_VERSION: u16 = 1;
+/// Generation descriptor format version with explicit provenance binding.
+pub const GENERATION_DESCRIPTOR_FORMAT_VERSION: u16 = 2;
 /// First durable Metadata Authority value schema version.
 pub const METADATA_SCHEMA_VERSION: u16 = 1;
 /// Maximum canonical object payload, matching the largest v0 artifact chunk.
@@ -24,6 +26,8 @@ pub const MAX_PERSISTENT_NODE_BYTES: usize = 64 * 1024;
 pub const ARTIFACT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum payload kept in one inline artifact blob before chunk indexing is used.
 pub const MAX_ARTIFACT_BLOB_BYTES: usize = 64 * 1024;
+/// Maximum complete encoded provenance context object, including its envelope.
+pub const MAX_PROVENANCE_CONTEXT_BYTES: usize = 64 * 1024;
 
 const OBJECT_MAGIC: [u8; 4] = *b"VFSO";
 const METADATA_MAGIC: [u8; 4] = *b"VFSM";
@@ -64,6 +68,8 @@ pub enum ObjectType {
     LogMapNode = 12,
     /// A persistent ordered named-artifact map node.
     ArtifactMapNode = 13,
+    /// Bounded Generation provenance context and required-evidence roots.
+    ProvenanceContext = 14,
 }
 
 impl TryFrom<u16> for ObjectType {
@@ -84,6 +90,7 @@ impl TryFrom<u16> for ObjectType {
             11 => Ok(Self::GenerationDescriptor),
             12 => Ok(Self::LogMapNode),
             13 => Ok(Self::ArtifactMapNode),
+            14 => Ok(Self::ProvenanceContext),
             other => Err(FormatError::UnknownObjectType(other)),
         }
     }
@@ -173,6 +180,13 @@ pub enum FormatError {
     InvalidEnvelope(&'static str),
     /// The object format version is not supported by this implementation.
     UnsupportedFormatVersion(u16),
+    /// The object type is not encoded using the requested format version.
+    UnsupportedObjectVersion {
+        /// Unsupported envelope version.
+        version: u16,
+        /// Object kind from the envelope.
+        object_type: ObjectType,
+    },
     /// The metadata schema version is not supported by this implementation.
     UnsupportedMetadataSchema(u16),
     /// The object type code is unknown.
@@ -195,6 +209,8 @@ pub enum FormatError {
     InvalidNativeView(&'static str),
     /// A Generation descriptor is invalid.
     InvalidGenerationDescriptor(&'static str),
+    /// A Generation provenance context or binding is invalid.
+    InvalidProvenance(&'static str),
 }
 
 impl fmt::Display for FormatError {
@@ -213,6 +229,13 @@ impl fmt::Display for FormatError {
             Self::UnsupportedFormatVersion(version) => {
                 write!(formatter, "unsupported object format version {version}")
             }
+            Self::UnsupportedObjectVersion {
+                version,
+                object_type,
+            } => write!(
+                formatter,
+                "object type {object_type:?} is unsupported in format version {version}"
+            ),
             Self::UnsupportedMetadataSchema(version) => {
                 write!(formatter, "unsupported metadata schema version {version}")
             }
@@ -240,11 +263,22 @@ impl fmt::Display for FormatError {
             Self::InvalidGenerationDescriptor(reason) => {
                 write!(formatter, "invalid Generation descriptor: {reason}")
             }
+            Self::InvalidProvenance(reason) => {
+                write!(formatter, "invalid Generation provenance: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for FormatError {}
+
+#[path = "format/provenance.rs"]
+mod provenance;
+pub use provenance::{
+    DecodedGenerationDescriptor, GenerationDescriptorFormat, GenerationDescriptorV2,
+    ProvenanceBinding, ProvenanceContext, ProvenanceCoverage, ProvenanceStatus,
+    decode_generation_descriptor,
+};
 
 /// Canonical uncompressed object envelope and payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -271,7 +305,7 @@ pub struct ObjectRef {
 impl ObjectRef {
     /// Builds a reference from validated encoded bytes.
     pub fn from_encoded(bytes: &[u8]) -> Result<Self, FormatError> {
-        let object = decode_object(bytes)?;
+        let object = decode_object_versioned(bytes)?;
         Ok(Self {
             object_type: object.object_type,
             object_id: object_id(bytes),
@@ -284,7 +318,7 @@ impl ObjectRef {
         if bytes.len() as u64 != self.encoded_len || object_id(bytes) != self.object_id {
             return Err(FormatError::ObjectReferenceMismatch);
         }
-        let object = decode_object(bytes)?;
+        let object = decode_object_versioned(bytes)?;
         if object.object_type != self.object_type {
             return Err(FormatError::ObjectReferenceMismatch);
         }
@@ -309,6 +343,16 @@ impl ObjectRef {
 
 /// Encodes an object envelope with a stable type, version, and declared payload length.
 pub fn encode_object(object_type: ObjectType, payload: &[u8]) -> Result<Vec<u8>, FormatError> {
+    encode_object_versioned(FORMAT_VERSION, object_type, payload)
+}
+
+/// Encodes one supported version/type pair using the canonical object envelope.
+pub(crate) fn encode_object_versioned(
+    version: u16,
+    object_type: ObjectType,
+    payload: &[u8],
+) -> Result<Vec<u8>, FormatError> {
+    validate_object_version(version, object_type)?;
     if payload.len() > MAX_OBJECT_PAYLOAD_BYTES {
         return Err(FormatError::PayloadTooLarge {
             actual: payload.len(),
@@ -317,15 +361,32 @@ pub fn encode_object(object_type: ObjectType, payload: &[u8]) -> Result<Vec<u8>,
     }
     let mut bytes = Vec::with_capacity(ENVELOPE_HEADER_BYTES + payload.len());
     bytes.extend_from_slice(&OBJECT_MAGIC);
-    bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&version.to_le_bytes());
     bytes.extend_from_slice(&(object_type as u16).to_le_bytes());
     bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
     bytes.extend_from_slice(payload);
     Ok(bytes)
 }
 
-/// Decodes and validates an object envelope, rejecting trailing or missing bytes.
+/// Decodes a v1 object envelope, rejecting trailing or missing bytes.
+///
+/// Versioned Generation descriptor reads use [`decode_object_versioned`].
 pub fn decode_object(bytes: &[u8]) -> Result<EncodedObject<'_>, FormatError> {
+    decode_object_with_versions(bytes, false)
+}
+
+/// Decodes an object using the current version/type dispatch table.
+///
+/// Unlike [`decode_object`], this accepts v2 Generation descriptors. All other
+/// supported object kinds remain on v1.
+pub fn decode_object_versioned(bytes: &[u8]) -> Result<EncodedObject<'_>, FormatError> {
+    decode_object_with_versions(bytes, true)
+}
+
+fn decode_object_with_versions(
+    bytes: &[u8],
+    allow_v2_generation_descriptor: bool,
+) -> Result<EncodedObject<'_>, FormatError> {
     if bytes.len() < ENVELOPE_HEADER_BYTES {
         return Err(FormatError::TruncatedEnvelope);
     }
@@ -333,10 +394,20 @@ pub fn decode_object(bytes: &[u8]) -> Result<EncodedObject<'_>, FormatError> {
         return Err(FormatError::InvalidEnvelope("wrong object magic"));
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if version != FORMAT_VERSION {
-        return Err(FormatError::UnsupportedFormatVersion(version));
-    }
     let object_type = ObjectType::try_from(u16::from_le_bytes([bytes[6], bytes[7]]))?;
+    match version {
+        FORMAT_VERSION => {}
+        GENERATION_DESCRIPTOR_FORMAT_VERSION
+            if allow_v2_generation_descriptor
+                && object_type == ObjectType::GenerationDescriptor => {}
+        GENERATION_DESCRIPTOR_FORMAT_VERSION => {
+            return Err(FormatError::UnsupportedObjectVersion {
+                version,
+                object_type,
+            });
+        }
+        other => return Err(FormatError::UnsupportedFormatVersion(other)),
+    }
     let payload_len = u64::from_le_bytes(bytes[8..16].try_into().expect("fixed header slice"));
     let payload_len = usize::try_from(payload_len)
         .map_err(|_| FormatError::InvalidEnvelope("declared length does not fit this platform"))?;
@@ -356,6 +427,20 @@ pub fn decode_object(bytes: &[u8]) -> Result<EncodedObject<'_>, FormatError> {
         object_type,
         payload: &bytes[ENVELOPE_HEADER_BYTES..],
     })
+}
+
+fn validate_object_version(version: u16, object_type: ObjectType) -> Result<(), FormatError> {
+    match version {
+        FORMAT_VERSION => Ok(()),
+        GENERATION_DESCRIPTOR_FORMAT_VERSION if object_type == ObjectType::GenerationDescriptor => {
+            Ok(())
+        }
+        GENERATION_DESCRIPTOR_FORMAT_VERSION => Err(FormatError::UnsupportedObjectVersion {
+            version,
+            object_type,
+        }),
+        other => Err(FormatError::UnsupportedFormatVersion(other)),
+    }
 }
 
 /// Computes the SHA-256 object identity over the complete encoded envelope.

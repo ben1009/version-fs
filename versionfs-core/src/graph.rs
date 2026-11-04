@@ -2,8 +2,9 @@
 
 use crate::format::{
     ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot, CaptureMode,
-    EXTENT_BYTES, FormatError, GenerationDescriptor, LogMapEntry, LogMapRoot, LogSegment,
-    MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, SegmentIndexEntry, VolumeRoot, decode_object,
+    DecodedGenerationDescriptor, EXTENT_BYTES, FormatError, LogMapEntry, LogMapRoot, LogSegment,
+    MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, ProvenanceContext, SegmentIndexEntry,
+    VolumeRoot, decode_generation_descriptor, decode_object,
 };
 use crate::identity::{LogId, ObjectId, ObjectStoreScopeId};
 use crate::persistent_map::{MapObjectStore, Node as MapNode, PersistentMapError, load_node};
@@ -36,7 +37,7 @@ pub enum GraphError {
 #[derive(Clone)]
 pub struct DependencyProof {
     descriptor: ObjectRef,
-    generation_descriptor: GenerationDescriptor,
+    generation_descriptor: DecodedGenerationDescriptor,
     root: Arc<VerifiedNode>,
     index: Arc<ProofIndex>,
     store_scope: ObjectStoreScopeId,
@@ -48,7 +49,7 @@ impl std::fmt::Debug for DependencyProof {
         formatter
             .debug_struct("DependencyProof")
             .field("descriptor", &self.descriptor)
-            .field("capture_mode", &self.generation_descriptor.capture_mode)
+            .field("capture_mode", &self.generation_descriptor.capture_mode())
             .field("store_scope", &self.store_scope)
             .finish_non_exhaustive()
     }
@@ -67,11 +68,11 @@ impl DependencyProof {
 
     /// Returns the exact capture mode recorded in the verified descriptor.
     pub const fn capture_mode(&self) -> CaptureMode {
-        self.generation_descriptor.capture_mode
+        self.generation_descriptor.capture_mode()
     }
 
     /// Returns the exact descriptor payload validated by this proof.
-    pub const fn generation_descriptor(&self) -> GenerationDescriptor {
+    pub const fn generation_descriptor(&self) -> DecodedGenerationDescriptor {
         self.generation_descriptor
     }
 
@@ -126,8 +127,9 @@ enum VerifiedSummary {
         end_seq: u64,
     },
     Descriptor {
-        descriptor: GenerationDescriptor,
+        descriptor: DecodedGenerationDescriptor,
     },
+    ProvenanceContext,
     Payload {
         payload_len: u64,
     },
@@ -508,14 +510,42 @@ impl<S: MapObjectStore> Verifier<'_, S> {
             return Err(FormatError::ObjectReferenceMismatch.into());
         }
         self.begin(reference)?;
-        let descriptor = GenerationDescriptor::decode(&self.object_bytes(reference)?)?;
-        let volume = self.verify_volume(descriptor.volume_root)?;
-        let logs = self.verify_logs(descriptor.logs_root)?;
-        let artifacts = self.verify_artifacts(descriptor.artifacts_root)?;
+        let descriptor = decode_generation_descriptor(&self.object_bytes(reference)?)?;
+        let volume = self.verify_volume(descriptor.volume_root())?;
+        let logs = self.verify_logs(descriptor.logs_root())?;
+        let artifacts = self.verify_artifacts(descriptor.artifacts_root())?;
+        let mut children = vec![volume, logs, artifacts];
+        if let Some(context_root) = descriptor.context_root() {
+            children.push(self.verify_provenance_context(context_root)?);
+        }
         Ok(self.finish(
             reference,
             VerifiedSummary::Descriptor { descriptor },
-            vec![volume, logs, artifacts],
+            children,
+        ))
+    }
+
+    fn verify_provenance_context(
+        &mut self,
+        reference: ObjectRef,
+    ) -> Result<Arc<VerifiedNode>, GraphError> {
+        if reference.object_type != ObjectType::ProvenanceContext {
+            return Err(FormatError::ObjectReferenceMismatch.into());
+        }
+        if let Some(node) = self.reusable(reference)? {
+            if matches!(&node.summary, VerifiedSummary::ProvenanceContext) {
+                return Ok(node);
+            }
+            return Err(FormatError::ObjectReferenceMismatch.into());
+        }
+        self.begin(reference)?;
+        let context = ProvenanceContext::decode(&self.object_bytes(reference)?)?;
+        let logs = self.verify_logs(context.required_logs_root)?;
+        let artifacts = self.verify_artifacts(context.required_artifacts_root)?;
+        Ok(self.finish(
+            reference,
+            VerifiedSummary::ProvenanceContext,
+            vec![logs, artifacts],
         ))
     }
 
@@ -954,11 +984,13 @@ mod tests {
     use super::{GraphError, verify_generation, verify_generation_with_reuse};
     use crate::format::{
         ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot,
-        CanonicalEncoder, CaptureMode, GenerationDescriptor, LogMapEntry, LogSegment, ObjectRef,
-        ObjectType, SegmentIndexEntry, VolumeGeometry, VolumeRoot, encode_object,
+        CanonicalEncoder, CaptureMode, GenerationDescriptor, GenerationDescriptorV2, LogMapEntry,
+        LogSegment, ObjectRef, ObjectType, ProvenanceBinding, ProvenanceContext, SegmentIndexEntry,
+        VolumeGeometry, VolumeRoot, encode_object,
     };
     use crate::identity::{
-        ArtifactId, GenerationId, LogId, ObjectId, ObjectStoreScopeId, VolumeBoundaryId,
+        ArtifactId, GenerationId, LogId, ObjectId, ObjectStoreScopeId, PrincipalId,
+        VolumeBoundaryId,
     };
     use crate::persistent_map::MapObjectStore;
     use crate::views::{
@@ -1516,6 +1548,132 @@ mod tests {
                 .iter()
                 .any(|object| object == &artifact_blob)
         );
+    }
+
+    #[test]
+    fn recorded_generation_proves_required_evidence_outside_its_view_roots() {
+        let mut store = MemoryStore::default();
+        let geometry = VolumeGeometry::new(4 * 1024 * 1024).unwrap();
+        let volume_root = VolumeExtentMap::empty(geometry, &mut store)
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+        let logs_root = LogMap::empty(&mut store).unwrap().seal(&mut store).unwrap();
+        let visible_artifacts = ArtifactMap::empty(&mut store)
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+
+        let evidence_log_id = LogId::from_bytes([0x16; 16]);
+        let evidence_segment = LogSegment {
+            log_id: evidence_log_id,
+            first_seq: 1,
+            end_seq: 2,
+            records: vec![b"reviewed the checkpoint protocol".to_vec()],
+            attachments: Vec::new(),
+        };
+        let evidence_segment_bytes = evidence_segment.encode().unwrap();
+        let evidence_segment_ref = store_object(&mut store, evidence_segment_bytes.clone());
+        let evidence_segment_index = LogSegmentIndex::empty(&mut store)
+            .unwrap()
+            .insert(
+                &mut store,
+                1,
+                SegmentIndexEntry {
+                    end_seq: 2,
+                    segment: evidence_segment_ref,
+                },
+            )
+            .unwrap();
+        let required_logs = LogMap::empty(&mut store)
+            .unwrap()
+            .insert(
+                &mut store,
+                "review-events",
+                LogMapEntry {
+                    log_id: evidence_log_id,
+                    first_seq: 1,
+                    end_seq: 2,
+                    segment_index_root: evidence_segment_index.root(),
+                },
+            )
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+        assert_ne!(required_logs, logs_root);
+
+        let evidence_blob_bytes = encode_artifact_blob(b"review evidence").unwrap();
+        let evidence_blob = store_object(&mut store, evidence_blob_bytes.clone());
+        let required_artifacts = ArtifactMap::empty(&mut store)
+            .unwrap()
+            .insert(
+                &mut store,
+                "review/finding-17",
+                &ArtifactDescriptor {
+                    artifact_id: ArtifactId::from_bytes([0x17; 16]),
+                    logical_len: b"review evidence".len() as u64,
+                    content_root: evidence_blob,
+                    dependencies: Vec::new(),
+                },
+            )
+            .unwrap()
+            .seal(&mut store)
+            .unwrap();
+        assert_ne!(required_artifacts, visible_artifacts);
+
+        let context = ProvenanceContext {
+            recording_principal: PrincipalId::from_bytes([0xA1; 16]),
+            actor: Some("codex".to_owned()),
+            execution_id: None,
+            session_id: None,
+            thread_id: None,
+            task_id: Some("issue-17".to_owned()),
+            workflow_operation_id: None,
+            reason: Some("address review finding".to_owned()),
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
+            required_logs_root: required_logs,
+            required_artifacts_root: required_artifacts,
+            optional_links: Vec::new(),
+        };
+        let context_ref = store_object(&mut store, context.encode().unwrap());
+        let descriptor = GenerationDescriptorV2 {
+            generation_id: GenerationId::from_bytes([0xB1; 16]),
+            parent_generation_id: None,
+            volume_root,
+            logs_root,
+            artifacts_root: visible_artifacts,
+            provenance: ProvenanceBinding::Recorded {
+                context_root: context_ref,
+            },
+            capture_mode: CaptureMode::BlockCut,
+            volume_boundary_id: VolumeBoundaryId::from_bytes([0xB2; 16]),
+            created_at_unix_ms: 42,
+        };
+        let descriptor_ref = store_object(&mut store, descriptor.encode().unwrap());
+
+        let proof = verify_generation(&store, descriptor_ref).unwrap();
+        assert!(proof.objects().contains(&context_ref));
+        assert!(proof.objects().contains(&required_logs));
+        assert!(proof.objects().contains(&evidence_segment_ref));
+        assert!(proof.objects().contains(&required_artifacts));
+        assert!(proof.objects().contains(&evidence_blob));
+
+        store.0.remove(&evidence_blob.object_id);
+        assert!(matches!(
+            verify_generation(&store, descriptor_ref),
+            Err(GraphError::MissingObject(id)) if id == evidence_blob.object_id
+        ));
+
+        store
+            .put(evidence_blob.object_id, evidence_blob_bytes)
+            .unwrap();
+        store.0.remove(&evidence_segment_ref.object_id);
+        assert!(matches!(
+            verify_generation(&store, descriptor_ref),
+            Err(GraphError::MissingObject(id)) if id == evidence_segment_ref.object_id
+        ));
     }
 
     #[test]
