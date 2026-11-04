@@ -14,8 +14,15 @@ require a provenance-capable v2 Generation descriptor for MVP release. This note
 continues to define the implemented v1 bytes. V1 descriptors have no provenance
 field and must be exposed as explicitly unattributed by the upgraded reader;
 do not append fields to v1 or rewrite its identities. The v2/context encoding,
-readers, graph traversal, and golden vectors remain pending P7 work and must
-pass RFC-002's I16 gates before claiming provenance support.
+descriptor readers, publication graph verification, and golden vectors remain
+pending P7 work. P9 owns protected provenance inspection in the SDK/CLI; P10
+owns required-evidence closure and typed-edge traversal for retention reports.
+These work items must pass RFC-002's I16 gates before claiming provenance support.
+
+The v2 descriptor uses outer `VFSO` envelope version `2` with object type `11`;
+its version is not an added payload field. V1-only readers reject that envelope
+before payload decoding. Upgraded readers dispatch both supported descriptor
+layouts and expose v1 as unattributed without changing its bytes or digest.
 
 ## 1. Primitive Encoding Rules
 

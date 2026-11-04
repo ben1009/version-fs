@@ -310,7 +310,7 @@ blob. Log attachments are explicit typed edges, not hashes inside opaque text.
 
 ```text
 GenerationDescriptor {
-    format_version: 2,       // provenance-capable descriptor revision
+    format_version: 2,       // outer VFSO envelope field, not repeated in payload
     generation_id,
     parent_generation_id?,   // lineage, not a required object edge
     volume_root,
@@ -341,7 +341,16 @@ volume root is also not automatically a Generation or a coordinated log/artifact
 checkpoint.
 
 This is a versioned extension to the implemented v1 descriptor, not a change to
-its existing byte layout. New MVP writers use descriptor v2 with an explicit
+its existing byte layout. The wire discriminator is the outer `VFSO` envelope:
+its existing little-endian u16 format-version field at byte offset 4 is `2`,
+and the object type remains `GenerationDescriptor` (code `11`). Readers dispatch
+on the envelope version/type pair before decoding the payload; there is no
+second descriptor-version field in that payload. A v1-only reader MUST reject
+`(2, 11)` as unsupported rather than parse it using the `(1, 11)` layout.
+Upgraded readers explicitly support both descriptor pairs; other referenced
+object kinds retain their existing supported versions.
+
+New MVP writers use descriptor v2 with an explicit
 binding, including for the initial empty Generation; unchanged data/map objects
 keep their existing versions and identities. A supported legacy v1 descriptor
 is reported as `unattributed`, `coverage = none`, with no context root and an
@@ -1513,7 +1522,9 @@ work packages under these phases.
     compatible PostgreSQL mapping. PostgreSQL implementation is not a v0 gate.
 13. Encode/decode explicit recorded and unattributed bindings, including genesis
     and legacy v1 inspection. Reject malformed combinations/unknown versions and
-    pin v2/context golden vectors. Publish distinct Generations sharing view roots
+    pin v2/context golden vectors. Verify outer-envelope dispatch and v1-only
+    reader rejection of v2 before payload decoding. Publish distinct Generations
+    sharing view roots
     with different context; a fresh worker reads the correct binding and authorized
     required evidence without mounts/ancestors. Pins, readers, and mark-only reports
     include required evidence outside ordinary views. Verify metadata-only defaults
