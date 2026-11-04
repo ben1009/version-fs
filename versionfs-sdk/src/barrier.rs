@@ -1044,7 +1044,7 @@ pub fn create_empty_generation<S: DurableObjectStore>(
     boundary_id: VolumeBoundaryId,
     geometry: VolumeGeometry,
     created_at_unix_ms: u64,
-) -> Result<GenerationSeed, BarrierError> {
+) -> Result<VerifiedGenerationSeed, BarrierError> {
     let (seed, objects) = {
         let mut staging = crate::volume::StagingMapStore::new(store);
         let volume = VolumeExtentMap::empty(geometry, &mut staging)?;
@@ -1086,9 +1086,9 @@ pub fn create_empty_generation<S: DurableObjectStore>(
             .map_err(BarrierError::ObjectStore)?;
     }
 
-    verify_generation(store, seed.descriptor)?;
+    let proof = verify_generation(store, seed.descriptor)?;
 
-    Ok(seed)
+    Ok(VerifiedGenerationSeed::from_proof(proof))
 }
 
 /// Creates, durably stores, and verifies a descriptor for already durable roots.
@@ -2219,8 +2219,8 @@ mod tests {
         let child = create_generation(
             &mut store,
             GenerationId::from_bytes([3; 16]),
-            Some(parent.generation_id),
-            parent.roots,
+            Some(parent.seed().generation_id),
+            parent.seed().roots,
             CaptureMode::FilesystemCleanUnmount,
             VolumeBoundaryId::from_bytes([4; 16]),
             20,
@@ -2236,7 +2236,7 @@ mod tests {
         assert_eq!(descriptor.generation_id(), child_seed.generation_id);
         assert_eq!(
             descriptor.parent_generation_id(),
-            Some(parent.generation_id)
+            Some(parent.seed().generation_id)
         );
         assert_eq!(
             descriptor.capture_mode(),
@@ -2271,7 +2271,7 @@ mod tests {
                 .objects
                 .lock()
                 .expect("lock object store")
-                .remove(&parent.roots.volume.object_id)
+                .remove(&parent.seed().roots.volume.object_id)
                 .is_some(),
             "parent volume root should exist before removal"
         );
@@ -2280,8 +2280,8 @@ mod tests {
             create_generation(
                 &mut store,
                 GenerationId::from_bytes([3; 16]),
-                Some(parent.generation_id),
-                parent.roots,
+                Some(parent.seed().generation_id),
+                parent.seed().roots,
                 CaptureMode::FilesystemCleanUnmount,
                 VolumeBoundaryId::from_bytes([4; 16]),
                 20,
@@ -2317,12 +2317,12 @@ mod tests {
             .unwrap();
         let roots = LiveRoots {
             volume,
-            ..initial.roots
+            ..initial.seed().roots
         };
         let parent = create_generation(
             &mut store,
             GenerationId::from_bytes([3; 16]),
-            Some(initial.generation_id),
+            Some(initial.seed().generation_id),
             roots,
             CaptureMode::BlockCut,
             VolumeBoundaryId::from_bytes([4; 16]),
@@ -2777,9 +2777,9 @@ mod tests {
                 writer_epoch: 1,
                 volume_epoch: 1,
                 stream_epoch: 1,
-                volume_root: seed.roots.volume,
-                logs_root: seed.roots.logs,
-                artifacts_root: seed.roots.artifacts,
+                volume_root: seed.seed().roots.volume,
+                logs_root: seed.seed().roots.logs,
+                artifacts_root: seed.seed().roots.artifacts,
                 writer: Some(grant),
                 attachment: Some(AttachmentState {
                     attachment_id,

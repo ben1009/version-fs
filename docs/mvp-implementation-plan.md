@@ -313,9 +313,10 @@ their mutation protocols and connects them to this same coordinator.
   required graph with the descriptor and reconcile the original binding on lost
   replies. Verify a context's recording principal against the authenticated
   caller on first publication; later authorized publishers may reuse the
-  established context without changing its original principal. Equal view roots
-  may have different Generation contexts; changed attribution on the same
-  operation ID rejects.
+  established context without changing its original principal. Apply this same
+  verification to initial workspace creation and standalone Generation catalog
+  publication. Equal view roots may have different Generation contexts; changed
+  attribution on the same operation ID rejects.
 - [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
 - [ ] Close local admission, read authoritative revision/live roots together,

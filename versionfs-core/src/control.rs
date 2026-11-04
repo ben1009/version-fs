@@ -497,17 +497,22 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         self.principal_id
     }
 
-    /// Creates a workspace and its first branch after the initial Generation is durable.
+    /// Creates a workspace and its first branch after the verified initial
+    /// Generation graph is durable in this control's object-store scope.
     pub fn create_workspace(
         &self,
         operation_id: OperationId,
         main_branch_id: BranchId,
         main_name: &str,
         retention_period_ms: u64,
-        initial: GenerationSeed,
+        initial: VerifiedGenerationSeed,
     ) -> Result<BranchState, ControlError> {
         validate_name(main_name)?;
-        validate_generation_seed(initial)?;
+        if initial.store_scope() != self.object_store_scope {
+            return Err(ControlError::InvalidTransition);
+        }
+        let initial_seed = initial.seed();
+        let provenance_identity = verified_provenance_identity(&initial)?;
         if retention_period_ms == 0 {
             return Err(ControlError::InvalidRequest(
                 "retention period must be positive",
@@ -518,7 +523,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         payload.fixed(main_branch_id.as_bytes());
         payload.bytes(main_name.as_bytes())?;
         payload.u64_le(retention_period_ms);
-        encode_generation_seed(&mut payload, initial);
+        encode_generation_seed(&mut payload, initial_seed);
         let result =
             self.run_atomic(operation_id, OP_CREATE_WORKSPACE, payload.finish(), |txn| {
                 if txn.get(&workspace_key(self.workspace_id))?.is_some()
@@ -529,35 +534,48 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         .get(&branch_name_key(self.workspace_id, main_name))?
                         .is_some()
                     || txn
-                        .get(&generation_key(self.workspace_id, initial.generation_id))?
+                        .get(&generation_key(
+                            self.workspace_id,
+                            initial_seed.generation_id,
+                        ))?
                         .is_some()
                 {
                     return Err(MetadataError::Conflict);
+                }
+                if let Some((context_root, recording_principal)) = provenance_identity {
+                    validate_or_record_provenance_context(
+                        txn,
+                        self.workspace_id,
+                        context_root,
+                        recording_principal,
+                        self.principal_id,
+                    )
+                    .map_err(to_metadata_error)?;
                 }
                 txn.put(
                     &workspace_key(self.workspace_id),
                     &encode_workspace(self.workspace_id, retention_period_ms)
                         .map_err(to_metadata_error)?,
                 )?;
-                let mut generation = GenerationRecord::new(initial, true);
+                let mut generation = GenerationRecord::new(initial_seed, true);
                 generation.branch_refs = 1;
                 txn.put(
-                    &generation_key(self.workspace_id, initial.generation_id),
+                    &generation_key(self.workspace_id, initial_seed.generation_id),
                     &encode_generation(&generation).map_err(to_metadata_error)?,
                 )?;
                 let branch = BranchState {
                     workspace_id: self.workspace_id,
                     branch_id: main_branch_id,
                     name: main_name.to_owned(),
-                    head: initial.generation_id,
+                    head: initial_seed.generation_id,
                     revision: 1,
                     pending_mutation_preparations: 0,
                     writer_epoch: 0,
                     volume_epoch: 1,
                     stream_epoch: 1,
-                    volume_root: initial.roots.volume,
-                    logs_root: initial.roots.logs,
-                    artifacts_root: initial.roots.artifacts,
+                    volume_root: initial_seed.roots.volume,
+                    logs_root: initial_seed.roots.logs,
+                    artifacts_root: initial_seed.roots.artifacts,
                     writer: None,
                     attachment: None,
                     capture: None,
@@ -576,16 +594,20 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         decode_branch(&result)
     }
 
-    /// Adds a durable, initially retained Generation catalog record.
+    /// Adds a verified, durable, initially retained Generation catalog record.
     pub fn register_generation(
         &self,
         operation_id: OperationId,
-        generation: GenerationSeed,
+        generation: VerifiedGenerationSeed,
     ) -> Result<(), ControlError> {
-        validate_generation_seed(generation)?;
+        if generation.store_scope() != self.object_store_scope {
+            return Err(ControlError::InvalidTransition);
+        }
+        let generation_seed = generation.seed();
+        let provenance_identity = verified_provenance_identity(&generation)?;
         let mut payload = CanonicalEncoder::new();
         payload.fixed(self.workspace_id.as_bytes());
-        encode_generation_seed(&mut payload, generation);
+        encode_generation_seed(&mut payload, generation_seed);
         self.run_atomic(
             operation_id,
             OP_REGISTER_GENERATION,
@@ -594,13 +616,23 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 if txn.get(&workspace_key(self.workspace_id))?.is_none() {
                     return Err(reject("not_found"));
                 }
-                let key = generation_key(self.workspace_id, generation.generation_id);
+                let key = generation_key(self.workspace_id, generation_seed.generation_id);
                 if txn.get(&key)?.is_some() {
                     return Err(MetadataError::Conflict);
                 }
+                if let Some((context_root, recording_principal)) = provenance_identity {
+                    validate_or_record_provenance_context(
+                        txn,
+                        self.workspace_id,
+                        context_root,
+                        recording_principal,
+                        self.principal_id,
+                    )
+                    .map_err(to_metadata_error)?;
+                }
                 txn.put(
                     &key,
-                    &encode_generation(&GenerationRecord::new(generation, true))
+                    &encode_generation(&GenerationRecord::new(generation_seed, true))
                         .map_err(to_metadata_error)?,
                 )?;
                 Ok(Vec::new())
@@ -2118,12 +2150,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             return Err(ControlError::InvalidTransition);
         }
         let descriptor = generation.descriptor();
-        let recording_principal = generation.provenance_recording_principal();
-        if descriptor.context_root().is_some() != recording_principal.is_some() {
-            return Err(ControlError::CorruptRecord(
-                "verified provenance context summary is missing".into(),
-            ));
-        }
+        let provenance_identity = verified_provenance_identity(&generation)?;
         let VerifiedGenerationSeed {
             seed: generation,
             proof: _,
@@ -2253,9 +2280,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             {
                 return Err(reject("invalid_transition"));
             }
-            if let (Some(context_root), Some(recording_principal)) =
-                (descriptor.context_root(), recording_principal)
-            {
+            if let Some((context_root, recording_principal)) = provenance_identity {
                 validate_or_record_provenance_context(
                     txn,
                     self.workspace_id,
@@ -3556,6 +3581,23 @@ fn validate_or_record_provenance_context(
         ));
     }
     Ok(())
+}
+
+fn verified_provenance_identity(
+    generation: &VerifiedGenerationSeed,
+) -> Result<Option<(ObjectRef, PrincipalId)>, ControlError> {
+    match (
+        generation.descriptor().context_root(),
+        generation.provenance_recording_principal(),
+    ) {
+        (None, None) => Ok(None),
+        (Some(context_root), Some(recording_principal)) => {
+            Ok(Some((context_root, recording_principal)))
+        }
+        _ => Err(ControlError::CorruptRecord(
+            "verified provenance context summary is missing".into(),
+        )),
+    }
 }
 
 fn encode_provenance_context_principal(

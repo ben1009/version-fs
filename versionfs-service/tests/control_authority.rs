@@ -14,13 +14,13 @@ use std::{
 
 use versionfs_core::{
     control::{
-        ControlError, GenerationSeed, LiveRoots, OperationState, PreparationKind,
-        PreparationRequest, WorkspaceControl, start_authority_owner,
+        ControlError, LiveRoots, OperationState, PreparationKind, PreparationRequest,
+        VerifiedGenerationSeed, WorkspaceControl, start_authority_owner,
     },
     fault::{FailureInjector, FailurePoint, OneShotFailures},
     format::{
-        CaptureMode, EXTENT_BYTES, FormatError, ObjectRef, ObjectType, ProvenanceBinding,
-        ProvenanceContext, VolumeGeometry, encode_object,
+        CaptureMode, EXTENT_BYTES, ObjectRef, ObjectType, ProvenanceBinding, ProvenanceContext,
+        VolumeGeometry, encode_object,
     },
     identity::{
         AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
@@ -220,16 +220,19 @@ struct TestEnv {
     workspace_id: WorkspaceId,
     principal_id: PrincipalId,
     owner: versionfs_core::control::OwnerIncarnation,
+    initial_roots: LiveRoots,
     failures: Arc<OneShotFailures>,
     control: WorkspaceControl<ToyKvMetadataAuthority>,
 }
 
 impl TestEnv {
     fn new() -> Self {
-        Self::with_initial_seed(seed(1))
+        let mut store = TestObjectStore::default();
+        Self::with_initial_seed(empty_generation(&mut store, generation(1), 80))
     }
 
-    fn with_initial_seed(initial_seed: GenerationSeed) -> Self {
+    fn with_initial_seed(initial_seed: VerifiedGenerationSeed) -> Self {
+        let initial_roots = initial_seed.seed().roots;
         let dir = TestDir::new();
         let clock = Arc::new(TestClock::default());
         let failures = Arc::new(OneShotFailures::default());
@@ -260,6 +263,7 @@ impl TestEnv {
             workspace_id,
             principal_id,
             owner,
+            initial_roots,
             failures,
             control,
         }
@@ -359,8 +363,9 @@ fn maintain_leases(
 #[test]
 fn retired_protection_ids_cannot_be_rebound_or_release_another_reader() {
     let env = TestEnv::new();
+    let mut store = TestObjectStore::default();
     env.control
-        .register_generation(op(10), seed(2))
+        .register_generation(op(10), empty_generation(&mut store, generation(2), 82))
         .expect("register retained Generation");
     env.control
         .open_generation(op(11), generation(2), protection(10))
@@ -375,7 +380,7 @@ fn retired_protection_ids_cannot_be_rebound_or_release_another_reader() {
     );
     assert_eq!(
         env.control
-            .open_live_log(op(14), branch(1), 1, roots(1).logs, protection(10)),
+            .open_live_log(op(14), branch(1), 1, env.initial_roots.logs, protection(10),),
         Err(ControlError::Conflict)
     );
 
@@ -398,7 +403,7 @@ fn retired_protection_ids_cannot_be_rebound_or_release_another_reader() {
 
     let deadline = env
         .control
-        .open_live_log(op(19), branch(1), 1, roots(1).logs, protection(12))
+        .open_live_log(op(19), branch(1), 1, env.initial_roots.logs, protection(12))
         .expect("open live-log reader");
     env.clock.set(deadline.as_nanos());
     env.control
@@ -481,7 +486,7 @@ fn zero_preparation_identities_remain_queryable_and_cleanup_releases_admission()
             volume_epoch: 1,
             protection_id: protection(35),
             kind: PreparationKind::VolumeBarrier,
-            expected_roots: Some(replace_volume_root(roots(1), 35)),
+            expected_roots: Some(replace_volume_root(env.initial_roots, 35)),
             dependencies: vec![],
         })
         .expect("zero branch ID survives preparation decoding");
@@ -580,7 +585,7 @@ fn capture_children_and_cleanup_keep_the_original_principal_scope() {
                 volume_epoch: 1,
                 protection_id: protection(marker + 3),
                 kind: PreparationKind::VolumeBarrier,
-                expected_roots: Some(replace_volume_root(roots(1), marker)),
+                expected_roots: Some(replace_volume_root(env.initial_roots, marker)),
                 dependencies: vec![],
             }),
             Err(ControlError::Fenced)
@@ -620,29 +625,99 @@ fn capture_children_and_cleanup_keep_the_original_principal_scope() {
 }
 
 #[test]
-fn generation_catalog_rejects_mistyped_roots_before_persisting_an_operation() {
+fn every_generation_catalog_path_binds_new_contexts_and_allows_verified_reuse() {
     let env = TestEnv::new();
-    let mut bad_volume = seed(50);
-    bad_volume.roots.volume = object(ObjectType::LogMapRoot, 50);
-    assert_eq!(
-        env.control.register_generation(op(51), bad_volume),
-        Err(ControlError::Format(FormatError::ObjectReferenceMismatch))
+    let mut store = TestObjectStore::default();
+    let base = empty_generation(&mut store, generation(40), 85);
+    let roots = base.seed().roots;
+    let initial_context = store_provenance_context(&mut store, principal(99), roots, "initial");
+    let initial_binding = ProvenanceBinding::Recorded {
+        context_root: initial_context,
+    };
+    let initial = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(50),
+        None,
+        roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(86)),
+        86,
+        initial_binding,
+        &[],
+    )
+    .expect("create verified recorded initial Generation");
+
+    let workspace_creator = control_for(
+        Arc::clone(&env.authority),
+        workspace(2),
+        principal(1),
+        env.owner,
     );
+    assert!(matches!(
+        workspace_creator.create_workspace(op(51), branch(2), "main", 60_000, initial.clone(),),
+        Err(ControlError::InvalidRequest(_))
+    ));
     assert_eq!(
-        env.control.get_operation(op(51)),
+        workspace_creator.get_branch(branch(2)),
         Err(ControlError::NotFound)
     );
 
-    let mut bad_descriptor = seed(52);
-    bad_descriptor.descriptor = object(ObjectType::VolumeRoot, 52);
-    assert_eq!(
-        env.control.register_generation(op(53), bad_descriptor),
-        Err(ControlError::Format(FormatError::ObjectReferenceMismatch))
+    let recording_creator = control_for(
+        Arc::clone(&env.authority),
+        workspace(2),
+        principal(99),
+        env.owner,
     );
-    assert_eq!(
-        env.control.get_operation(op(53)),
-        Err(ControlError::NotFound)
+    recording_creator
+        .create_workspace(op(52), branch(2), "main", 60_000, initial)
+        .expect("authenticated recording principal may create initial Generation");
+
+    let registration_context =
+        store_provenance_context(&mut store, principal(88), roots, "registration");
+    let registration_binding = ProvenanceBinding::Recorded {
+        context_root: registration_context,
+    };
+    let unverified_registration = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(51),
+        Some(generation(50)),
+        roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(87)),
+        87,
+        registration_binding,
+        &[],
+    )
+    .expect("create verified recorded catalog Generation");
+    assert!(matches!(
+        workspace_creator.register_generation(op(53), unverified_registration.clone()),
+        Err(ControlError::InvalidRequest(_))
+    ));
+    let registration_principal = control_for(
+        Arc::clone(&env.authority),
+        workspace(2),
+        principal(88),
+        env.owner,
     );
+    registration_principal
+        .register_generation(op(54), unverified_registration)
+        .expect("recording principal may register its verified context");
+
+    let reused = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(52),
+        Some(generation(50)),
+        roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(88)),
+        88,
+        initial_binding,
+        &[],
+    )
+    .expect("create Generation reusing the established initial context");
+    workspace_creator
+        .register_generation(op(55), reused)
+        .expect("authorized publisher may reuse verified initial context");
 }
 
 fn control_for(
@@ -717,19 +792,11 @@ fn replace_volume_root(current: LiveRoots, marker: u8) -> LiveRoots {
     }
 }
 
-fn seed(marker: u8) -> GenerationSeed {
-    GenerationSeed {
-        generation_id: generation(marker),
-        descriptor: object(ObjectType::GenerationDescriptor, marker),
-        roots: roots(marker),
-    }
-}
-
 fn empty_generation(
     store: &mut TestObjectStore,
     generation_id: GenerationId,
     boundary_id: u8,
-) -> GenerationSeed {
+) -> VerifiedGenerationSeed {
     create_empty_generation(
         store,
         generation_id,
@@ -775,9 +842,10 @@ fn store_provenance_context(
 fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
     let mut store = TestObjectStore::default();
     let initial = empty_generation(&mut store, generation(1), 80);
-    let first_context = store_provenance_context(&mut store, principal(1), initial.roots, "task-a");
+    let first_context =
+        store_provenance_context(&mut store, principal(1), initial.seed().roots, "task-a");
     let second_context =
-        store_provenance_context(&mut store, principal(1), initial.roots, "task-b");
+        store_provenance_context(&mut store, principal(1), initial.seed().roots, "task-b");
     let first_binding = ProvenanceBinding::Recorded {
         context_root: first_context,
     };
@@ -785,7 +853,7 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         context_root: second_context,
     };
 
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(90);
     let request = PreparationRequest {
@@ -799,9 +867,9 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         kind: PreparationKind::CheckpointCapture,
         expected_roots: None,
         dependencies: vec![
-            initial.roots.volume,
-            initial.roots.logs,
-            initial.roots.artifacts,
+            initial.seed().roots.volume,
+            initial.seed().roots.logs,
+            initial.seed().roots.artifacts,
         ],
     };
 
@@ -849,7 +917,7 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         &mut store,
         generation(2),
         Some(generation(1)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::FilesystemCleanUnmount,
         VolumeBoundaryId::from_bytes(id(82)),
         82,
@@ -876,7 +944,7 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         &mut store,
         generation(3),
         Some(generation(1)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::FilesystemCleanUnmount,
         VolumeBoundaryId::from_bytes(id(83)),
         83,
@@ -944,9 +1012,9 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         kind: PreparationKind::CheckpointCapture,
         expected_roots: None,
         dependencies: vec![
-            initial.roots.volume,
-            initial.roots.logs,
-            initial.roots.artifacts,
+            initial.seed().roots.volume,
+            initial.seed().roots.logs,
+            initial.seed().roots.artifacts,
         ],
     };
     env.control
@@ -959,7 +1027,7 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         &mut store,
         generation(4),
         Some(generation(3)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::FilesystemCleanUnmount,
         VolumeBoundaryId::from_bytes(id(84)),
         84,
@@ -981,8 +1049,8 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         )
         .expect("publish a Generation with different attribution");
     assert_eq!(next_published.generation_id, generation(4));
-    assert_eq!(next_generation.seed().roots, initial.roots);
-    assert_eq!(matching_generation.seed().roots, initial.roots);
+    assert_eq!(next_generation.seed().roots, initial.seed().roots);
+    assert_eq!(matching_generation.seed().roots, initial.seed().roots);
     assert_ne!(
         next_generation.descriptor().context_root(),
         matching_generation.descriptor().context_root()
@@ -1019,7 +1087,7 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         &mut store,
         generation(5),
         Some(generation(4)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::FilesystemCleanUnmount,
         VolumeBoundaryId::from_bytes(id(87)),
         87,
@@ -1047,11 +1115,12 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
 fn first_publication_rejects_recording_principal_not_bound_to_authenticated_caller() {
     let mut store = TestObjectStore::default();
     let initial = empty_generation(&mut store, generation(1), 85);
-    let context = store_provenance_context(&mut store, principal(99), initial.roots, "untrusted");
+    let context =
+        store_provenance_context(&mut store, principal(99), initial.seed().roots, "untrusted");
     let binding = ProvenanceBinding::Recorded {
         context_root: context,
     };
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(94);
     env.control
@@ -1078,7 +1147,7 @@ fn first_publication_rejects_recording_principal_not_bound_to_authenticated_call
         &mut store,
         generation(5),
         Some(generation(1)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::BlockCut,
         VolumeBoundaryId::from_bytes(id(86)),
         86,
@@ -1181,23 +1250,23 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
     let new_generation = create_generation(
         &mut object_store,
         generation(2),
-        Some(initial.generation_id),
-        initial.roots,
+        Some(initial.seed().generation_id),
+        initial.seed().roots,
         CaptureMode::FilesystemCleanUnmount,
         VolumeBoundaryId::from_bytes(id(31)),
         31,
     )
     .expect("create verified child Generation");
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(30);
-    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.seed().roots);
 
     let wrong_parent = create_generation(
         &mut object_store,
         generation(4),
         Some(generation(9)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::BlockCut,
         VolumeBoundaryId::from_bytes(id(32)),
         32,
@@ -1225,6 +1294,7 @@ fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
         33,
     )
     .expect("create alternate valid Generation graph")
+    .seed()
     .roots;
     let wrong_roots = create_generation(
         &mut object_store,
@@ -1351,16 +1421,16 @@ fn capture_publication_rechecks_each_lease_after_buffering_its_outcome() {
             &mut store,
             generation(2),
             Some(generation(1)),
-            initial.roots,
+            initial.seed().roots,
             CaptureMode::BlockCut,
             VolumeBoundaryId::from_bytes(id(71)),
             71,
         )
         .unwrap();
-        let env = TestEnv::with_initial_seed(initial);
+        let env = TestEnv::with_initial_seed(initial.clone());
         let mut grant = env.writer_and_attachment();
         let capture_id = op(30);
-        env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+        env.start_sealed_capture(capture_id, protection(30), grant, initial.seed().roots);
         match lease {
             "attachment" => grant = maintain_leases(&env, grant, 14, false),
             "preparation" => grant = maintain_leases(&env, grant, 29, true),
@@ -1424,16 +1494,16 @@ fn committed_capture_replays_after_lease_expiry_when_the_reply_was_lost() {
         &mut store,
         generation(2),
         Some(generation(1)),
-        initial.roots,
+        initial.seed().roots,
         CaptureMode::BlockCut,
         VolumeBoundaryId::from_bytes(id(73)),
         73,
     )
     .unwrap();
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(30);
-    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.seed().roots);
     env.failures
         .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
     assert!(matches!(
@@ -1494,7 +1564,7 @@ fn live_root_commit_and_child_renewal_recheck_parent_capture_deadlines() {
                 .unwrap();
         }
         let barrier_id = if parent_capture { op(32) } else { op(5) };
-        let next_roots = replace_volume_root(roots(1), 9);
+        let next_roots = replace_volume_root(env.initial_roots, 9);
         env.control
             .begin_preparation(PreparationRequest {
                 operation_id: barrier_id,
@@ -1632,19 +1702,19 @@ fn reader_protection_does_not_open_or_renew_after_its_deadline() {
 fn capture_publication_rejects_a_verified_graph_from_another_object_namespace() {
     let mut target_store = TestObjectStore::default();
     let initial = empty_generation(&mut target_store, generation(1), 60);
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(61);
-    env.start_sealed_capture(capture_id, protection(61), grant, initial.roots);
+    env.start_sealed_capture(capture_id, protection(61), grant, initial.seed().roots);
 
     let mut foreign_store = TestObjectStore::with_scope(ObjectStoreScopeId::from_bytes([0xD5; 16]));
     let foreign_initial = empty_generation(&mut foreign_store, generation(1), 60);
-    assert_eq!(foreign_initial.roots, initial.roots);
+    assert_eq!(foreign_initial.seed().roots, initial.seed().roots);
     let foreign_generation = create_generation(
         &mut foreign_store,
         generation(2),
         Some(generation(1)),
-        foreign_initial.roots,
+        foreign_initial.seed().roots,
         CaptureMode::BlockCut,
         VolumeBoundaryId::from_bytes(id(62)),
         62,
@@ -1678,17 +1748,17 @@ fn detached_capture_publication_retains_generation_without_rebasing_branch() {
     let new_generation = create_generation(
         &mut object_store,
         generation(3),
-        Some(initial.generation_id),
-        initial.roots,
+        Some(initial.seed().generation_id),
+        initial.seed().roots,
         CaptureMode::FilesystemFrozen,
         VolumeBoundaryId::from_bytes(id(41)),
         41,
     )
     .expect("create verified detached Generation");
-    let env = TestEnv::with_initial_seed(initial);
+    let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
     let capture_id = op(40);
-    env.start_sealed_capture(capture_id, protection(40), grant, initial.roots);
+    env.start_sealed_capture(capture_id, protection(40), grant, initial.seed().roots);
 
     let published = env
         .control
@@ -1752,7 +1822,7 @@ fn prepared_live_root_commit_is_atomic_replayable_and_keeps_attachment_base_prot
         Err(ControlError::Busy)
     );
 
-    let next_roots = replace_volume_root(roots(1), 9);
+    let next_roots = replace_volume_root(env.initial_roots, 9);
     let preparation = env
         .control
         .begin_preparation(PreparationRequest {
@@ -1998,7 +2068,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
             volume_epoch: 1,
             protection_id: protection(5),
             kind: PreparationKind::VolumeBarrier,
-            expected_roots: Some(replace_volume_root(roots(1), 12)),
+            expected_roots: Some(replace_volume_root(env.initial_roots, 12)),
             dependencies: vec![],
         },
     )
@@ -2008,7 +2078,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
         op(12),
         1,
         grant,
-        replace_volume_root(roots(1), 12),
+        replace_volume_root(env.initial_roots, 12),
         Some(op(10)),
     )
     .expect("commit admitted drain child");
@@ -2019,7 +2089,10 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
         .expect("seal exact final capture boundary");
     assert!(sealed.sealed);
     assert_eq!(sealed.sealed_revision, Some(2));
-    assert_eq!(sealed.sealed_roots, Some(replace_volume_root(roots(1), 12)));
+    assert_eq!(
+        sealed.sealed_roots,
+        Some(replace_volume_root(env.initial_roots, 12))
+    );
 
     assert_eq!(
         env.control
@@ -2055,7 +2128,7 @@ fn capture_admits_only_identified_children_and_abort_releases_the_token() {
 fn capture_waits_for_mutation_preparations_and_renewed_writer_can_finish_one() {
     let env = TestEnv::new();
     let grant = env.writer_and_attachment();
-    let roots = replace_volume_root(roots(1), 60);
+    let roots = replace_volume_root(env.initial_roots, 60);
     env.control
         .begin_preparation(PreparationRequest {
             operation_id: op(60),
@@ -2313,6 +2386,7 @@ fn abandoned_capture_child_authorization_is_reclaimed_by_abort_or_expiry() {
 #[test]
 fn owner_restart_fences_old_grants_and_expired_read_protections_release_retention() {
     let env = TestEnv::new();
+    let mut store = TestObjectStore::default();
     let old_grant = env.writer_and_attachment();
     let next_owner = start_authority_owner(env.authority.as_ref(), op(251)).expect("restart owner");
     assert!(next_owner > env.owner);
@@ -2343,7 +2417,7 @@ fn owner_restart_fences_old_grants_and_expired_read_protections_release_retentio
     );
 
     next_control
-        .register_generation(op(6), seed(2))
+        .register_generation(op(6), empty_generation(&mut store, generation(2), 83))
         .expect("register separately retained Generation");
     let first_deadline = next_control
         .open_generation(op(7), generation(2), protection(7))
@@ -2375,7 +2449,7 @@ fn owner_restart_fences_old_grants_and_expired_read_protections_release_retentio
     );
 
     next_control
-        .register_generation(op(16), seed(3))
+        .register_generation(op(16), empty_generation(&mut store, generation(3), 84))
         .expect("register Generation for expiry test");
     let expiry_deadline = next_control
         .open_generation(op(17), generation(3), protection(9))

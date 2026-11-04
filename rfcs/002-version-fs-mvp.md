@@ -382,7 +382,11 @@ task, workflow-operation, reason, and trace/span fields are optional, untrusted
 attribution claims from the runtime. They establish neither an authenticated
 identity nor proof of observation by Version FS. Reusing recorded context preserves
 its original verified recording principal; the publishing caller is authorized
-separately. Scoped workflow references can group several
+separately. The first successful catalog publication of a context in a workspace
+atomically establishes its context-root/recording-principal association. Later
+publications must match that association before the context can be reused. This
+workspace-scoped verification association does not replace the descriptor's
+provenance binding or create an object-retention edge. Scoped workflow references can group several
 operations or appear in several Generations without adding an operation-query
 engine or replacing storage request IDs.
 
@@ -1090,9 +1094,13 @@ Detached publication omits step 2: the Generation is visible and retained by ID
 without moving the head or rebasing the attachment's Generation baseline.
 Its preceding durable flushes remain ordinary live-root changes.
 
-Provenance is bound through the verified immutable descriptor; there is no
-separately mutable attribution row. The transaction records that descriptor and
-its retention/outcome atomically. Unknown-outcome recovery returns the original
+Generation attribution is bound through the verified immutable descriptor; there
+is no separately mutable Generation-attribution row. On first catalog
+publication, the transaction also records the workspace-scoped verification
+association between a context root and its original recording principal. That
+association cannot change the descriptor binding and is not an object-retention
+root. The transaction records the descriptor, required-evidence retention, and
+operation outcome atomically. Unknown-outcome recovery returns the original
 descriptor/binding, including after later head movement. It cannot accept a
 replacement context for the same checkpoint ID or report an uploaded context as
 a successfully published Generation.

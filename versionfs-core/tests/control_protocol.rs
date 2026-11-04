@@ -1,7 +1,7 @@
 //! Core control-state-machine regression tests with an in-memory authority.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     num::NonZeroUsize,
     sync::{
         Arc, Mutex,
@@ -11,19 +11,25 @@ use std::{
 
 use versionfs_core::{
     control::{
-        ControlError, GenerationSeed, LiveRoots, OperationState, PreparationKind,
-        PreparationRequest, WorkspaceControl, start_authority_owner,
+        ControlError, LiveRoots, OperationState, PreparationKind, PreparationRequest,
+        VerifiedGenerationSeed, WorkspaceControl, start_authority_owner,
     },
-    format::{ObjectRef, ObjectType, encode_object},
+    format::{
+        CaptureMode, GenerationDescriptorV2, ObjectRef, ObjectType, ProvenanceBinding,
+        VolumeGeometry, encode_object,
+    },
+    graph::verify_generation,
     identity::{
-        AttachmentId, BranchId, GenerationId, ObjectStoreScopeId, OperationId, PrincipalId,
-        ProtectionId, WorkspaceId,
+        AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId,
+        PrincipalId, ProtectionId, VolumeBoundaryId, WorkspaceId,
     },
     metadata::{
         MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataSnapshot,
         MetadataTxn, MutationIdentity, ReconciledOutcome,
     },
+    persistent_map::MapObjectStore,
     time::MonotonicTime,
+    views::{ArtifactMap, LogMap, VolumeExtentMap},
 };
 
 #[derive(Default)]
@@ -36,6 +42,24 @@ struct MemoryAuthority {
 struct MemorySnapshot {
     scope: u64,
     values: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+#[derive(Default)]
+struct MemoryObjectStore(HashMap<ObjectId, Vec<u8>>);
+
+impl MapObjectStore for MemoryObjectStore {
+    fn proof_scope(&self) -> ObjectStoreScopeId {
+        ObjectStoreScopeId::from_bytes([0xA5; 16])
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.0.get(&id).cloned())
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        self.0.insert(id, bytes);
+        Ok(())
+    }
 }
 
 impl MetadataSnapshot for MemorySnapshot {
@@ -181,7 +205,7 @@ fn control() -> WorkspaceControl<MemoryAuthority> {
         owner,
     );
     control
-        .create_workspace(op(1), branch(1), "main", 60_000, seed(1))
+        .create_workspace(op(1), branch(1), "main", 60_000, verified_seed(1))
         .expect("create workspace");
     control
 }
@@ -255,12 +279,40 @@ fn replace_artifact_root(current: LiveRoots, marker: u8) -> LiveRoots {
     }
 }
 
-fn seed(marker: u8) -> GenerationSeed {
-    GenerationSeed {
+fn verified_seed(marker: u8) -> VerifiedGenerationSeed {
+    let mut store = MemoryObjectStore::default();
+    let geometry = VolumeGeometry::new(4 * 65_536).expect("valid test geometry");
+    let volume_root = VolumeExtentMap::empty(geometry, &mut store)
+        .expect("create empty volume map")
+        .seal(&mut store)
+        .expect("seal empty volume map");
+    let logs_root = LogMap::empty(&mut store)
+        .expect("create empty log map")
+        .seal(&mut store)
+        .expect("seal empty log map");
+    let artifacts_root = ArtifactMap::empty(&mut store)
+        .expect("create empty artifact map")
+        .seal(&mut store)
+        .expect("seal empty artifact map");
+    let descriptor_bytes = GenerationDescriptorV2 {
         generation_id: generation(marker),
-        descriptor: object(ObjectType::GenerationDescriptor, marker),
-        roots: roots(marker),
+        parent_generation_id: None,
+        volume_root,
+        logs_root,
+        artifacts_root,
+        provenance: ProvenanceBinding::Unattributed,
+        capture_mode: CaptureMode::BlockCut,
+        volume_boundary_id: VolumeBoundaryId::from_bytes([marker; 16]),
+        created_at_unix_ms: u64::from(marker),
     }
+    .encode()
+    .expect("encode Generation descriptor");
+    let descriptor = ObjectRef::from_encoded(&descriptor_bytes).expect("reference descriptor");
+    store
+        .put(descriptor.object_id, descriptor_bytes)
+        .expect("persist Generation descriptor");
+    let proof = verify_generation(&store, descriptor).expect("verify Generation graph");
+    VerifiedGenerationSeed::from_proof(proof)
 }
 
 #[test]
@@ -438,7 +490,12 @@ fn core_protocol_limits_each_preparation_to_its_view_root() {
     control
         .attach_volume(op(41), branch(1), 1, writer, attachment(1), protection(1))
         .expect("attach volume");
-    let initial = roots(1);
+    let current = control.get_branch(branch(1)).expect("read initial branch");
+    let initial = LiveRoots {
+        volume: current.volume_root,
+        logs: current.logs_root,
+        artifacts: current.artifacts_root,
+    };
 
     assert!(matches!(
         control.begin_preparation(PreparationRequest {
