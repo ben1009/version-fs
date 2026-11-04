@@ -16,7 +16,8 @@ use versionfs_core::control::{
 };
 use versionfs_core::fault::{FailureInjector, FailurePoint, NoFailures};
 use versionfs_core::format::{
-    CaptureMode, GenerationDescriptor, ObjectRef, ObjectType, VolumeGeometry, VolumeRoot,
+    CaptureMode, GenerationDescriptorV2, ObjectRef, ObjectType, ProvenanceBinding, VolumeGeometry,
+    VolumeRoot,
 };
 use versionfs_core::graph::{
     DependencyProof, GraphError, verify_generation, verify_generation_with_reuse,
@@ -1050,12 +1051,13 @@ pub fn create_empty_generation<S: DurableObjectStore>(
         let volume_root = volume.seal(&mut staging)?;
         let logs_root = LogMap::empty(&mut staging)?.seal(&mut staging)?;
         let artifacts_root = ArtifactMap::empty(&mut staging)?.seal(&mut staging)?;
-        let descriptor = GenerationDescriptor {
+        let descriptor = GenerationDescriptorV2 {
             generation_id,
             parent_generation_id: None,
             volume_root,
             logs_root,
             artifacts_root,
+            provenance: ProvenanceBinding::Unattributed,
             capture_mode: CaptureMode::BlockCut,
             volume_boundary_id: boundary_id,
             created_at_unix_ms,
@@ -1133,12 +1135,13 @@ pub fn create_generation_with_reuse<S: DurableObjectStore>(
     created_at_unix_ms: u64,
     protected_proofs: &[&DependencyProof],
 ) -> Result<VerifiedGenerationSeed, BarrierError> {
-    let descriptor = GenerationDescriptor {
+    let descriptor = GenerationDescriptorV2 {
         generation_id,
         parent_generation_id,
         volume_root: roots.volume,
         logs_root: roots.logs,
         artifacts_root: roots.artifacts,
+        provenance: ProvenanceBinding::Unattributed,
         capture_mode,
         volume_boundary_id: boundary_id,
         created_at_unix_ms,
@@ -2176,16 +2179,22 @@ mod tests {
             .get(child_seed.descriptor.object_id)
             .expect("read descriptor")
             .expect("descriptor exists");
-        let descriptor =
-            GenerationDescriptor::decode(&descriptor_bytes).expect("canonical descriptor");
-        assert_eq!(descriptor.generation_id, child_seed.generation_id);
-        assert_eq!(descriptor.parent_generation_id, Some(parent.generation_id));
-        assert_eq!(descriptor.capture_mode, CaptureMode::FilesystemCleanUnmount);
+        let descriptor = versionfs_core::format::decode_generation_descriptor(&descriptor_bytes)
+            .expect("canonical descriptor");
+        assert_eq!(descriptor.generation_id(), child_seed.generation_id);
+        assert_eq!(
+            descriptor.parent_generation_id(),
+            Some(parent.generation_id)
+        );
+        assert_eq!(
+            descriptor.capture_mode(),
+            CaptureMode::FilesystemCleanUnmount
+        );
         assert_eq!(
             LiveRoots {
-                volume: descriptor.volume_root,
-                logs: descriptor.logs_root,
-                artifacts: descriptor.artifacts_root,
+                volume: descriptor.volume_root(),
+                logs: descriptor.logs_root(),
+                artifacts: descriptor.artifacts_root(),
             },
             child_seed.roots
         );

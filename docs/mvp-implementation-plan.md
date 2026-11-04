@@ -303,10 +303,11 @@ their mutation protocols and connects them to this same coordinator.
   publication moves the head, branch reference, and attachment-base protection in
   the same authority transaction; both modes reconcile unknown outcomes by the
   capture operation ID.
-- [ ] Add RFC-002's provenance-capable v2 descriptor and bounded context format,
+- [x] Add RFC-002's provenance-capable v2 descriptor and bounded context format,
   typed evidence edges, and golden vectors. Keep v1 bytes stable and inspect
-  legacy descriptors as explicitly unattributed. This format upgrade is pending;
-  the completed publication slice above does not yet qualify I16.
+  legacy descriptors as explicitly unattributed. The core codec and graph proof
+  implement this format slice; capture-time binding and the complete provenance
+  release gate remain pending and this does not yet qualify I16.
 - [ ] Bind explicit provenance at capture admission and in request fingerprints;
   publish/retain its verified required graph with the descriptor and reconcile
   the original binding on lost replies. Equal view roots may have different

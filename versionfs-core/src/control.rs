@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::{
     format::{
-        CanonicalDecoder, CanonicalEncoder, FormatError, GenerationDescriptor, MetadataRecordType,
-        ObjectRef, ObjectType, decode_metadata_record, encode_metadata_record,
+        CanonicalDecoder, CanonicalEncoder, DecodedGenerationDescriptor, FormatError,
+        MetadataRecordType, ObjectRef, ObjectType, decode_metadata_record, encode_metadata_record,
     },
     graph::DependencyProof,
     identity::{
@@ -264,12 +264,12 @@ impl VerifiedGenerationSeed {
         let descriptor = proof.generation_descriptor();
         Self {
             seed: GenerationSeed {
-                generation_id: descriptor.generation_id,
+                generation_id: descriptor.generation_id(),
                 descriptor: proof.descriptor(),
                 roots: LiveRoots {
-                    volume: descriptor.volume_root,
-                    logs: descriptor.logs_root,
-                    artifacts: descriptor.artifacts_root,
+                    volume: descriptor.volume_root(),
+                    logs: descriptor.logs_root(),
+                    artifacts: descriptor.artifacts_root(),
                 },
             },
             proof,
@@ -282,7 +282,7 @@ impl VerifiedGenerationSeed {
     }
 
     /// Returns the descriptor payload validated by the retained proof.
-    pub const fn descriptor(&self) -> GenerationDescriptor {
+    pub const fn descriptor(&self) -> DecodedGenerationDescriptor {
         self.proof.generation_descriptor()
     }
 
@@ -2074,7 +2074,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         if generation.store_scope() != self.object_store_scope {
             return Err(ControlError::InvalidTransition);
         }
-        if generation.descriptor().parent_generation_id != Some(expected_parent) {
+        if generation.descriptor().parent_generation_id() != Some(expected_parent) {
             return Err(ControlError::InvalidTransition);
         }
         let VerifiedGenerationSeed {
