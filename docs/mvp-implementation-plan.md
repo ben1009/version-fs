@@ -343,14 +343,16 @@ retry by refreshing only the revision/roots. Ownership changes fence the origina
 worker. All three capture modes have distinct descriptor and recovery tests.
 Fork does not walk volume extents; journal replay uses a writable fork;
 name reuse and old-device commits cannot affect the new branch state.
-Recorded/unattributed and legacy descriptors round-trip unambiguously; required
-context/evidence failures prevent publication, capture admission and publication
-reconcile the original provenance after lost replies, the authenticated caller
-must match the context recording principal, and mismatching provenance cannot
-replace a committed binding on retry. Identical view roots can be published in
-different Generations with distinct verified contexts. I16 remains incomplete
-until protected inspection, retention closure, and the remaining acceptance
-campaign are implemented.
+Recorded and unattributed bindings, as well as legacy descriptors, round-trip
+unambiguously. Missing or corrupt required context or evidence prevents
+publication. Capture admission fixes the provenance binding in the operation
+fingerprint; publication and lost-reply reconciliation preserve that binding.
+On first publication, the authenticated caller must match the context's
+recording principal. A retry with mismatching provenance cannot replace a
+committed binding. Identical view roots can be published in different
+Generations with distinct verified contexts. I16 remains incomplete until
+protected inspection, retention closure, and the remaining acceptance campaign
+are implemented.
 
 ### P8. Native logs and artifacts
 
