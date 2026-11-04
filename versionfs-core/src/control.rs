@@ -68,6 +68,8 @@ const TRANSITION_EXPIRE_PREPARATION: u16 = 4;
 const TRANSITION_PUBLISH_CAPTURE: u16 = 5;
 const OP_TOMBSTONE: u16 = u16::MAX;
 const CAPTURE_PROVENANCE_EXTENSION: &[u8; 4] = b"CPRV";
+const MAX_CALLER_PREPARATION_DEPENDENCIES: usize = 4096;
+const MAX_STORED_PREPARATION_DEPENDENCIES: usize = MAX_CALLER_PREPARATION_DEPENDENCIES + 1;
 
 /// A durable authority-owner incarnation. Every owner restart advances it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1415,6 +1417,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         } = request;
         let capture = kind == PreparationKind::CheckpointCapture;
         validate_provenance_binding(provenance)?;
+        if dependencies.len() > MAX_CALLER_PREPARATION_DEPENDENCIES {
+            return Err(ControlError::InvalidRequest(
+                "too many protected dependencies",
+            ));
+        }
         if !capture && provenance != ProvenanceBinding::Unattributed {
             return Err(ControlError::InvalidRequest(
                 "provenance may only be bound to checkpoint captures",
@@ -1425,7 +1432,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         {
             dependencies.push(context_root);
         }
-        if dependencies.len() > 4096 {
+        if dependencies.len() > MAX_STORED_PREPARATION_DEPENDENCIES {
             return Err(ControlError::InvalidRequest(
                 "too many protected dependencies",
             ));
@@ -3221,7 +3228,9 @@ fn encode_branch(branch: &BranchState) -> Result<Vec<u8>, FormatError> {
         None => e.u8(0),
     }
     e.u8(u8::from(branch.deleted));
-    if let Some(capture) = &branch.capture {
+    if let Some(capture) = &branch.capture
+        && capture.provenance != ProvenanceBinding::Unattributed
+    {
         encode_capture_provenance_extension(&mut e, capture.provenance)?;
     }
     encode_metadata_record(MetadataRecordType::Branch, &e.finish())
@@ -3487,7 +3496,7 @@ fn decode_protection(bytes: &[u8]) -> Result<ProtectionRecord, ControlError> {
             let owner_incarnation = OwnerIncarnation(d.u64_le().map_err(corrupt)?);
             let expires_at = MonotonicTime::from_nanos(d.u64_le().map_err(corrupt)?);
             let count = d.u32_le().map_err(corrupt)? as usize;
-            if count > 4096 {
+            if count > MAX_STORED_PREPARATION_DEPENDENCIES {
                 return Err(ControlError::CorruptRecord(
                     "too many protected dependencies".into(),
                 ));
@@ -3776,10 +3785,11 @@ fn encode_capture(e: &mut CanonicalEncoder, value: &CaptureState) {
 fn encode_capture_result(value: &CaptureState) -> Result<Vec<u8>, FormatError> {
     let mut e = CanonicalEncoder::new();
     encode_capture(&mut e, value);
-    // Include an extension even for unattributed captures so sealed results
-    // expose the exact admitted binding. Legacy result bytes decode as
-    // unattributed when this extension is absent.
-    encode_capture_provenance_extension(&mut e, value.provenance)?;
+    // Preserve legacy bytes for unattributed captures. Recorded bindings need
+    // the extension because they cannot be inferred from the legacy payload.
+    if value.provenance != ProvenanceBinding::Unattributed {
+        encode_capture_provenance_extension(&mut e, value.provenance)?;
+    }
     Ok(e.finish())
 }
 

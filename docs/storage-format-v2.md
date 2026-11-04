@@ -1,7 +1,9 @@
 # Version FS Provenance Format v2
 
-**Status:** Implemented in `versionfs-core`; capture-time provenance publication
-and protected inspection remain pending.
+**Status:** Versioned descriptors, context encoding, graph verification,
+capture-time binding, catalog publication, and recording-principal verification
+are implemented in `versionfs-core`. Protected inspection and retention-report
+closure remain pending.
 
 This note defines the v2 Generation descriptor and its bounded provenance
 context. All referenced data, maps, log segments, and artifact payloads retain
@@ -101,7 +103,8 @@ required evidence invalidates the proof; readers must not downgrade the
 Generation to unattributed. Optional links and opaque IDs create no retention
 edges.
 
-The format and graph proof do not implement capture-time binding, operation
-fingerprinting, publication, retention catalog updates, or protected context
-inspection. Those protocols remain separate P7/P9/P10 work.
+The format and graph proof define immutable data, not the control protocol. P7
+implements capture-time binding, operation fingerprinting, and atomic catalog
+publication in core. Protected context inspection remains P9 work, and required-
+evidence closure in retention reports remains P10 work.
 

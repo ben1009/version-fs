@@ -1063,6 +1063,10 @@ expiry; an unknown renewal must be retried/queried under the same ID before anot
 is allocated. Pause further work while unresolved, keeping the capture freeze or
 barrier admission and dependencies protected.
 
+A preparation accepts at most 4096 caller-supplied protected dependencies. A
+recorded capture's context root is added automatically when absent, so its stored
+preparation may contain one additional dependency.
+
 The block worker checks renewal between immutable-object transfers. Each blocking
 S3 bridge operation has a five-minute enforced deadline, shorter than the
 preparation's ten-minute inactivity deadline, so one stalled transfer cannot

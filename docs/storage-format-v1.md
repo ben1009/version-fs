@@ -15,10 +15,12 @@ note defines the unchanged v1 bytes for existing objects. V1 descriptors have no
 provenance field and upgraded readers expose them as explicitly unattributed;
 never append fields to v1 or rewrite its identities. V2 encoding, context objects,
 dual-version descriptor readers, graph verification, and golden vectors are
-specified in [`storage-format-v2.md`](storage-format-v2.md). Capture-time binding
-and protected inspection remain pending P7/P9; P10 owns required-evidence
-traversal for retention reports. These work items must pass RFC-002's I16 gates
-before claiming complete provenance support.
+specified in [`storage-format-v2.md`](storage-format-v2.md). P7 implements
+capture-time binding, descriptor matching, publication, and workspace-scoped
+recording-principal verification in core. Protected provenance inspection remains
+pending P9, and P10 owns required-evidence traversal for retention reports; all
+remaining work must pass RFC-002's I16 gates before claiming complete provenance
+support.
 
 The v2 descriptor uses outer `VFSO` envelope version `2` with object type `11`;
 its version is not an added payload field. V1-only readers reject that envelope
@@ -183,6 +185,15 @@ Record type codes are `Workspace=1`, `Branch=2`, `Generation=3`,
 authority protocol; a prefix scan is not a transactional predicate. Unknown
 schema versions and record types are rejected. A migration must add explicit
 reader/writer support before data is stored under the new version.
+
+P7 adds record type 10 for workspace-scoped provenance-principal associations and
+the optional `CPRV` suffix to branch and capture-result payloads with recorded
+provenance. Unattributed captures omit the suffix and preserve their legacy
+payload bytes. These additions are not readable by older metadata readers:
+deploy readers that understand them before recording provenance, and do not roll
+back to a reader that rejects them while such records remain. The same
+reader-first, no-downgrade rule applies to v2 Generation descriptors, as
+described in [`storage-format-v2.md`](storage-format-v2.md).
 
 ## 7. Golden Vectors
 

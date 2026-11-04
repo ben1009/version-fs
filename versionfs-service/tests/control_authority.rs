@@ -1109,6 +1109,93 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         .expect("authorized publisher preserves the context's original principal");
     assert_eq!(reused_publication.generation_id, generation(5));
     assert_eq!(reused_publication.branch.revision, 4);
+
+    let original_principal_capture_id = op(98);
+    env.control
+        .begin_preparation_with_provenance(
+            PreparationRequest {
+                operation_id: original_principal_capture_id,
+                branch_id: branch(1),
+                expected_revision: 4,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(93),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![],
+            },
+            first_binding,
+        )
+        .expect("original recording principal remains valid after context reuse");
+    env.control
+        .seal_capture(op(99), original_principal_capture_id, 4, grant)
+        .expect("seal capture using the original recording principal");
+    let original_principal_generation = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(6),
+        Some(generation(5)),
+        initial.seed().roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(89)),
+        89,
+        first_binding,
+        &[],
+    )
+    .expect("create Generation with the established context");
+    let original_principal_publication = env
+        .control
+        .publish_capture(
+            original_principal_capture_id,
+            4,
+            generation(5),
+            grant,
+            attachment(1),
+            1,
+            original_principal_generation,
+            true,
+        )
+        .expect("reusing the context did not replace its recording principal");
+    assert_eq!(original_principal_publication.generation_id, generation(6));
+}
+
+#[test]
+fn recorded_capture_context_does_not_consume_caller_dependency_limit() {
+    let mut store = TestObjectStore::default();
+    let initial = empty_generation(&mut store, generation(1), 86);
+    let context = store_provenance_context(
+        &mut store,
+        principal(1),
+        initial.seed().roots,
+        "many-dependencies",
+    );
+    let env = TestEnv::with_initial_seed(initial.clone());
+    let grant = env.writer_and_attachment();
+    let capture_id = op(181);
+
+    env.control
+        .begin_preparation_with_provenance(
+            PreparationRequest {
+                operation_id: capture_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(181),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![initial.seed().roots.volume; 4096],
+            },
+            ProvenanceBinding::Recorded {
+                context_root: context,
+            },
+        )
+        .expect("context protection is in addition to the caller dependency limit");
+
+    env.control
+        .abort_operation(capture_id)
+        .expect("decode and release all stored dependencies");
 }
 
 #[test]
