@@ -17,8 +17,8 @@ use crate::{
     },
     graph::DependencyProof,
     identity::{
-        AttachmentId, BranchId, GenerationId, ObjectStoreScopeId, OperationId, PinId, PrincipalId,
-        ProtectionId, WorkspaceId,
+        AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
+        PrincipalId, ProtectionId, WorkspaceId,
     },
     metadata::{
         MetadataAuthority, MetadataError, MetadataTxn, MutationIdentity, ReconciledOutcome,
@@ -2117,15 +2117,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         if generation.descriptor().parent_generation_id() != Some(expected_parent) {
             return Err(ControlError::InvalidTransition);
         }
-        if generation
-            .provenance_recording_principal()
-            .is_some_and(|recording_principal| recording_principal != self.principal_id)
-        {
-            return Err(ControlError::InvalidRequest(
-                "provenance recording principal does not match the authenticated caller",
+        let descriptor = generation.descriptor();
+        let recording_principal = generation.provenance_recording_principal();
+        if descriptor.context_root().is_some() != recording_principal.is_some() {
+            return Err(ControlError::CorruptRecord(
+                "verified provenance context summary is missing".into(),
             ));
         }
-        let descriptor = generation.descriptor();
         let VerifiedGenerationSeed {
             seed: generation,
             proof: _,
@@ -2254,6 +2252,18 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 || branch_live_roots(&branch) != generation.roots
             {
                 return Err(reject("invalid_transition"));
+            }
+            if let (Some(context_root), Some(recording_principal)) =
+                (descriptor.context_root(), recording_principal)
+            {
+                validate_or_record_provenance_context(
+                    txn,
+                    self.workspace_id,
+                    context_root,
+                    recording_principal,
+                    self.principal_id,
+                )
+                .map_err(to_metadata_error)?;
             }
 
             let preparation_protection_key = protection_key(self.workspace_id, protection_id);
@@ -3520,6 +3530,65 @@ fn decode_capture_child_reservation(bytes: &[u8]) -> Result<CaptureChildReservat
     Ok(reservation)
 }
 
+fn validate_or_record_provenance_context(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    context_root: ObjectRef,
+    recording_principal: PrincipalId,
+    publishing_principal: PrincipalId,
+) -> Result<(), ControlError> {
+    let key = provenance_context_principal_key(workspace, context_root.object_id);
+    let Some(bytes) = txn.get(&key)? else {
+        if recording_principal != publishing_principal {
+            return Err(ControlError::InvalidRequest(
+                "an unverified provenance context must be recorded by its authenticated principal",
+            ));
+        }
+        let encoded = encode_provenance_context_principal(context_root, recording_principal)?;
+        txn.put(&key, &encoded)?;
+        return Ok(());
+    };
+
+    let (stored_root, stored_principal) = decode_provenance_context_principal(&bytes)?;
+    if stored_root != context_root || stored_principal != recording_principal {
+        return Err(ControlError::CorruptRecord(
+            "provenance context principal binding conflicts with its verified object".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn encode_provenance_context_principal(
+    context_root: ObjectRef,
+    recording_principal: PrincipalId,
+) -> Result<Vec<u8>, FormatError> {
+    validate_provenance_binding(ProvenanceBinding::Recorded { context_root })?;
+    let mut encoder = CanonicalEncoder::new();
+    encoder.object_ref(context_root);
+    encoder.fixed(recording_principal.as_bytes());
+    encode_metadata_record(
+        MetadataRecordType::ProvenanceContextPrincipal,
+        &encoder.finish(),
+    )
+}
+
+fn decode_provenance_context_principal(
+    bytes: &[u8],
+) -> Result<(ObjectRef, PrincipalId), ControlError> {
+    let (record_type, payload) = decode_metadata_record(bytes).map_err(corrupt)?;
+    if record_type != MetadataRecordType::ProvenanceContextPrincipal {
+        return Err(ControlError::CorruptRecord(
+            "wrong provenance context principal record type".into(),
+        ));
+    }
+    let mut decoder = CanonicalDecoder::new(payload);
+    let context_root = decoder.object_ref().map_err(corrupt)?;
+    validate_provenance_binding(ProvenanceBinding::Recorded { context_root }).map_err(corrupt)?;
+    let principal = PrincipalId::from_bytes(decoder.fixed().map_err(corrupt)?);
+    decoder.finish().map_err(corrupt)?;
+    Ok((context_root, principal))
+}
+
 fn encode_pin(pin: PinRecord) -> Result<Vec<u8>, FormatError> {
     let mut e = CanonicalEncoder::new();
     e.fixed(pin.generation_id.as_bytes());
@@ -4470,6 +4539,15 @@ fn generation_key(workspace: WorkspaceId, generation: GenerationId) -> Vec<u8> {
         b"generation/",
         workspace.as_bytes(),
         generation.as_bytes(),
+    ]
+    .concat()
+}
+fn provenance_context_principal_key(workspace: WorkspaceId, object_id: ObjectId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"provenance-context-principal/",
+        workspace.as_bytes(),
+        object_id.as_bytes(),
     ]
     .concat()
 }

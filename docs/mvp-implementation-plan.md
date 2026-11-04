@@ -311,9 +311,11 @@ their mutation protocols and connects them to this same coordinator.
 - [x] Bind explicit provenance at capture admission and in request fingerprints;
   protect its context root during preparation, then publish/retain its verified
   required graph with the descriptor and reconcile the original binding on lost
-  replies. Enforce the context recording principal against the authenticated
-  caller. Equal view roots may have different Generation contexts; changed
-  attribution on the same operation ID rejects.
+  replies. Verify a context's recording principal against the authenticated
+  caller on first publication; later authorized publishers may reuse the
+  established context without changing its original principal. Equal view roots
+  may have different Generation contexts; changed attribution on the same
+  operation ID rejects.
 - [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
 - [ ] Close local admission, read authoritative revision/live roots together,

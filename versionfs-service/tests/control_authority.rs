@@ -987,10 +987,64 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
         next_generation.descriptor().context_root(),
         matching_generation.descriptor().context_root()
     );
+
+    let other_principal = control_for(
+        Arc::clone(&env.authority),
+        env.workspace_id,
+        principal(2),
+        env.owner,
+    );
+    let reused_capture_id = op(96);
+    other_principal
+        .begin_preparation_with_provenance(
+            PreparationRequest {
+                operation_id: reused_capture_id,
+                branch_id: branch(1),
+                expected_revision: 3,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(92),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![],
+            },
+            first_binding,
+        )
+        .expect("authorized publisher can reuse an established provenance context");
+    other_principal
+        .seal_capture(op(97), reused_capture_id, 3, grant)
+        .expect("seal capture with reused context");
+    let reused_generation = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(5),
+        Some(generation(4)),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(87)),
+        87,
+        first_binding,
+        &[],
+    )
+    .expect("create Generation reusing the verified context");
+    let reused_publication = other_principal
+        .publish_capture(
+            reused_capture_id,
+            3,
+            generation(4),
+            grant,
+            attachment(1),
+            1,
+            reused_generation,
+            true,
+        )
+        .expect("authorized publisher preserves the context's original principal");
+    assert_eq!(reused_publication.generation_id, generation(5));
+    assert_eq!(reused_publication.branch.revision, 4);
 }
 
 #[test]
-fn capture_rejects_recording_principal_not_bound_to_authenticated_caller() {
+fn first_publication_rejects_recording_principal_not_bound_to_authenticated_caller() {
     let mut store = TestObjectStore::default();
     let initial = empty_generation(&mut store, generation(1), 85);
     let context = store_provenance_context(&mut store, principal(99), initial.roots, "untrusted");

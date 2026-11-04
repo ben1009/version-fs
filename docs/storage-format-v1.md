@@ -177,10 +177,12 @@ Metadata values use a separate envelope:
 | 16 | variable | canonical record payload |
 
 Record type codes are `Workspace=1`, `Branch=2`, `Generation=3`,
-`OperationOutcome=4`, and `Protection=5`. Metadata keys remain point-addressed
-by the authority protocol; a prefix scan is not a transactional predicate.
-Unknown schema versions and record types are rejected. A migration must add
-explicit reader/writer support before data is stored under the new version.
+`OperationOutcome=4`, `Protection=5`, `AuthorityOwner=6`,
+`BranchNameIndex=7`, `Pin=8`, `CaptureChildReservation=9`, and
+`ProvenanceContextPrincipal=10`. Metadata keys remain point-addressed by the
+authority protocol; a prefix scan is not a transactional predicate. Unknown
+schema versions and record types are rejected. A migration must add explicit
+reader/writer support before data is stored under the new version.
 
 ## 7. Golden Vectors
 
