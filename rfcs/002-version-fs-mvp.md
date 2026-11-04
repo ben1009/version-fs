@@ -366,10 +366,14 @@ Distinct Generations with the same VolumeRoot or even the same complete view
 roots may bind different contexts; state deduplication never merges attribution.
 
 `ProvenanceContext` is one canonical, checksummed metadata object bounded to
-64 KiB. It records the authenticated recording principal separately from supplied
-actor/execution, session/thread, task, workflow-operation, reason, and trace/span
-fields. Those supplied fields are optional claims from the runtime, not proof
-of observation by Version FS. Scoped workflow references can group several
+64 KiB. When recording new context, the recording principal MUST be derived from
+the authenticated request identity or validated against it; a caller-supplied
+principal that fails validation MUST be rejected. Actor/execution, session/thread,
+task, workflow-operation, reason, and trace/span fields are optional, untrusted
+attribution claims from the runtime. They establish neither an authenticated
+identity nor proof of observation by Version FS. Reusing recorded context preserves
+its original verified recording principal; the publishing caller is authorized
+separately. Scoped workflow references can group several
 operations or appear in several Generations without adding an operation-query
 engine or replacing storage request IDs.
 
