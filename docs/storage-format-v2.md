@@ -22,8 +22,10 @@ Upgraded readers dispatch on `(version, type)` before decoding the payload:
 
 All other known objects remain on v1. The legacy `decode_object` entry point is
 v1-only and rejects `(2, 11)` before payload validation. The upgraded
-`decode_object_versioned` and `decode_generation_descriptor` entry points
-accept the supported pairs above and reject unknown versions or pairs.
+`decode_object_versioned` handles envelope dispatch across supported object kinds.
+Typed descriptor reads use `decode_generation_descriptor` for `(1, 11)` and
+`(2, 11)`, while `ProvenanceContext::decode` handles `(1, 14)`. Each entry point
+rejects unsupported versions or types.
 
 `GenerationDescriptor::encode` and `GenerationDescriptor::decode` remain legacy
 v1 codecs. General readers use `decode_generation_descriptor`, which preserves
