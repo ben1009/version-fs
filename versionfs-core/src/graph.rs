@@ -6,7 +6,7 @@ use crate::format::{
     MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, ProvenanceContext, SegmentIndexEntry,
     VolumeRoot, decode_generation_descriptor, decode_object,
 };
-use crate::identity::{LogId, ObjectId, ObjectStoreScopeId};
+use crate::identity::{LogId, ObjectId, ObjectStoreScopeId, PrincipalId};
 use crate::persistent_map::{MapObjectStore, Node as MapNode, PersistentMapError, load_node};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
@@ -76,6 +76,22 @@ impl DependencyProof {
         self.generation_descriptor
     }
 
+    /// Returns the recording principal from the verified context object, if present.
+    pub fn provenance_recording_principal(&self) -> Option<PrincipalId> {
+        let context_root = self.generation_descriptor.context_root()?;
+        self.root.children.iter().find_map(|child| {
+            if child.reference != context_root {
+                return None;
+            }
+            match &child.summary {
+                VerifiedSummary::ProvenanceContext {
+                    recording_principal,
+                } => Some(*recording_principal),
+                _ => None,
+            }
+        })
+    }
+
     /// Returns the exact strong dependency closure in deterministic ID order.
     ///
     /// This materializes the proof DAG and is intended for inspection or
@@ -129,7 +145,9 @@ enum VerifiedSummary {
     Descriptor {
         descriptor: DecodedGenerationDescriptor,
     },
-    ProvenanceContext,
+    ProvenanceContext {
+        recording_principal: PrincipalId,
+    },
     Payload {
         payload_len: u64,
     },
@@ -533,7 +551,7 @@ impl<S: MapObjectStore> Verifier<'_, S> {
             return Err(FormatError::ObjectReferenceMismatch.into());
         }
         if let Some(node) = self.reusable(reference)? {
-            if matches!(&node.summary, VerifiedSummary::ProvenanceContext) {
+            if matches!(&node.summary, VerifiedSummary::ProvenanceContext { .. }) {
                 return Ok(node);
             }
             return Err(FormatError::ObjectReferenceMismatch.into());
@@ -544,7 +562,9 @@ impl<S: MapObjectStore> Verifier<'_, S> {
         let artifacts = self.verify_artifacts(context.required_artifacts_root)?;
         Ok(self.finish(
             reference,
-            VerifiedSummary::ProvenanceContext,
+            VerifiedSummary::ProvenanceContext {
+                recording_principal: context.recording_principal,
+            },
             vec![logs, artifacts],
         ))
     }

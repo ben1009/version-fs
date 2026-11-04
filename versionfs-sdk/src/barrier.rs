@@ -1044,7 +1044,7 @@ pub fn create_empty_generation<S: DurableObjectStore>(
     boundary_id: VolumeBoundaryId,
     geometry: VolumeGeometry,
     created_at_unix_ms: u64,
-) -> Result<GenerationSeed, BarrierError> {
+) -> Result<VerifiedGenerationSeed, BarrierError> {
     let (seed, objects) = {
         let mut staging = crate::volume::StagingMapStore::new(store);
         let volume = VolumeExtentMap::empty(geometry, &mut staging)?;
@@ -1086,9 +1086,9 @@ pub fn create_empty_generation<S: DurableObjectStore>(
             .map_err(BarrierError::ObjectStore)?;
     }
 
-    verify_generation(store, seed.descriptor)?;
+    let proof = verify_generation(store, seed.descriptor)?;
 
-    Ok(seed)
+    Ok(VerifiedGenerationSeed::from_proof(proof))
 }
 
 /// Creates, durably stores, and verifies a descriptor for already durable roots.
@@ -1106,7 +1106,7 @@ pub fn create_generation<S: DurableObjectStore>(
     boundary_id: VolumeBoundaryId,
     created_at_unix_ms: u64,
 ) -> Result<VerifiedGenerationSeed, BarrierError> {
-    create_generation_with_reuse(
+    create_generation_with_provenance(
         store,
         generation_id,
         parent_generation_id,
@@ -1114,6 +1114,31 @@ pub fn create_generation<S: DurableObjectStore>(
         capture_mode,
         boundary_id,
         created_at_unix_ms,
+        ProvenanceBinding::Unattributed,
+    )
+}
+
+/// Creates and verifies a Generation descriptor with an explicit provenance binding.
+#[allow(clippy::too_many_arguments)]
+pub fn create_generation_with_provenance<S: DurableObjectStore>(
+    store: &mut S,
+    generation_id: GenerationId,
+    parent_generation_id: Option<GenerationId>,
+    roots: LiveRoots,
+    capture_mode: CaptureMode,
+    boundary_id: VolumeBoundaryId,
+    created_at_unix_ms: u64,
+    provenance: ProvenanceBinding,
+) -> Result<VerifiedGenerationSeed, BarrierError> {
+    create_generation_with_reuse_and_provenance(
+        store,
+        generation_id,
+        parent_generation_id,
+        roots,
+        capture_mode,
+        boundary_id,
+        created_at_unix_ms,
+        provenance,
         &[],
     )
 }
@@ -1135,13 +1160,40 @@ pub fn create_generation_with_reuse<S: DurableObjectStore>(
     created_at_unix_ms: u64,
     protected_proofs: &[&DependencyProof],
 ) -> Result<VerifiedGenerationSeed, BarrierError> {
+    create_generation_with_reuse_and_provenance(
+        store,
+        generation_id,
+        parent_generation_id,
+        roots,
+        capture_mode,
+        boundary_id,
+        created_at_unix_ms,
+        ProvenanceBinding::Unattributed,
+        protected_proofs,
+    )
+}
+
+/// Creates a Generation while binding explicit provenance and reusing verified,
+/// protected immutable subgraphs.
+#[allow(clippy::too_many_arguments)]
+pub fn create_generation_with_reuse_and_provenance<S: DurableObjectStore>(
+    store: &mut S,
+    generation_id: GenerationId,
+    parent_generation_id: Option<GenerationId>,
+    roots: LiveRoots,
+    capture_mode: CaptureMode,
+    boundary_id: VolumeBoundaryId,
+    created_at_unix_ms: u64,
+    provenance: ProvenanceBinding,
+    protected_proofs: &[&DependencyProof],
+) -> Result<VerifiedGenerationSeed, BarrierError> {
     let descriptor = GenerationDescriptorV2 {
         generation_id,
         parent_generation_id,
         volume_root: roots.volume,
         logs_root: roots.logs,
         artifacts_root: roots.artifacts,
-        provenance: ProvenanceBinding::Unattributed,
+        provenance,
         capture_mode,
         volume_boundary_id: boundary_id,
         created_at_unix_ms,
@@ -2167,8 +2219,8 @@ mod tests {
         let child = create_generation(
             &mut store,
             GenerationId::from_bytes([3; 16]),
-            Some(parent.generation_id),
-            parent.roots,
+            Some(parent.seed().generation_id),
+            parent.seed().roots,
             CaptureMode::FilesystemCleanUnmount,
             VolumeBoundaryId::from_bytes([4; 16]),
             20,
@@ -2184,7 +2236,7 @@ mod tests {
         assert_eq!(descriptor.generation_id(), child_seed.generation_id);
         assert_eq!(
             descriptor.parent_generation_id(),
-            Some(parent.generation_id)
+            Some(parent.seed().generation_id)
         );
         assert_eq!(
             descriptor.capture_mode(),
@@ -2219,7 +2271,7 @@ mod tests {
                 .objects
                 .lock()
                 .expect("lock object store")
-                .remove(&parent.roots.volume.object_id)
+                .remove(&parent.seed().roots.volume.object_id)
                 .is_some(),
             "parent volume root should exist before removal"
         );
@@ -2228,8 +2280,8 @@ mod tests {
             create_generation(
                 &mut store,
                 GenerationId::from_bytes([3; 16]),
-                Some(parent.generation_id),
-                parent.roots,
+                Some(parent.seed().generation_id),
+                parent.seed().roots,
                 CaptureMode::FilesystemCleanUnmount,
                 VolumeBoundaryId::from_bytes([4; 16]),
                 20,
@@ -2265,12 +2317,12 @@ mod tests {
             .unwrap();
         let roots = LiveRoots {
             volume,
-            ..initial.roots
+            ..initial.seed().roots
         };
         let parent = create_generation(
             &mut store,
             GenerationId::from_bytes([3; 16]),
-            Some(initial.generation_id),
+            Some(initial.seed().generation_id),
             roots,
             CaptureMode::BlockCut,
             VolumeBoundaryId::from_bytes([4; 16]),
@@ -2725,9 +2777,9 @@ mod tests {
                 writer_epoch: 1,
                 volume_epoch: 1,
                 stream_epoch: 1,
-                volume_root: seed.roots.volume,
-                logs_root: seed.roots.logs,
-                artifacts_root: seed.roots.artifacts,
+                volume_root: seed.seed().roots.volume,
+                logs_root: seed.seed().roots.logs,
+                artifacts_root: seed.seed().roots.artifacts,
                 writer: Some(grant),
                 attachment: Some(AttachmentState {
                     attachment_id,
@@ -3307,6 +3359,7 @@ mod tests {
                 operation_id: capture_id,
                 principal_id: versionfs_core::identity::PrincipalId::from_bytes([20; 16]),
                 protection_id: ProtectionId::from_bytes([21; 16]),
+                provenance: versionfs_core::format::ProvenanceBinding::Unattributed,
                 expected_revision: 1,
                 sealed: false,
                 pending_child: None,
@@ -3344,6 +3397,7 @@ mod tests {
                 operation_id: capture_id,
                 principal_id: versionfs_core::identity::PrincipalId::from_bytes([24; 16]),
                 protection_id: ProtectionId::from_bytes([25; 16]),
+                provenance: versionfs_core::format::ProvenanceBinding::Unattributed,
                 expected_revision: 1,
                 sealed: false,
                 pending_child: Some(child_id),
@@ -3387,6 +3441,7 @@ mod tests {
                 operation_id: capture_id,
                 principal_id: versionfs_core::identity::PrincipalId::from_bytes([28; 16]),
                 protection_id: ProtectionId::from_bytes([29; 16]),
+                provenance: versionfs_core::format::ProvenanceBinding::Unattributed,
                 expected_revision: 1,
                 sealed: false,
                 pending_child: Some(child_id),
@@ -3429,6 +3484,7 @@ mod tests {
                 operation_id: OperationId::from_bytes([40; 16]),
                 principal_id: versionfs_core::identity::PrincipalId::from_bytes([41; 16]),
                 protection_id: ProtectionId::from_bytes([44; 16]),
+                provenance: versionfs_core::format::ProvenanceBinding::Unattributed,
                 expected_revision: 1,
                 sealed: false,
                 pending_child: Some(child_id),
@@ -3553,6 +3609,7 @@ mod tests {
                     operation_id: OperationId::from_bytes([30; 16]),
                     principal_id: versionfs_core::identity::PrincipalId::from_bytes([31; 16]),
                     protection_id: ProtectionId::from_bytes([32; 16]),
+                    provenance: versionfs_core::format::ProvenanceBinding::Unattributed,
                     expected_revision: 1,
                     sealed: false,
                     pending_child: None,
