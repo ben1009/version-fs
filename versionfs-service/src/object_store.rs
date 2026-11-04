@@ -745,7 +745,14 @@ fn s3_backend_namespace(builder: &AmazonS3Builder, deployment_prefix: &str) -> S
         digest.update(component.as_bytes());
     }
 
-    format!("s3://{:x}", digest.finalize())
+    let digest = digest.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded_digest = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded_digest.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded_digest.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    format!("s3://{encoded_digest}")
 }
 
 #[cfg(feature = "s3-emulator")]
@@ -1300,6 +1307,24 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn s3_backend_namespace_encodes_sha256_as_lowercase_hex() {
+        let builder = AmazonS3Builder::new()
+            .with_access_key_id("test")
+            .with_secret_access_key("test");
+        let namespace = s3_backend_namespace(&builder, "deployment");
+        let digest = namespace
+            .strip_prefix("s3://")
+            .expect("namespace has the S3 scheme");
+
+        assert_eq!(digest.len(), 64);
+        assert!(
+            digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
