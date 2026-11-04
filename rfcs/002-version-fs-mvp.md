@@ -22,6 +22,8 @@ implements the Generation semantics and invariants of RFC-001 using:
 - A native SDK and CLI, with a Linux ublk block server and ext4 as the reference
   filesystem consumer.
 - Native ordered logs using S2 as the semantic reference.
+- An immutable Generation provenance binding with explicit attribution status
+  and retained references to caller-selected context and evidence.
 - Explicit retention, pins, reader protection, and mark-only reachability reports.
 
 A successful demonstration is:
@@ -68,6 +70,7 @@ or achieved performance.
 | Metadata | Persistent volume-extent map, artifact-chunk indexes, log indexes, and root maps. |
 | Authority | Backend-independent transactional contract, implemented by `ToyKvMetadataAuthority` for the MVP. |
 | Generations | Complete immutable roots; branch-attached and detached publication; operation outcome lookup. |
+| Provenance | Explicit recorded/unattributed binding, bounded Generation context, required-evidence graph protection, and protected inspection. |
 | Block volume | One fixed-capacity volume per workspace, sparse zero extents, range reads, dirty-extent tracking, and fenced writable attachment. |
 | Filesystem | Linux ublk device with ext4 reference formatting/mounting; filesystem operations and metadata are implemented by Linux. |
 | Branches | Create/fork, checkpoint, conditional head movement, rollback, promote, delete, writer fencing. |
@@ -89,6 +92,11 @@ chunking, volume resize, multi-volume atomic checkpoints, discard/TRIM,
 automatic autosave, or a remote mutation WAL for unflushed block writes.
 The v0 object store only grows. Safe reclamation and deletion fencing belong
 in a follow-up RFC, tentatively RFC-003: Safe Object Reclamation.
+
+Automatic operation instrumentation, execution-history ingestion or search,
+cross-version causal indexes, and file/line/character attribution are deferred.
+The runtime supplies context and observations; v0 stores their declared binding
+and required evidence without inferring events from block writes.
 
 Process-memory snapshots, application database snapshots, GTS adapters, and
 coordinated global checkpoints remain the extension in RFC-001 Section 18.
@@ -302,12 +310,17 @@ blob. Log attachments are explicit typed edges, not hashes inside opaque text.
 
 ```text
 GenerationDescriptor {
-    format_version,
+    format_version: 2,       // provenance-capable descriptor revision
     generation_id,
     parent_generation_id?,   // lineage, not a required object edge
     volume_root,
     logs_root,
     artifacts_root,
+    provenance: {
+        status: recorded | unattributed,
+        context_root?: ObjectRef<ProvenanceContext>,
+        coverage: generation_context | none,
+    },
     capture: { mode, volume_boundary_id },
     created_at,              // informational, not a global coordinate
 }
@@ -326,6 +339,61 @@ The authority catalog binds a Generation ID to its descriptor and publication
 result. Uploading a descriptor creates no visible Generation. A live durable
 volume root is also not automatically a Generation or a coordinated log/artifact
 checkpoint.
+
+This is a versioned extension to the implemented v1 descriptor, not a change to
+its existing byte layout. New MVP writers use descriptor v2 with an explicit
+binding, including for the initial empty Generation; unchanged data/map objects
+keep their existing versions and identities. A supported legacy v1 descriptor
+is reported as `unattributed`, `coverage = none`, with no context root and an
+explicit legacy-format indicator. Its bytes, digest, and publication binding
+are never rewritten to synthesize provenance. Unknown versions are rejected.
+The v2 encoding, new context type, readers, and golden vectors must be specified
+and implemented before the provenance release gate is qualified; the existing
+[v1 format note](../docs/storage-format-v1.md) documents the legacy encoding.
+
+### 4.6 Minimal Generation provenance
+
+The descriptor's binding has exactly two v0 states:
+
+| Status | Required representation and meaning |
+| --- | --- |
+| `recorded` | A typed context root is present and `coverage = generation_context`; the selected context for creating this Generation is retained. It does not claim complete observation of all contributing operations. |
+| `unattributed` | No context root and `coverage = none`; attribution was not supplied or is absent in a legacy descriptor. |
+
+Other combinations and unknown enum values are invalid. An unavailable required
+context is an error, not permission to reinterpret `recorded` as `unattributed`.
+Distinct Generations with the same VolumeRoot or even the same complete view
+roots may bind different contexts; state deduplication never merges attribution.
+
+`ProvenanceContext` is one canonical, checksummed metadata object bounded to
+64 KiB. It records the authenticated recording principal separately from supplied
+actor/execution, session/thread, task, workflow-operation, reason, and trace/span
+fields. Those supplied fields are optional claims from the runtime, not proof
+of observation by Version FS. Scoped workflow references can group several
+operations or appear in several Generations without adding an operation-query
+engine or replacing storage request IDs.
+
+The context has typed `required_logs_root` and `required_artifacts_root` edges,
+using the existing native map formats and canonical empty roots when no evidence
+is selected. These resolve exact retained log ranges and artifact payloads.
+The descriptor-to-context edge and both evidence closures are strong edges,
+including evidence absent from the Generation's ordinary view roots. Context
+may also hold optional external links; they are descriptive and create no
+retention edges. Opaque hashes, trace IDs, and prior-version/workflow IDs inside
+attributes do not implicitly retain their targets.
+
+By default the provenance path retains selected structured identifiers,
+correlation fields, references, and coverage. It does not automatically copy raw
+prompts, conversations, or tool output. Retaining such payloads as required
+evidence requires explicit selection under an access, retention, and redaction
+policy. Sanitize before durable ingestion, including log append or S3 staging.
+The v0 store has no physical erasure; later policy changes cannot rewrite a
+published binding or silently remove required evidence. This default does not
+alter the bytes a caller explicitly writes to the volume or appends to a log.
+
+The runtime owns the context and claimed observations. The trusted Version FS
+path verifies their encoding, scope, required graph, and durable association;
+it provides no automatic tracing collector or filename attribution.
 
 ## 5. Control metadata and operation identity
 
@@ -512,6 +580,10 @@ preconditions, and logical payload. A protected preparation binds its request
 first; checkpoint sealing records the final immutable root once, rejecting a
 different root on retry. Matching retries return the recorded result or resume
 that preparation. Reusing an ID with another request is `OperationMismatch`.
+Creation/checkpoint fingerprints include the exact provenance binding, including
+its status, coverage, and context-root identity. Capture admission and the durable
+intent fix this binding before object I/O; sealing cannot replace it. A retry
+with another attribution is `OperationMismatch`, even when all view roots match.
 Authorizing a capture child reserves its operation ID across all mutation kinds
 in the owning caller's namespace. An unrelated mutation or preparation on any
 branch cannot claim that ID while it is reserved, even before an operation
@@ -915,9 +987,12 @@ reuse requires complete verified reads/uploads. Validation proceeds bottom-up
 without walking every unchanged protected subtree.
 
 This applies equally to durable volume barriers, checkpoint descriptors, native
-log roots, and artifact attachments. Required dependencies are protected until
-commit or a definite abort. No object deletion or GC admission barrier exists
-in v0. The parent Generation ID is not a required content edge.
+log roots, artifact attachments, and recorded provenance context/evidence.
+The builder verifies all typed context edges in the workspace's object namespace;
+missing or corrupt required evidence prevents publication. Optional external
+links are not fetched as durability or graph dependencies. Required dependencies
+are protected until commit or a definite abort. No object deletion or GC admission
+barrier exists in v0. The parent Generation ID is not a required content edge.
 
 ### 8.2 Capture sequence and preparation lifetime
 
@@ -947,10 +1022,12 @@ in v0. The parent Generation ID is not a required content edge.
    I/O; permit only the capture's identified drain-flush children. Each child
    advances the live root/revision normally and records its own durable outcome.
 3. After the final durable barrier, stop/drain block mutations and seal one
-   immutable tuple of volume boundary/root, log root, artifact input, and the
-   resulting revision. Track only authorized child revision changes; unrelated
-   mutations conflict rather than silently rebasing the capture.
-4. Build/upload new artifact/index nodes and a complete Generation descriptor.
+   immutable tuple of volume boundary/root, log root, artifact input, the fixed
+   provenance binding, and the resulting revision. Track only authorized child
+   revision changes; unrelated mutations conflict rather than silently rebasing
+   the capture.
+4. Build/upload new artifact/index nodes, the already selected provenance context
+   and any new required evidence, and a complete Generation descriptor.
    The volume root and historical log segments are reused, not rescanned or recopied.
 5. Publish the sealed tuple in one authority transaction, then reconcile the
    result and local baseline before thawing/reopening admission. Clean-unmount
@@ -985,9 +1062,11 @@ unreferenced bytes remain stored and may appear in mark-only reports.
 
 Validate authority incarnation, writer/attachment epochs, current lease,
 capture token, sealed roots, exact resulting branch revision, preparation state,
-and retention guards under Section 5.1. Atomically:
+and retention guards under Section 5.1. Require the verified descriptor's
+provenance binding to equal the admitted/sealed binding exactly. Atomically:
 
-1. Create the Generation catalog/descriptor binding and initial retention.
+1. Create the Generation catalog/descriptor binding, including its exact
+   provenance binding and required-evidence closure, and initial retention.
 2. For attached publication, move the head, advance revision, and move the
    attachment's Generation base protection to the new Generation.
 3. Record the immutable operation result, release the branch capture token,
@@ -997,6 +1076,13 @@ The already committed live volume/log roots must still equal the sealed roots.
 Detached publication omits step 2: the Generation is visible and retained by ID
 without moving the head or rebasing the attachment's Generation baseline.
 Its preceding durable flushes remain ordinary live-root changes.
+
+Provenance is bound through the verified immutable descriptor; there is no
+separately mutable attribution row. The transaction records that descriptor and
+its retention/outcome atomically. Unknown-outcome recovery returns the original
+descriptor/binding, including after later head movement. It cannot accept a
+replacement context for the same checkpoint ID or report an uploaded context as
+a successfully published Generation.
 
 Before the transaction, no uploaded descriptor is published. After commit, the
 Generation is authoritative even if the reply is lost or the head moves again.
@@ -1069,6 +1155,13 @@ A parent Generation ID is lineage, not a strong edge to its descriptor. Required
 Git files, log attachments, segment indexes, and named artifacts are strong
 edges. Reachability marking includes each retained descriptor as well as its
 complete content graph.
+
+A recorded provenance context and its required log/artifact evidence are part
+of that graph, even if no branch or ordinary native view names those payloads.
+Pins, protected readers, and preparations protect the same closure; live trim
+cannot invalidate required historical evidence. Optional external links are not
+report roots and may become unavailable. Neither descriptive workflow/ancestor
+links nor permanent operation outcomes implicitly retain their referenced state.
 
 Opening a Generation transactionally verifies publication and current retention
 and creates a five-minute renewable read protection. An open writable volume attachment
@@ -1164,6 +1257,13 @@ filesystem recovery. Native logs/artifacts remain available through their own
 Generation handles without mounting ext4. A complete raw-image export is an
 explicit O(volume capacity) operation, not the normal attach/read path.
 
+The same protected handle lets a fresh worker inspect the provenance binding,
+decode authorized context, and read required evidence without a mount, prior
+worker, or ancestor replay. Missing/corrupt required context or evidence returns
+`IntegrityError`; denied context access is reported as an authorization failure,
+and an unavailable optional link is reported explicitly. None of these cases
+silently relabels a recorded binding as unattributed or substitutes another version.
+
 After ordinary worker/device loss, a fresh writable attachment starts from the
 branch's latest committed live VolumeRoot. A named retained Generation instead
 selects its exact historical root. Successful remote FLUSH/FUA barriers survive
@@ -1199,17 +1299,18 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 
 | Request | Required arguments / result |
 | --- | --- |
-| `create_workspace` | Operation ID and fixed capacity/geometry; returns workspace, main, and zero-volume Generation. |
+| `create_workspace` | Operation ID, fixed capacity/geometry, and selected provenance binding (explicit `unattributed` when absent); returns workspace, main, and zero-volume Generation. |
 | `create_branch` / `get_branch` | Retained base and identified create, or stable ID/name lookup; returns head, live roots, revisions, epochs, and attachment state. |
 | `acquire_writer` / `renew_writer` / `release_writer` | Identified request and exact grant/epoch/handover policy; returns original grant/deadline or release result. |
 | `attach_volume` | Operation ID, branch ID/revision, exact grant; returns fenced attachment ID, protected base, live VolumeRoot/geometry, and device setup inputs. |
 | `renew_base_protection` / `detach_volume` | Operation ID, exact attachment ID/volume epoch/protection ID, and writer grant; detach requires an unmounted, drained device and returns `busy` while a mutation preparation (including a barrier) or capture is pending. Callers must resolve pending work before retrying. Successful detach releases the attachment-base protection; callers must flush dirty state first or explicitly discard it. |
 | `flush_volume` | Internal operation ID, exact attachment/epoch/grant, covered I/O boundary, sealed dirty version, and expected live revision; returns durable volume boundary/root/revision. |
-| `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
+| `checkpoint` | Operation ID, branch/attachment/grant, capture mode, attached/detached policy, and selected provenance binding; captures/seals the exact final revision after authorized drain flushes and returns Generation/optional head revision. |
 | `renew_preparation` | Renewal ID, prepared operation ID (including volume barrier or capture child), exact grant; returns its recorded deadline. |
 | `move_head` / `promote` | Stable source/destination identities and revisions, retained target/published source head, destination grant, explicit live-state discard policy. |
 | `delete_branch` | Operation ID, current stable ID/revision/write authority, explicit live-state discard policy; revokes attachment and removes live refs. |
 | `open_generation` / `renew_handle` / `close_handle` | Identified protected historical view lifecycle; replay does not renew rights. |
+| `read_provenance` | Protected Generation handle; returns status, coverage, descriptor source format, authorized decoded context, and evidence references under the same handle's protection. Optional links are explicitly labeled; inspection requires no external-link fetch. |
 | `read_blocks_at` / `attach_readonly` | Protected Generation and byte range, or immutable block attachment; writes fail. Filesystem replay requires a writable fork. |
 | `diff` | Two protected Generations; streams changed volume ranges, log-view changes, and native named-artifact changes. It returns no inferred filename diff. |
 | `create_log` / `delete_log` / `trim_log` | Identified conditional live-root changes; trim only at batch boundaries. |
@@ -1221,7 +1322,8 @@ its ID to deployment/caller; later requests use workspace/caller scope.
 | `collect` / `get_gc_report` | Operator mark-only report lifecycle, root boundary/inventory window/completeness and paged candidates; expired details return `ReportExpired`. |
 
 The CLI composes device attachment, reference ext4 format/mount/unmount helpers,
-checkpoint/freeze coordination, branch/fork/rollback/promote, log/artifact access,
+checkpoint/freeze coordination, Generation provenance inspection,
+branch/fork/rollback/promote, log/artifact access,
 pins, diff, and recovery/report operations. Formatting is explicitly destructive
 to the selected writable volume; it is never implicit on attach/restore.
 
@@ -1249,6 +1351,8 @@ explicitly if the adapter cannot support them.
 | Any live mutation commits after the pre-drain root read but before capture-token acquisition | Reject acquisition on the old revision; restart capture and drain with a new operation ID, never refresh roots and reuse the old cut. |
 | Extent upload succeeds, metadata commit fails | Old live root remains authoritative; new objects are unreachable preparation data. |
 | Descriptor uploaded, publication not committed | No Generation is visible. |
+| Required context/evidence upload or verification fails | No Generation publication; retain uncertain preparation protection and reconcile its original outcome. |
+| Matching checkpoint ID is retried with different provenance | `OperationMismatch`; preserve the original request/binding and any committed outcome. |
 | Barrier/publication reply is lost after commit | Recover the original operation result even if live roots/head later moved. |
 | Definite transaction conflict | Retry metadata logic and the fresh final lease decision under the same operation ID; repeat no remote/local side effects inside the closure. |
 | Lease expires before the logical commit decision | Reject the entire write set; delayed durability acknowledgement after a valid decision remains valid. |
@@ -1284,7 +1388,7 @@ segments, V retained Generations, and R the distinct report graph.
 | --- | --- |
 | Change discovery | Track admitted dirty block ranges; no O(files + file bytes) directory scan. |
 | Volume persistence | Changed 64 KiB extents plus changed map paths; partial writes may require verified read-modify-write. |
-| Checkpoint | Establish the requested cut/freeze, flush outstanding dirty extents, bind existing volume/log roots, upload staged artifacts/descriptor, and publish. |
+| Checkpoint | Establish the requested cut/freeze, flush outstanding dirty extents, bind existing volume/log roots and selected provenance, upload new required evidence/staged artifacts/descriptor, and publish. |
 | Fork | Bounded metadata/reference writes, independent of capacity, mapped extents, file count, and ancestry. |
 | Attach/read | Fetch root/index paths and demanded extents; independent of V. Filesystem startup may read its own metadata working set. |
 | Raw image export | O(capacity); an explicit operation, not a prerequisite for lazy attach. |
@@ -1403,6 +1507,13 @@ work packages under these phases.
 12. Verify backend-independent domain code, point-key uniqueness/retention guards,
     snapshot-only report scans, no engine timestamp identities, and a documented
     compatible PostgreSQL mapping. PostgreSQL implementation is not a v0 gate.
+13. Encode/decode explicit recorded and unattributed bindings, including genesis
+    and legacy v1 inspection. Reject malformed combinations/unknown versions and
+    pin v2/context golden vectors. Publish distinct Generations sharing view roots
+    with different context; a fresh worker reads the correct binding and authorized
+    required evidence without mounts/ancestors. Pins, readers, and mark-only reports
+    include required evidence outside ordinary views. Verify metadata-only defaults
+    and explicit selection/sanitization of raw conversational payloads.
 
 ### 16.2 Failure-injection gates
 
@@ -1461,6 +1572,12 @@ termination. Check API/kernel outcomes and persisted graph state, not only CLI e
   authorization, root substitution, or workspace outage.
 - Corrupt/missing allocated extents, maps, segments, or descriptors: error instead
   of zero-fill, older contents, or a successful partial filesystem recovery.
+- Required context/evidence missing, corrupt, or in another object namespace:
+  reject publication or report an explicit integrity failure on later access.
+  Trim while evidence is retained and verify its required bytes remain readable.
+- Lose a publication reply, then retry with changed status, coverage, or context:
+  reject the mismatch; replaying the original request returns its original binding.
+  Expiring/denying an optional link does not change that binding or state restore.
 - Exhausted dirty/cache/disk/queue/metadata capacity and unavailable S3/authority:
   fail or preserve recoverable state; no dirty eviction, weakened acknowledgement,
   release of uncertain protection, or reversion to a cached authoritative head.
@@ -1476,6 +1593,7 @@ termination. Check API/kernel outcomes and persisted graph state, not only CLI e
 | I9 | Destroy worker dirty/control/cache state; recover acknowledged live barriers and retained Generations from durable services. |
 | I12-I13 | Workspace/device/object authorization and durable ordered native log ranges/attachments. |
 | I10, I15 | Explicit filesystem/application/runtime/DB boundaries; no fabricated coordinated global-checkpoint claim. |
+| I16 | Versioned explicit provenance, immutable publication/retry binding, required-evidence protection/report closure, distinct attributions over shared state, and fresh-worker authorized inspection. |
 
 Completion requires every capability and gate above, real ublk/ext4/S3/toy-kv
 benchmark evidence, and operator instructions covering device lifecycle, freeze
@@ -1496,6 +1614,7 @@ Other filesystems are not qualified merely because the block interface is generi
 | Transactional MetadataAuthority / toy-kv reference | Backend-neutral protocol exercised locally with preserved storage; no production HA or engine-specific lease hook. |
 | Compatible later PostgreSQL | Production path through managed metadata infrastructure; implementation/qualification deferred. |
 | Native sealed log batches and artifact edges | Preserve exact ordered views independent of disk format; each batch adds remote objects and permanent outcome metadata. |
+| Minimal Generation provenance | Bounded context plus typed required-evidence edges and explicit unattributed status; runtime supplies facts, raw payload retention is opt-in, and operation search/content attribution are deferred. |
 | S3 immutable graph and mark-only reporting | Portable recovery and reachability evidence; unreclaimed bytes and operation results grow for the workspace lifetime. |
 | Trusted coordinator/runner | Provides capture coordination; OS access and external side effects require a separate sandbox/application protocol. |
 

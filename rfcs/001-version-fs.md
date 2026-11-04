@@ -436,6 +436,14 @@ Required evidence must be imported or protected by an equivalent retention
 contract. Context access remains subject to authorization, including when the
 state itself is accessible.
 
+Provenance recording MUST NOT durably copy raw prompts, conversations, or tool
+output by default. Retention of those payloads as required evidence requires
+explicit selection under declared access, retention, and redaction policies;
+ordinary context captures selected identifiers, correlation fields, references,
+and coverage. Sensitive content should be omitted or sanitized before durable
+ingestion. Redaction policies must account for immutable retained state rather
+than promise in-place changes to a published binding or its required evidence.
+
 Agent names and propagated attributes are attribution claims, not access
 credentials. The authenticated recording principal remains distinguishable from
 the claimed producer. Links across workspaces or systems do not grant access to

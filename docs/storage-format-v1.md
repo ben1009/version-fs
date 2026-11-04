@@ -9,6 +9,14 @@ durable writer. The shared golden vectors are in
 [`fixtures/storage-format-v1.tsv`](../fixtures/storage-format-v1.tsv) and are
 checked by `versionfs-core`.
 
+**Provenance extension pending:** [RFC-002 Sections 4.5–4.6](../rfcs/002-version-fs-mvp.md#45-complete-generation-descriptor)
+require a provenance-capable v2 Generation descriptor for MVP release. This note
+continues to define the implemented v1 bytes. V1 descriptors have no provenance
+field and must be exposed as explicitly unattributed by the upgraded reader;
+do not append fields to v1 or rewrite its identities. The v2/context encoding,
+readers, graph traversal, and golden vectors remain pending P7 work and must
+pass RFC-002's I16 gates before claiming provenance support.
+
 ## 1. Primitive Encoding Rules
 
 - Unsigned integers are little-endian unless a field explicitly says otherwise.
