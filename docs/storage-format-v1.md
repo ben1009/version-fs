@@ -72,6 +72,9 @@ Object type codes are fixed:
 | 9 | `ArtifactIndexNode` |
 | 10 | `ArtifactMapRoot` |
 | 11 | `GenerationDescriptor` |
+| 12 | `LogMapNode` |
+| 13 | `ArtifactMapNode` |
+| 14 | `ProvenanceContext` |
 
 Codes are not reused. New formats need an explicit version or new type code.
 The tree-node layout and split policy are fixed with the persistent-map
