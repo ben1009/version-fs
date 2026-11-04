@@ -303,6 +303,14 @@ their mutation protocols and connects them to this same coordinator.
   publication moves the head, branch reference, and attachment-base protection in
   the same authority transaction; both modes reconcile unknown outcomes by the
   capture operation ID.
+- [ ] Add RFC-002's provenance-capable v2 descriptor and bounded context format,
+  typed evidence edges, and golden vectors. Keep v1 bytes stable and inspect
+  legacy descriptors as explicitly unattributed. This format upgrade is pending;
+  the completed publication slice above does not yet qualify I16.
+- [ ] Bind explicit provenance at capture admission and in request fingerprints;
+  publish/retain its verified required graph with the descriptor and reconcile
+  the original binding on lost replies. Equal view roots may have different
+  Generation contexts; changed attribution on the same operation ID rejects.
 - [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
 - [ ] Close local admission, read authoritative revision/live roots together,
@@ -329,6 +337,9 @@ retry by refreshing only the revision/roots. Ownership changes fence the origina
 worker. All three capture modes have distinct descriptor and recovery tests.
 Fork does not walk volume extents; journal replay uses a writable fork;
 name reuse and old-device commits cannot affect the new branch state.
+Recorded/unattributed and legacy descriptors round-trip unambiguously; required
+context/evidence failures prevent publication, and mismatching provenance cannot
+replace a committed binding on retry.
 
 ### P8. Native logs and artifacts
 
@@ -358,6 +369,9 @@ Native artifact identity is explicit, not inferred from a path.
 - [ ] Compose device attach/detach, explicit ext4 format/mount/unmount helpers,
   checkpoint modes, fork/promote/rollback, native logs/artifacts, pins, diff, and
   operation status/abort. Add report commands when P10 is available.
+- [ ] Add protected Generation provenance inspection to SDK/CLI, including
+  explicit legacy/unattributed status and fresh-worker authorized evidence reads.
+  Keep raw conversational payload capture opt-in and sanitize before ingestion.
 - [ ] Distinguish local WRITE, durable FLUSH/FUA, durable append, and published
   Generation acknowledgements. Document OS permissions, external dependencies,
   and the absence of application/database/process-memory capture guarantees.
@@ -372,6 +386,8 @@ on the old worker. Formatting never happens implicitly during restore.
   final commits. Bytes physically present do not revive expired Generation eligibility.
 - [ ] Copy/seal retained and live volume/log/artifact roots from one read-only
   authority snapshot; release the snapshot before object I/O.
+- [ ] Include recorded context and required evidence outside ordinary view roots
+  in retained/protected closure; exclude optional links and descriptive IDs.
 - [ ] Traverse typed strong edges and uncertain preparations using bounded RAM/disk
   spill; inventory S3 over a recorded window and persist bounded candidate pages.
 - [ ] Make corruption, missing graph metadata, snapshot loss, budget exhaustion,
@@ -450,6 +466,7 @@ as the checklist; list each fault campaign individually in the evidence index.
 | 10: Durable block barriers and supported I/O | P0, P4, P6, P11 |
 | 11: Authority conformance and lease decisions | P2, P5, P11 |
 | 12: Backend-neutral protocol and future PG mapping | P2, P5, P12 |
+| 13: Minimal provenance format, publication, protection, and inspection (I16) | P7, P9, P10, P11 |
 
 ## 7. First implementation PRs
 

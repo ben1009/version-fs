@@ -5,7 +5,7 @@
 | Status | Draft |
 | Created | 2026-10-22 |
 | Target | Version FS architecture |
-| Scope | System model, state semantics, correctness, performance, scalability, and integration boundaries |
+| Scope | System model, state and provenance semantics, correctness, performance, scalability, and integration boundaries |
 
 ## 1. Summary
 
@@ -19,9 +19,14 @@ state rooted at a stable manifest. A retained Generation is independently
 readable and restorable. It may share almost all physical data and metadata with
 other Generations.
 
+Version FS pairs **versioned state with durable causal context**. A Generation
+can carry the actor, task, operation, and conversation or evidence behind its
+creation. This provenance makes retained state explainable to a later agent,
+subject to the recorded coverage and access permissions.
+
 ```text
                            Version FS
-                       immutable Generation
+                 immutable Generation + context
                                 |
            +----------+---------+---------+------------+
            |          |         |         |            |
@@ -87,6 +92,11 @@ Historical state becomes an ordinary execution input: it can be read, forked,
 reviewed, restored, or promoted. A backup is one use of a Generation; a
 Generation also serves as a live execution base.
 
+Restoring bytes alone does not explain why they changed. An agent may implement
+a task, react to a failed test, receive another agent's review, and repair its
+work before publishing a result. Linking versions and operations to that context
+lets a later session inspect the task, evidence, and prior state behind a change.
+
 The desired checkpoint cost follows changed data and metadata. Fork should
 primarily create references. These are architectural objectives, not measured
 performance claims.
@@ -111,6 +121,9 @@ particular implementation mechanism.
 8. Retention protects the complete reachable state of every retained Generation.
 9. Concurrent or stale operations cannot overwrite newer authoritative state.
 10. Content integrity and authorization are independently enforced.
+11. Generations can bind durable provenance; operation records can connect state
+    changes to their declared agent and task context without requiring content
+    attribution at every byte.
 
 The performance and scalability objectives in Section 21 describe how these
 properties should remain practical as state, histories, and concurrency grow.
@@ -191,12 +204,14 @@ ordering, and retention.
 | GlobalTimestamp | An abstract global version coordinate T, interpreted in its declared timestamp domain. |
 | Coordinated version | An immutable binding of a GlobalTimestamp to captured participant state, scoped by timestamp domain and stable history ID. |
 | Runtime snapshot | Captured process memory and execution context, possibly including its containing sandbox or VM. |
+| Provenance | Recorded attribution, rationale, and causal links connecting versions or operations to their producing context. |
+| Causal context | Structured actor, task, execution, and evidence references propagated with work and durably bound where declared. |
 
 Generation identity, object identity, log position, branch concurrency state,
-and optional global version coordinates serve different purposes. A coordinated
-version can select a retained Generation or participant snapshot without
-replacing its native identity. A local wall-clock reading alone does not
-establish a coordinated version.
+provenance trace links, and optional global version coordinates serve different
+purposes. A coordinated version can select a retained Generation or participant
+snapshot without replacing its native identity. A local wall-clock reading alone
+does not establish a coordinated version.
 
 ## 5. Architecture and authority
 
@@ -245,6 +260,7 @@ wire format:
 ```text
 Generation G102
     +-- parent_generation_id: G101    (lineage only)
+    +-- provenance: context and declared evidence references
     +-- root (declares authoritative representations)
           +-- block volume root, when included
           |     +-- consumer filesystem / Git views, when represented here
@@ -292,6 +308,160 @@ object.
 External package registries and services remain outside the captured state
 unless their required bytes are imported. A view must declare which dependencies
 belong to the Generation and which remain external.
+
+### 6.3 Provenance model
+
+Provenance connects state history to execution history: who initiated work,
+which task it served, what explanation was supplied, and which observed actions
+or evidence led to the result. [Delta's agent version-control model](https://delta.dev/blog/fine-grained-version-control-for-agents)
+links edits to their producing conversations and discusses tracing code across
+files and versions down to individual characters. Version FS adopts the context
+association while leaving attribution granularity to the relevant layer.
+
+| Level | Architectural role |
+| --- | --- |
+| Generation provenance | Baseline capability: bind a version to its capture context and declared evidence. |
+| Operation provenance | Recommended: associate identified work and its observed effects with agent, task, and execution context. |
+| Content provenance | Optional higher-level index attributing text lines, characters, file ranges, or domain objects to operations. |
+
+Generations MUST support an immutable association with declared provenance.
+If context is absent, that absence must be explicit; an imported or unattributed
+version cannot imply a known agent or complete execution history. The context
+describes capture and attributed work, rather than assigning every shared byte
+to the checkpoint's actor. Identical content can have different producing
+contexts, and deduplication MUST NOT collapse those attribution records.
+
+Operation provenance SHOULD support multiple workflow operations contributing
+to a Generation and a long-running operation spanning Generations. A workflow
+can group several storage requests; each authoritative request retains its own
+retry identity. Reviews, failed tests, and other observations can have durable
+records without creating a Generation. An operation that changes no state need
+not create a new storage version.
+
+### 6.4 Context propagation and tracing
+
+The reference model is [OpenTelemetry context propagation](https://opentelemetry.io/docs/concepts/context-propagation/)
+and its [trace model](https://opentelemetry.io/docs/specs/otel/trace/api/): trace
+and span identities provide correlation, parent relationships describe nested
+work, and span links connect related work across traces. Attributes and events
+carry additional context. These concepts inform the semantic model; they do not
+require a particular SDK, exporter, or telemetry backend.
+
+Conceptually, durable context can describe:
+
+| Context | Meaning |
+| --- | --- |
+| Actor and execution | Authenticated recording principal and separately identified agent, session, and conversation/thread, when known. |
+| Task and rationale | Task or issue reference, a short reason, and prompt/conversation, review-finding, or test-evidence references. |
+| Operation | Scoped workflow identity, related storage requests, base state, and observed effects or authoritative outcomes. |
+| Trace and span | `trace_id`, `span_id`, a span's parent (`parent_span_id`), and links to related work, when available. |
+| Attributes and events | Extensible named context and references to ordered execution evidence. |
+
+An SDK or runtime SHOULD propagate context through agent delegation, tools, and
+service calls, and bind the declared context when work is recorded or captured.
+Task attributes need explicit propagation; propagating a trace ID alone does
+not propagate span attributes.
+Concurrent tasks need distinct execution associations; a worker's current ambient
+context must not relabel earlier or unrelated writes. Reviews and asynchronous
+follow-up work may have several causal inputs, represented by explicit links
+rather than forcing every relationship into one parent chain.
+
+Trace/span identities MUST NOT replace Generation identity, a scoped operation's
+retry identity, or the global version coordinates in Section 18. Retries may
+produce new telemetry spans while preserving the logical operation and its
+bound context. Changed rationale or later evidence must not silently rewrite an
+already committed association.
+
+Required provenance MUST survive telemetry sampling, span expiry, and loss of
+the original worker. A trace link alone does not preserve its span payload or
+conversation. Releases define their durable context representation and capture
+coverage separately from observability export.
+
+### 6.5 Event logs and operation attribution
+
+An event log can bridge Version FS state and agent context using the ordered-log
+contract in Section 9. Records SHOULD associate observed actions with their
+logical operation, execution context, and relevant base or result versions.
+For example:
+
+```text
+Generation G102
+    +-- parent: G101                         (lineage)
+    +-- context: task issue-534 / agent-7
+    +-- capture operation: checkpoint-99
+    +-- evidence: exact retained event range
+          +-- review finding F123
+          +-- operation fix-892
+          |     +-- reason: fix WAL recovery race
+          |     +-- prompt/conversation reference
+          |     +-- observed changes and test result
+          +-- explicit link: fix-892 responds to F123
+```
+
+This is an attribution example, not a wire format or an inference from storage
+diffs. Adapters MUST declare what they observe. A native filesystem adapter or
+instrumented tool can report paths and renames; a block-volume adapter sees
+logical ranges and cannot infer which file, prompt, or agent caused a write.
+Path or content-range history requires evidence from a layer that understands
+those names. Unobserved changes remain unattributed.
+
+A provenance event records an observation or a supplied explanation. Sharing a
+trace, actor, or timestamp alone does not prove causation. Explicit links state
+the claimed relationship and identify its source. Provenance and mutation WALs
+have distinct contracts: recording an event does not make the state change
+durable, and published state never requires event replay for reconstruction.
+
+Captured evidence uses exact immutable log ranges or artifact references.
+An intent, test result, or preparation event MUST NOT be treated as proof of a
+successful authoritative mutation; that follows the operation's durable outcome.
+A completion event appended after publication belongs to a later log view and
+cannot be inserted retroactively into the Generation's captured range. Publication
+can bind the outcome and its context without requiring that later event to be
+inside its own snapshot.
+
+### 6.6 Context retention, history, and queries
+
+Publication MUST atomically establish the immutable provenance binding declared
+by the Generation. Required context objects, event ranges, and evidence payloads
+follow the same durability-before-visibility and retention rules as required
+state. A retry resolves the same committed binding. A failed capture does not
+erase independently durable event records or acknowledged live updates.
+
+Raw prompts, conversations, and large tool output SHOULD be referenced rather
+than duplicated into each Generation's metadata. Each reference MUST declare
+whether its target is required retained content or an optional external link.
+Only the former promises durable resolution under Generation retention; optional
+links may expire or become inaccessible without invalidating state restore.
+Required evidence must be imported or protected by an equivalent retention
+contract. Context access remains subject to authorization, including when the
+state itself is accessible.
+
+Provenance recording MUST NOT durably copy raw prompts, conversations, or tool
+output by default. Retention of those payloads as required evidence requires
+explicit selection under declared access, retention, and redaction policies;
+ordinary context captures selected identifiers, correlation fields, references,
+and coverage. Sensitive content should be omitted or sanitized before durable
+ingestion. Redaction policies must account for immutable retained state rather
+than promise in-place changes to a published binding or its required evidence.
+
+Agent names and propagated attributes are attribution claims, not access
+credentials. The authenticated recording principal remains distinguishable from
+the claimed producer. Links across workspaces or systems do not grant access to
+their targets. A later annotation may add evidence under its own identity and
+retention policy without changing the published Generation's original binding.
+
+Fork, rollback, and promotion preserve the original attribution of selected
+state; the selecting action can carry its own context. Provenance links to base
+Generations or earlier operations are descriptive unless explicitly declared as
+retention dependencies. Descriptive links do not retain ancestors, and restoring
+the selected state must not require replaying the causal graph.
+
+History queries can follow recorded relationships from a Generation to its
+task, operations, review, and test evidence, or locate a retained state before a
+particular action. File or content queries depend on the optional indexes and
+coverage supplied by the appropriate adapter. Selectively undoing one actor's
+effects still requires application-aware conflict and dependency handling;
+provenance alone does not define semantic merge or selective rollback.
 
 ## 7. Immutable objects and persistent manifests
 
@@ -457,6 +627,10 @@ Generation becomes visible. Prepared state alone is not a published Generation.
 Publication must establish that its complete required graph is durable and
 protected, including references to reused state.
 
+The Generation's declared provenance binding is part of this publication
+contract. Required context and evidence must be durable and protected; links to
+optional external context carry the weaker contract declared in Section 6.
+
 The publication boundary atomically establishes the Generation's authoritative
 visibility, required retention protection, and operation outcome. Publication
 does not require moving a branch reference.
@@ -588,7 +762,7 @@ metadata traversal remain real costs.
 Retained Generations, branch heads and current durable live roots, pins, protected
 readers, and protected operations define liveness. Shared content remains live
 while any such reference can require it. Retention applies to all views, including
-log ranges and required artifact dependencies.
+log ranges, required artifact dependencies, and declared required provenance.
 
 A retained coordinated version protects its Version FS Generation even when no
 branch points to it. Other participants protect their own captured state under
@@ -819,6 +993,7 @@ request parameters, or a release checklist:
 | Append / read log | Durably extend a log or read its live/captured view. |
 | Pin / unpin | Add or release explicit retention interest. |
 | Open coordinated version | Resolve participant state using its timestamp domain, stable history ID, and GlobalTimestamp. |
+| Inspect provenance | Resolve a version's declared context and follow recorded operation/evidence links under their access and retention contracts. |
 
 Conflict detection, retry identity, cursor formats, and concrete API parameters
 are defined by implementation RFCs. Coordinated version access belongs to the
@@ -843,6 +1018,7 @@ optional integration described in Section 18.
 | I13 | A successful log append atomically establishes an identified ordered range of durable records. |
 | I14 | Live trimming cannot change log bytes visible in a retained Generation. |
 | I15 | A published coordinated global version binds its declared participant states at one common boundary and protects all state required for the promised restore. |
+| I16 | A published Generation's declared provenance binding is immutable; required context is durable and protected, and optional or missing context is distinguished explicitly. |
 
 These are architecture requirements across releases. Implementation choices and
 performance optimizations must preserve them. Release specifications must
@@ -858,7 +1034,7 @@ independent agent histories. Capacity and performance have several dimensions:
 | Dimension | Sources of growth |
 | --- | --- |
 | Bytes | Files, artifacts, runtime images, and retained changed content. |
-| Metadata | Namespace entries, directory fanout, manifest nodes, and log indexes. |
+| Metadata | Namespace entries, directory fanout, manifest nodes, log indexes, and provenance records. |
 | Versions | Branches, retained Generations, pins, and coordinated checkpoints. |
 | Concurrency | Readers, writers, simultaneous checkpoints, and fork/restore bursts. |
 | Churn | Log ingestion, small writes, branch lifecycle, and abandoned preparations. |
@@ -896,6 +1072,11 @@ later writes must remain outside the captured boundary.
 In the worst case, diff visits the complete compared namespace and requires content
 reads. Full materialization or export reads all selected state. Structural
 sharing and lazy access do not remove those costs.
+
+Provenance capture SHOULD share existing context objects and exact event ranges.
+Checkpoint publication and state reads must not require conversation or causal
+history replay. Required new evidence still contributes to durable storage and
+transfer costs.
 
 ### 21.3 Read and metadata scalability
 
@@ -974,7 +1155,8 @@ coordination. Implementation proposals must explain their concrete tradeoffs.
 
 The following sources informed the architecture. Their implementation choices
 and performance claims are not Version FS guarantees. The implications below
-are this RFC's interpretation; sources were consulted on 2026-10-22.
+are this RFC's interpretation. The initial reference set was consulted on
+2026-10-22; the Delta and OpenTelemetry references were consulted on 2026-11-04.
 
 - [toy-kv-engine](https://github.com/ben1009/toy-kv-engine) informs the separate
   database snapshot and recovery boundary.
@@ -990,6 +1172,15 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
   workspaces over shared history; Version FS defines remote publication
   separately from physical sharing.
 - [Code Storage](https://code.storage/) informs programmatic source-state access.
+- [Delta's fine-grained version control for agents](https://delta.dev/blog/fine-grained-version-control-for-agents)
+  informs the association between changes and their producing conversation.
+  Version FS defines Generation and operation attribution while leaving
+  character-level tracking to optional higher-level indexes.
+- [OpenTelemetry context propagation](https://opentelemetry.io/docs/concepts/context-propagation/)
+  and its [tracing API](https://opentelemetry.io/docs/specs/otel/trace/api/)
+  inform correlation identities, span relationships, attributes, links, and
+  events. Section 6 adds Version FS's durable binding, coverage, and retention
+  contract; telemetry retention alone does not provide those guarantees.
 - [S2 streams](https://s2.dev/docs/concepts/streams) and
   [appends](https://s2.dev/docs/concepts/appends) provide the durable ordered-log
   reference. Version FS adds Generation-bound views and retention semantics.
@@ -1023,4 +1214,4 @@ are this RFC's interpretation; sources were consulted on 2026-10-22.
 
 The design succeeds when a retained Generation is an ordinary durable execution
 input: complete and independently recoverable, with unchanged physical state
-shared across histories.
+shared across histories and declared context explaining how that state arose.
