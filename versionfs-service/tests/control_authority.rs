@@ -19,8 +19,8 @@ use versionfs_core::{
     },
     fault::{FailureInjector, FailurePoint, OneShotFailures},
     format::{
-        CaptureMode, EXTENT_BYTES, FormatError, ObjectRef, ObjectType, VolumeGeometry,
-        encode_object,
+        CaptureMode, EXTENT_BYTES, FormatError, ObjectRef, ObjectType, ProvenanceBinding,
+        ProvenanceContext, VolumeGeometry, encode_object,
     },
     identity::{
         AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
@@ -33,7 +33,10 @@ use versionfs_core::{
     persistent_map::{DurableObjectStore, MapObjectStore},
     time::{Clock, MonotonicTime},
 };
-use versionfs_sdk::barrier::{VolumeBarrierControl, create_empty_generation, create_generation};
+use versionfs_sdk::barrier::{
+    VolumeBarrierControl, create_empty_generation, create_generation,
+    create_generation_with_reuse_and_provenance,
+};
 use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -735,6 +738,326 @@ fn empty_generation(
         u64::from(boundary_id),
     )
     .expect("create verified empty Generation graph")
+}
+
+fn store_provenance_context(
+    store: &mut TestObjectStore,
+    recording_principal: PrincipalId,
+    roots: LiveRoots,
+    task_id: &str,
+) -> ObjectRef {
+    let encoded = ProvenanceContext {
+        recording_principal,
+        actor: Some("codex".to_owned()),
+        execution_id: Some(format!("execution-{task_id}")),
+        session_id: None,
+        thread_id: None,
+        task_id: Some(task_id.to_owned()),
+        workflow_operation_id: None,
+        reason: Some("checkpoint capture test".to_owned()),
+        trace_id: None,
+        span_id: None,
+        parent_span_id: None,
+        required_logs_root: roots.logs,
+        required_artifacts_root: roots.artifacts,
+        optional_links: Vec::new(),
+    }
+    .encode()
+    .expect("encode provenance context");
+    let reference = ObjectRef::from_encoded(&encoded).expect("reference context object");
+    store
+        .put_durable(reference, &encoded)
+        .expect("persist provenance context");
+    reference
+}
+
+#[test]
+fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
+    let mut store = TestObjectStore::default();
+    let initial = empty_generation(&mut store, generation(1), 80);
+    let first_context = store_provenance_context(&mut store, principal(1), initial.roots, "task-a");
+    let second_context =
+        store_provenance_context(&mut store, principal(1), initial.roots, "task-b");
+    let first_binding = ProvenanceBinding::Recorded {
+        context_root: first_context,
+    };
+    let second_binding = ProvenanceBinding::Recorded {
+        context_root: second_context,
+    };
+
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(90);
+    let request = PreparationRequest {
+        operation_id: capture_id,
+        branch_id: branch(1),
+        expected_revision: 1,
+        grant,
+        attachment_id: attachment(1),
+        volume_epoch: 1,
+        protection_id: protection(90),
+        kind: PreparationKind::CheckpointCapture,
+        expected_roots: None,
+        dependencies: vec![
+            initial.roots.volume,
+            initial.roots.logs,
+            initial.roots.artifacts,
+        ],
+    };
+
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control
+            .begin_preparation_with_provenance(request.clone(), first_binding),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+    let admitted = env
+        .control
+        .begin_preparation_with_provenance(request.clone(), first_binding)
+        .expect("reconcile recorded capture admission with its original binding");
+    assert!(matches!(admitted, OperationState::Preparing { .. }));
+    assert_eq!(
+        env.control
+            .begin_preparation_with_provenance(request.clone(), first_binding)
+            .expect("replay same binding"),
+        admitted
+    );
+    assert_eq!(
+        env.control
+            .begin_preparation_with_provenance(request, second_binding),
+        Err(ControlError::OperationMismatch),
+        "an operation ID cannot be rebound to another context"
+    );
+    assert_eq!(
+        env.control_for_owner(env.owner)
+            .get_branch(branch(1))
+            .expect("read persisted capture from a fresh control handle")
+            .capture
+            .expect("capture remains open")
+            .provenance,
+        first_binding
+    );
+
+    let sealed = env
+        .control
+        .seal_capture(op(91), capture_id, 1, grant)
+        .expect("seal recorded capture");
+    assert_eq!(sealed.provenance, first_binding);
+
+    let mismatched_generation = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(2),
+        Some(generation(1)),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(82)),
+        82,
+        second_binding,
+        &[],
+    )
+    .expect("create Generation with a different context");
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            mismatched_generation.clone(),
+            true,
+        ),
+        Err(ControlError::InvalidTransition),
+        "publication must use the binding fixed at capture admission"
+    );
+
+    let matching_generation = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(3),
+        Some(generation(1)),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(83)),
+        83,
+        first_binding,
+        &[],
+    )
+    .expect("create Generation with the admitted context");
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            matching_generation.clone(),
+            true,
+        ),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            matching_generation.clone(),
+            true,
+        )
+        .expect("reconcile publication with the original binding");
+    assert_eq!(published.generation_id, generation(3));
+    assert!(published.head_advanced);
+    assert_eq!(published.branch.head, generation(3));
+    assert_eq!(published.branch.revision, 2);
+    assert!(published.branch.capture.is_none());
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            mismatched_generation,
+            true,
+        ),
+        Err(ControlError::OperationMismatch),
+        "a terminal publish retry cannot replace the committed context"
+    );
+
+    let next_capture_id = op(92);
+    let next_request = PreparationRequest {
+        operation_id: next_capture_id,
+        branch_id: branch(1),
+        expected_revision: 2,
+        grant,
+        attachment_id: attachment(1),
+        volume_epoch: 1,
+        protection_id: protection(91),
+        kind: PreparationKind::CheckpointCapture,
+        expected_roots: None,
+        dependencies: vec![
+            initial.roots.volume,
+            initial.roots.logs,
+            initial.roots.artifacts,
+        ],
+    };
+    env.control
+        .begin_preparation_with_provenance(next_request, second_binding)
+        .expect("admit a distinct capture with a distinct context");
+    env.control
+        .seal_capture(op(93), next_capture_id, 2, grant)
+        .expect("seal second capture");
+    let next_generation = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(4),
+        Some(generation(3)),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(84)),
+        84,
+        second_binding,
+        &[],
+    )
+    .expect("create another Generation over identical view roots");
+    let next_published = env
+        .control
+        .publish_capture(
+            next_capture_id,
+            2,
+            generation(3),
+            grant,
+            attachment(1),
+            1,
+            next_generation.clone(),
+            true,
+        )
+        .expect("publish a Generation with different attribution");
+    assert_eq!(next_published.generation_id, generation(4));
+    assert_eq!(next_generation.seed().roots, initial.roots);
+    assert_eq!(matching_generation.seed().roots, initial.roots);
+    assert_ne!(
+        next_generation.descriptor().context_root(),
+        matching_generation.descriptor().context_root()
+    );
+}
+
+#[test]
+fn capture_rejects_recording_principal_not_bound_to_authenticated_caller() {
+    let mut store = TestObjectStore::default();
+    let initial = empty_generation(&mut store, generation(1), 85);
+    let context = store_provenance_context(&mut store, principal(99), initial.roots, "untrusted");
+    let binding = ProvenanceBinding::Recorded {
+        context_root: context,
+    };
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(94);
+    env.control
+        .begin_preparation_with_provenance(
+            PreparationRequest {
+                operation_id: capture_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(92),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![],
+            },
+            binding,
+        )
+        .expect("admit context before contents are graph-verified");
+    env.control
+        .seal_capture(op(95), capture_id, 1, grant)
+        .expect("seal capture");
+    let generation_seed = create_generation_with_reuse_and_provenance(
+        &mut store,
+        generation(5),
+        Some(generation(1)),
+        initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(86)),
+        86,
+        binding,
+        &[],
+    )
+    .expect("verify a descriptor with mismatched caller identity");
+
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            generation_seed,
+            true,
+        ),
+        Err(ControlError::InvalidRequest(_))
+    ));
+    assert_eq!(
+        env.control.get_branch(branch(1)).unwrap().head,
+        generation(1),
+        "untrusted attribution must not publish"
+    );
+    assert!(matches!(
+        env.control.get_operation(capture_id),
+        Ok(OperationState::Preparing { .. })
+    ));
+    env.control
+        .abort_operation(capture_id)
+        .expect("abort rejected capture");
 }
 
 #[test]

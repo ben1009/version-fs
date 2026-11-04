@@ -12,7 +12,8 @@ use thiserror::Error;
 use crate::{
     format::{
         CanonicalDecoder, CanonicalEncoder, DecodedGenerationDescriptor, FormatError,
-        MetadataRecordType, ObjectRef, ObjectType, decode_metadata_record, encode_metadata_record,
+        MAX_PROVENANCE_CONTEXT_BYTES, MetadataRecordType, ObjectRef, ObjectType, ProvenanceBinding,
+        decode_metadata_record, encode_metadata_record,
     },
     graph::DependencyProof,
     identity::{
@@ -66,6 +67,7 @@ const TRANSITION_ABORT: u16 = 3;
 const TRANSITION_EXPIRE_PREPARATION: u16 = 4;
 const TRANSITION_PUBLISH_CAPTURE: u16 = 5;
 const OP_TOMBSTONE: u16 = u16::MAX;
+const CAPTURE_PROVENANCE_EXTENSION: &[u8; 4] = b"CPRV";
 
 /// A durable authority-owner incarnation. Every owner restart advances it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -209,6 +211,8 @@ pub struct CaptureState {
     pub principal_id: PrincipalId,
     /// Protection record that keeps this capture's dependencies reachable.
     pub protection_id: ProtectionId,
+    /// Immutable provenance selected when this capture was admitted.
+    pub provenance: ProvenanceBinding,
     /// Exact branch revision captured before producer drain.
     pub expected_revision: u64,
     /// Capture is open to identified drain children until sealed.
@@ -284,6 +288,11 @@ impl VerifiedGenerationSeed {
     /// Returns the descriptor payload validated by the retained proof.
     pub const fn descriptor(&self) -> DecodedGenerationDescriptor {
         self.proof.generation_descriptor()
+    }
+
+    /// Returns the recording principal decoded from the verified provenance context.
+    pub fn provenance_recording_principal(&self) -> Option<PrincipalId> {
+        self.proof.provenance_recording_principal()
     }
 
     /// Returns the immutable-object namespace in which this graph was verified.
@@ -1347,6 +1356,19 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         &self,
         request: PreparationRequest,
     ) -> Result<OperationState, ControlError> {
+        self.begin_preparation_with_provenance(request, ProvenanceBinding::Unattributed)
+    }
+
+    /// Registers or replays a preparation with an explicit capture provenance binding.
+    ///
+    /// Non-capture preparations must use `Unattributed`. For a recorded capture,
+    /// the context root is added to the preparation's protected dependencies.
+    /// Reusing the operation ID with another binding returns `OperationMismatch`.
+    pub fn begin_preparation_with_provenance(
+        &self,
+        request: PreparationRequest,
+        provenance: ProvenanceBinding,
+    ) -> Result<OperationState, ControlError> {
         let PreparationRequest {
             operation_id,
             branch_id,
@@ -1357,9 +1379,20 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             protection_id,
             kind,
             expected_roots,
-            dependencies,
+            mut dependencies,
         } = request;
         let capture = kind == PreparationKind::CheckpointCapture;
+        validate_provenance_binding(provenance)?;
+        if !capture && provenance != ProvenanceBinding::Unattributed {
+            return Err(ControlError::InvalidRequest(
+                "provenance may only be bound to checkpoint captures",
+            ));
+        }
+        if let Some(context_root) = provenance.context_root()
+            && !dependencies.contains(&context_root)
+        {
+            dependencies.push(context_root);
+        }
         if dependencies.len() > 4096 {
             return Err(ControlError::InvalidRequest(
                 "too many protected dependencies",
@@ -1395,6 +1428,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         payload.u32_le(dependencies.len() as u32);
         for dependency in &dependencies {
             payload.object_ref(*dependency);
+        }
+        // Preserve the pre-provenance fingerprint for explicit/unset legacy
+        // captures. A recorded binding is an extension of that exact request.
+        if provenance != ProvenanceBinding::Unattributed {
+            encode_capture_provenance_extension(&mut payload, provenance)?;
         }
         let request = payload.finish();
         let fp = fingerprint(OP_BEGIN_PREPARATION, &request);
@@ -1524,6 +1562,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     operation_id,
                     principal_id: self.principal_id,
                     protection_id,
+                    provenance,
                     expected_revision,
                     sealed: false,
                     pending_child: None,
@@ -2042,7 +2081,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             .capture
                             .as_ref()
                             .ok_or_else(|| reject("invalid_transition"))?,
-                    ),
+                    )
+                    .map_err(to_metadata_error)?,
                     Some(grant.expires_at.min(capture_deadline)),
                 ))
             })?;
@@ -2077,6 +2117,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         if generation.descriptor().parent_generation_id() != Some(expected_parent) {
             return Err(ControlError::InvalidTransition);
         }
+        if generation
+            .provenance_recording_principal()
+            .is_some_and(|recording_principal| recording_principal != self.principal_id)
+        {
+            return Err(ControlError::InvalidRequest(
+                "provenance recording principal does not match the authenticated caller",
+            ));
+        }
+        let descriptor = generation.descriptor();
         let VerifiedGenerationSeed {
             seed: generation,
             proof: _,
@@ -2196,6 +2245,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             validate_capture_principal(capture, self.principal_id)?;
             if capture.operation_id != capture_id
                 || capture.protection_id != protection_id
+                || !descriptor_matches_provenance(descriptor, capture.provenance)
                 || capture.expected_revision != prepared_revision
                 || !capture.sealed
                 || capture.pending_child.is_some()
@@ -3136,6 +3186,9 @@ fn encode_branch(branch: &BranchState) -> Result<Vec<u8>, FormatError> {
         None => e.u8(0),
     }
     e.u8(u8::from(branch.deleted));
+    if let Some(capture) = &branch.capture {
+        encode_capture_provenance_extension(&mut e, capture.provenance)?;
+    }
     encode_metadata_record(MetadataRecordType::Branch, &e.finish())
 }
 
@@ -3181,12 +3234,18 @@ fn decode_branch(bytes: &[u8]) -> Result<BranchState, ControlError> {
             ));
         }
     };
-    let capture = match d.u8().map_err(corrupt)? {
+    let mut capture = match d.u8().map_err(corrupt)? {
         0 => None,
         1 => Some(decode_capture_fields(&mut d).map_err(corrupt)?),
         _ => return Err(ControlError::CorruptRecord("invalid capture option".into())),
     };
     let deleted = decode_bool(d.u8().map_err(corrupt)?)?;
+    if !d.is_finished() {
+        let capture = capture.as_mut().ok_or_else(|| {
+            ControlError::CorruptRecord("capture provenance extension has no capture".into())
+        })?;
+        capture.provenance = decode_capture_provenance_extension(&mut d).map_err(corrupt)?;
+    }
     d.finish().map_err(corrupt)?;
     Ok(BranchState {
         workspace_id,
@@ -3603,15 +3662,22 @@ fn encode_capture(e: &mut CanonicalEncoder, value: &CaptureState) {
     }
 }
 
-fn encode_capture_result(value: &CaptureState) -> Vec<u8> {
+fn encode_capture_result(value: &CaptureState) -> Result<Vec<u8>, FormatError> {
     let mut e = CanonicalEncoder::new();
     encode_capture(&mut e, value);
-    e.finish()
+    // Include an extension even for unattributed captures so sealed results
+    // expose the exact admitted binding. Legacy result bytes decode as
+    // unattributed when this extension is absent.
+    encode_capture_provenance_extension(&mut e, value.provenance)?;
+    Ok(e.finish())
 }
 
 fn decode_capture_result(bytes: &[u8]) -> Result<CaptureState, ControlError> {
     let mut d = CanonicalDecoder::new(bytes);
-    let value = decode_capture_fields(&mut d).map_err(corrupt)?;
+    let mut value = decode_capture_fields(&mut d).map_err(corrupt)?;
+    if !d.is_finished() {
+        value.provenance = decode_capture_provenance_extension(&mut d).map_err(corrupt)?;
+    }
     d.finish().map_err(corrupt)?;
     Ok(value)
 }
@@ -3652,12 +3718,74 @@ fn decode_capture_fields(d: &mut CanonicalDecoder<'_>) -> Result<CaptureState, F
         operation_id,
         principal_id,
         protection_id,
+        provenance: ProvenanceBinding::Unattributed,
         expected_revision,
         sealed,
         pending_child,
         sealed_revision,
         sealed_roots,
     })
+}
+
+fn validate_provenance_binding(binding: ProvenanceBinding) -> Result<(), FormatError> {
+    if let ProvenanceBinding::Recorded { context_root } = binding {
+        context_root.validate()?;
+        if context_root.object_type != ObjectType::ProvenanceContext
+            || context_root.encoded_len > MAX_PROVENANCE_CONTEXT_BYTES as u64
+        {
+            return Err(FormatError::InvalidProvenance(
+                "capture context reference is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn encode_capture_provenance_extension(
+    encoder: &mut CanonicalEncoder,
+    binding: ProvenanceBinding,
+) -> Result<(), FormatError> {
+    validate_provenance_binding(binding)?;
+    encoder.fixed(CAPTURE_PROVENANCE_EXTENSION);
+    match binding {
+        ProvenanceBinding::Recorded { context_root } => {
+            encoder.u8(1);
+            encoder.object_ref(context_root);
+        }
+        ProvenanceBinding::Unattributed => encoder.u8(2),
+    }
+    Ok(())
+}
+
+fn decode_capture_provenance_extension(
+    decoder: &mut CanonicalDecoder<'_>,
+) -> Result<ProvenanceBinding, FormatError> {
+    if decoder.fixed::<4>()? != *CAPTURE_PROVENANCE_EXTENSION {
+        return Err(FormatError::InvalidProvenance(
+            "unknown capture provenance extension",
+        ));
+    }
+    let binding = match decoder.u8()? {
+        1 => ProvenanceBinding::Recorded {
+            context_root: decoder.object_ref()?,
+        },
+        2 => ProvenanceBinding::Unattributed,
+        _ => {
+            return Err(FormatError::InvalidProvenance(
+                "unknown capture provenance status",
+            ));
+        }
+    };
+    validate_provenance_binding(binding)?;
+    Ok(binding)
+}
+
+fn descriptor_matches_provenance(
+    descriptor: DecodedGenerationDescriptor,
+    binding: ProvenanceBinding,
+) -> bool {
+    descriptor.provenance_status() == binding.status()
+        && descriptor.context_root() == binding.context_root()
 }
 
 fn encode_live_roots(e: &mut CanonicalEncoder, roots: LiveRoots) {

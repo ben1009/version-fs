@@ -579,6 +579,10 @@ impl<'a> CanonicalDecoder<'a> {
         Self { bytes, offset: 0 }
     }
 
+    pub(crate) fn is_finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
     pub(crate) fn u8(&mut self) -> Result<u8, FormatError> {
         let value = *self
             .bytes
@@ -650,7 +654,7 @@ impl<'a> CanonicalDecoder<'a> {
     }
 
     pub(crate) fn finish(self) -> Result<(), FormatError> {
-        if self.offset == self.bytes.len() {
+        if self.is_finished() {
             Ok(())
         } else {
             Err(FormatError::InvalidEnvelope("trailing payload bytes"))
