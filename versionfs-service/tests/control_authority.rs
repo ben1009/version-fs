@@ -1,7 +1,9 @@
 //! Control-protocol integration tests against the toy-kv Metadata Authority.
 
 use std::{
+    collections::HashMap,
     env,
+    num::NonZeroUsize,
     path::PathBuf,
     sync::{
         Arc, Barrier,
@@ -15,15 +17,23 @@ use versionfs_core::{
         ControlError, GenerationSeed, LiveRoots, OperationState, PreparationKind,
         PreparationRequest, WorkspaceControl, start_authority_owner,
     },
-    fault::NoFailures,
-    format::{FormatError, ObjectRef, ObjectType, encode_object},
-    identity::{
-        AttachmentId, BranchId, GenerationId, OperationId, PinId, PrincipalId, ProtectionId,
-        WorkspaceId,
+    fault::{FailureInjector, FailurePoint, OneShotFailures},
+    format::{
+        CaptureMode, EXTENT_BYTES, FormatError, ObjectRef, ObjectType, VolumeGeometry,
+        encode_object,
     },
+    identity::{
+        AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
+        PrincipalId, ProtectionId, VolumeBoundaryId, WorkspaceId,
+    },
+    metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
+    },
+    persistent_map::{DurableObjectStore, MapObjectStore},
     time::{Clock, MonotonicTime},
 };
-use versionfs_sdk::barrier::VolumeBarrierControl;
+use versionfs_sdk::barrier::{VolumeBarrierControl, create_empty_generation, create_generation};
 use versionfs_service::toy_kv_metadata::ToyKvMetadataAuthority;
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +55,59 @@ impl Drop for TestDir {
     }
 }
 
+struct TestObjectStore {
+    objects: HashMap<ObjectId, Vec<u8>>,
+    scope: ObjectStoreScopeId,
+}
+
+impl Default for TestObjectStore {
+    fn default() -> Self {
+        Self::with_scope(ObjectStoreScopeId::from_bytes([0xD4; 16]))
+    }
+}
+
+impl TestObjectStore {
+    fn with_scope(scope: ObjectStoreScopeId) -> Self {
+        Self {
+            objects: HashMap::new(),
+            scope,
+        }
+    }
+}
+
+impl MapObjectStore for TestObjectStore {
+    fn proof_scope(&self) -> ObjectStoreScopeId {
+        self.scope
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.objects.get(&id).cloned())
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        self.objects.insert(id, bytes);
+        Ok(())
+    }
+}
+
+impl DurableObjectStore for TestObjectStore {
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        reference
+            .verify(encoded)
+            .map_err(|error| format!("invalid durable test object: {error}"))?;
+        match self.objects.get(&reference.object_id) {
+            Some(existing) if existing != encoded => {
+                Err("immutable test object ID was reused with different bytes".to_owned())
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.objects.insert(reference.object_id, encoded.to_vec());
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct TestClock(AtomicU64);
 
@@ -60,6 +123,93 @@ impl Clock for TestClock {
     }
 }
 
+// Advances the authority clock after the domain buffers its outcome, just
+// before the final gated lease decision.
+struct AdvanceAtOutcome {
+    inner: Arc<ToyKvMetadataAuthority>,
+    clock: Arc<TestClock>,
+    advance_to: AtomicU64,
+}
+
+struct AdvanceAtOutcomeTxn<'a> {
+    inner: &'a mut dyn MetadataTxn,
+    outcome_key: &'a [u8],
+    clock: &'a TestClock,
+    advance_to: &'a AtomicU64,
+}
+
+impl MetadataTxn for AdvanceAtOutcomeTxn<'_> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+        self.inner.get(key)
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) -> Result<(), MetadataError> {
+        self.inner.put(key, value)?;
+        if key == self.outcome_key {
+            let deadline = self.advance_to.swap(0, Ordering::SeqCst);
+            if deadline != 0 {
+                self.clock.set(deadline);
+            }
+        }
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &[u8]) -> Result<(), MetadataError> {
+        self.inner.delete(key)
+    }
+
+    fn now(&self) -> MonotonicTime {
+        self.inner.now()
+    }
+}
+
+impl MetadataAuthority for AdvanceAtOutcome {
+    type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+        self.inner.get(key)
+    }
+
+    fn transact<R, F>(
+        &self,
+        operation: MutationIdentity<'_>,
+        mut body: F,
+    ) -> Result<R, MetadataError>
+    where
+        F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+    {
+        self.inner.transact(operation, |txn| {
+            body(&mut AdvanceAtOutcomeTxn {
+                inner: txn,
+                outcome_key: operation.outcome_key,
+                clock: &self.clock,
+                advance_to: &self.advance_to,
+            })
+        })
+    }
+
+    fn reconcile_unknown(
+        &self,
+        operation: MutationIdentity<'_>,
+    ) -> Result<ReconciledOutcome, MetadataError> {
+        self.inner.reconcile_unknown(operation)
+    }
+
+    fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+        self.inner.snapshot()
+    }
+
+    fn scan_prefix(
+        &self,
+        snapshot: &Self::Snapshot,
+        prefix: &[u8],
+        cursor: Option<&MetadataCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<MetadataPage, MetadataError> {
+        self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+    }
+}
+
 struct TestEnv {
     _dir: TestDir,
     clock: Arc<TestClock>,
@@ -67,18 +217,25 @@ struct TestEnv {
     workspace_id: WorkspaceId,
     principal_id: PrincipalId,
     owner: versionfs_core::control::OwnerIncarnation,
+    failures: Arc<OneShotFailures>,
     control: WorkspaceControl<ToyKvMetadataAuthority>,
 }
 
 impl TestEnv {
     fn new() -> Self {
+        Self::with_initial_seed(seed(1))
+    }
+
+    fn with_initial_seed(initial_seed: GenerationSeed) -> Self {
         let dir = TestDir::new();
         let clock = Arc::new(TestClock::default());
+        let failures = Arc::new(OneShotFailures::default());
+        let failure_injector: Arc<dyn FailureInjector> = failures.clone();
         let authority = Arc::new(
             ToyKvMetadataAuthority::open_with(
                 &dir.0,
                 Arc::clone(&clock) as Arc<dyn Clock>,
-                Arc::new(NoFailures),
+                failure_injector,
             )
             .expect("open toy-kv authority"),
         );
@@ -91,7 +248,7 @@ impl TestEnv {
         let principal_id = principal(1);
         let control = control_for(Arc::clone(&authority), workspace_id, principal_id, owner);
         control
-            .create_workspace(op(1), branch(1), "main", 60_000, seed(1))
+            .create_workspace(op(1), branch(1), "main", 60_000, initial_seed)
             .expect("create initial workspace");
         Self {
             _dir: dir,
@@ -100,6 +257,7 @@ impl TestEnv {
             workspace_id,
             principal_id,
             owner,
+            failures,
             control,
         }
     }
@@ -126,6 +284,73 @@ impl TestEnv {
             .expect("attach volume");
         grant
     }
+
+    fn start_sealed_capture(
+        &self,
+        capture_id: OperationId,
+        protection_id: ProtectionId,
+        grant: versionfs_core::control::WriterGrant,
+        roots: LiveRoots,
+    ) {
+        self.control
+            .begin_preparation(PreparationRequest {
+                operation_id: capture_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id,
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![roots.volume, roots.logs, roots.artifacts],
+            })
+            .expect("begin protected capture");
+        self.control
+            .seal_capture(op(251), capture_id, 1, grant)
+            .expect("seal capture");
+    }
+}
+
+fn advancing_control(env: &TestEnv) -> (Arc<AdvanceAtOutcome>, WorkspaceControl<AdvanceAtOutcome>) {
+    let authority = Arc::new(AdvanceAtOutcome {
+        inner: Arc::clone(&env.authority),
+        clock: Arc::clone(&env.clock),
+        advance_to: AtomicU64::new(0),
+    });
+    let control = WorkspaceControl::new(
+        Arc::clone(&authority),
+        env.workspace_id,
+        ObjectStoreScopeId::from_bytes([0xD4; 16]),
+        env.principal_id,
+        env.owner,
+    );
+    (authority, control)
+}
+
+fn maintain_leases(
+    env: &TestEnv,
+    mut grant: versionfs_core::control::WriterGrant,
+    steps: u8,
+    renew_attachment: bool,
+) -> versionfs_core::control::WriterGrant {
+    for step in 1..=steps {
+        env.clock.set(u64::from(step) * 20_000_000_000);
+        grant = env.control.renew_writer(op(100 + step), grant).unwrap();
+        if renew_attachment && step % 14 == 0 {
+            env.control
+                .renew_attachment_base(
+                    op(200 + step / 14),
+                    branch(1),
+                    attachment(1),
+                    1,
+                    protection(1),
+                    grant,
+                )
+                .unwrap();
+        }
+    }
+    grant
 }
 
 #[test]
@@ -423,7 +648,13 @@ fn control_for(
     principal_id: PrincipalId,
     owner: versionfs_core::control::OwnerIncarnation,
 ) -> WorkspaceControl<ToyKvMetadataAuthority> {
-    WorkspaceControl::new(authority, workspace_id, principal_id, owner)
+    WorkspaceControl::new(
+        authority,
+        workspace_id,
+        ObjectStoreScopeId::from_bytes([0xD4; 16]),
+        principal_id,
+        owner,
+    )
 }
 
 fn id<const N: usize>(byte: u8) -> [u8; N] {
@@ -491,6 +722,21 @@ fn seed(marker: u8) -> GenerationSeed {
     }
 }
 
+fn empty_generation(
+    store: &mut TestObjectStore,
+    generation_id: GenerationId,
+    boundary_id: u8,
+) -> GenerationSeed {
+    create_empty_generation(
+        store,
+        generation_id,
+        VolumeBoundaryId::from_bytes(id(boundary_id)),
+        VolumeGeometry::new(u64::from(EXTENT_BYTES) * 4).expect("valid test geometry"),
+        u64::from(boundary_id),
+    )
+    .expect("create verified empty Generation graph")
+}
+
 #[test]
 fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() {
     let env = TestEnv::new();
@@ -548,6 +794,569 @@ fn operation_results_are_replay_safe_and_branch_names_use_atomic_point_claims() 
             .filter(|result| matches!(result, Err(ControlError::Conflict)))
             .count(),
         1
+    );
+}
+
+#[test]
+fn attached_capture_publication_moves_head_and_attachment_base_atomically() {
+    let mut object_store = TestObjectStore::default();
+    let initial = empty_generation(&mut object_store, generation(1), 30);
+    let new_generation = create_generation(
+        &mut object_store,
+        generation(2),
+        Some(initial.generation_id),
+        initial.roots,
+        CaptureMode::FilesystemCleanUnmount,
+        VolumeBoundaryId::from_bytes(id(31)),
+        31,
+    )
+    .expect("create verified child Generation");
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(30);
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+
+    let wrong_parent = create_generation(
+        &mut object_store,
+        generation(4),
+        Some(generation(9)),
+        initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(32)),
+        32,
+    )
+    .expect("create verified Generation with wrong lineage");
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            wrong_parent,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    );
+
+    let different_roots = create_empty_generation(
+        &mut object_store,
+        generation(5),
+        VolumeBoundaryId::from_bytes(id(33)),
+        VolumeGeometry::new(u64::from(EXTENT_BYTES) * 8).expect("valid alternate geometry"),
+        33,
+    )
+    .expect("create alternate valid Generation graph")
+    .roots;
+    let wrong_roots = create_generation(
+        &mut object_store,
+        generation(6),
+        Some(generation(1)),
+        different_roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(34)),
+        34,
+    )
+    .expect("create verified Generation with different sealed roots");
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            wrong_roots,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    ));
+
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation.clone(),
+            true,
+        ),
+        Err(ControlError::Metadata(
+            versionfs_core::metadata::MetadataError::UnknownOutcome { .. }
+        ))
+    ));
+
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation.clone(),
+            true,
+        )
+        .expect("reconcile the committed publication");
+    assert_eq!(published.generation_id, generation(2));
+    assert!(published.head_advanced);
+    assert_eq!(published.branch.head, generation(2));
+    assert_eq!(published.branch.revision, 2);
+    assert!(published.branch.capture.is_none());
+    let attachment_state = published.branch.attachment.expect("retained attachment");
+    assert_eq!(attachment_state.base_generation, generation(2));
+    assert_eq!(
+        env.control
+            .get_branch(branch(1))
+            .expect("read published branch"),
+        published.branch
+    );
+    let renewed_attachment = env
+        .control
+        .renew_attachment_base(op(32), branch(1), attachment(1), 1, protection(1), grant)
+        .expect("renew the attachment protection on the published Generation");
+    assert_eq!(renewed_attachment.base_generation, generation(2));
+    env.control
+        .mark_generation_unretained(op(33), generation(1))
+        .expect("old head has no remaining branch or attachment references");
+    assert_eq!(
+        env.control
+            .publish_capture(
+                capture_id,
+                1,
+                generation(1),
+                grant,
+                attachment(1),
+                1,
+                new_generation.clone(),
+                true,
+            )
+            .expect("replay publication"),
+        published
+    );
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation.clone(),
+            false,
+        ),
+        Err(ControlError::OperationMismatch)
+    );
+    let operation = env.control.get_operation(capture_id);
+    assert!(
+        matches!(operation, Ok(OperationState::Committed(_))),
+        "unexpected publication outcome: {operation:?}"
+    );
+    assert_eq!(
+        env.control
+            .mark_generation_unretained(op(31), generation(2)),
+        Err(ControlError::Busy)
+    );
+}
+
+#[test]
+fn capture_publication_rechecks_each_lease_after_buffering_its_outcome() {
+    for lease in ["writer", "attachment", "preparation"] {
+        let mut store = TestObjectStore::default();
+        let initial = empty_generation(&mut store, generation(1), 70);
+        let child = create_generation(
+            &mut store,
+            generation(2),
+            Some(generation(1)),
+            initial.roots,
+            CaptureMode::BlockCut,
+            VolumeBoundaryId::from_bytes(id(71)),
+            71,
+        )
+        .unwrap();
+        let env = TestEnv::with_initial_seed(initial);
+        let mut grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+        match lease {
+            "attachment" => grant = maintain_leases(&env, grant, 14, false),
+            "preparation" => grant = maintain_leases(&env, grant, 29, true),
+            _ => {}
+        }
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let preparation_deadline = match env.control.get_operation(capture_id).unwrap() {
+            OperationState::Preparing { expires_at, .. } => expires_at,
+            other => panic!("unexpected capture state: {other:?}"),
+        };
+        let attachment_deadline = before.attachment.unwrap().protection_expires_at;
+        let deadline = match lease {
+            "writer" => grant.expires_at,
+            "attachment" => attachment_deadline,
+            _ => preparation_deadline,
+        };
+        assert_eq!(
+            deadline,
+            grant
+                .expires_at
+                .min(attachment_deadline)
+                .min(preparation_deadline)
+        );
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(deadline.as_nanos(), Ordering::SeqCst);
+
+        assert_eq!(
+            control.publish_capture(
+                capture_id,
+                1,
+                generation(1),
+                grant,
+                attachment(1),
+                1,
+                child,
+                true,
+            ),
+            Err(ControlError::Expired),
+            "{lease} expired before the commit decision"
+        );
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert!(matches!(
+            env.control.get_operation(capture_id),
+            Ok(OperationState::Preparing { .. })
+        ));
+        assert_eq!(
+            env.control
+                .open_generation(op(80), generation(2), protection(80)),
+            Err(ControlError::NotFound)
+        );
+    }
+}
+
+#[test]
+fn committed_capture_replays_after_lease_expiry_when_the_reply_was_lost() {
+    let mut store = TestObjectStore::default();
+    let initial = empty_generation(&mut store, generation(1), 72);
+    let child = create_generation(
+        &mut store,
+        generation(2),
+        Some(generation(1)),
+        initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(73)),
+        73,
+    )
+    .unwrap();
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(30);
+    env.start_sealed_capture(capture_id, protection(30), grant, initial.roots);
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            child.clone(),
+            true
+        ),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+
+    env.clock.set(grant.expires_at.as_nanos());
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            child,
+            true,
+        )
+        .expect("reconcile a committed capture after lease expiry");
+    assert_eq!(published.branch.head, generation(2));
+}
+
+#[test]
+fn live_root_commit_and_child_renewal_recheck_parent_capture_deadlines() {
+    for (parent_capture, renew_child) in [(false, false), (true, false), (true, true)] {
+        let env = TestEnv::new();
+        let mut grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        if parent_capture {
+            env.control
+                .begin_preparation(PreparationRequest {
+                    operation_id: capture_id,
+                    branch_id: branch(1),
+                    expected_revision: 1,
+                    grant,
+                    attachment_id: attachment(1),
+                    volume_epoch: 1,
+                    protection_id: protection(30),
+                    kind: PreparationKind::CheckpointCapture,
+                    expected_roots: None,
+                    dependencies: vec![],
+                })
+                .unwrap();
+            grant = maintain_leases(&env, grant, 29, true);
+            env.control
+                .authorize_capture_child(op(31), capture_id, op(32), grant)
+                .unwrap();
+        }
+        let barrier_id = if parent_capture { op(32) } else { op(5) };
+        let next_roots = replace_volume_root(roots(1), 9);
+        env.control
+            .begin_preparation(PreparationRequest {
+                operation_id: barrier_id,
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(32),
+                kind: PreparationKind::VolumeBarrier,
+                expected_roots: Some(next_roots),
+                dependencies: vec![],
+            })
+            .unwrap();
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let before_operation = env.control.get_operation(barrier_id).unwrap();
+        let deadline = if parent_capture {
+            match env.control.get_operation(capture_id).unwrap() {
+                OperationState::Preparing { expires_at, .. } => expires_at,
+                other => panic!("unexpected capture state: {other:?}"),
+            }
+        } else {
+            grant.expires_at
+        };
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(deadline.as_nanos(), Ordering::SeqCst);
+        let child = parent_capture.then_some((capture_id, barrier_id));
+        let result = if renew_child {
+            control
+                .renew_preparation(op(33), barrier_id, grant)
+                .map(|_| ())
+        } else {
+            control
+                .commit_live_roots(barrier_id, 1, grant, next_roots, child)
+                .map(|_| ())
+        };
+        assert_eq!(result, Err(ControlError::Expired));
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert_eq!(env.control.get_operation(barrier_id), Ok(before_operation));
+    }
+}
+
+#[test]
+fn lease_dependent_control_operations_recheck_after_buffering_outcomes() {
+    for action in [
+        "renew_writer",
+        "begin",
+        "renew_preparation",
+        "authorize",
+        "seal",
+    ] {
+        let env = TestEnv::new();
+        let grant = env.writer_and_attachment();
+        let capture_id = op(30);
+        let request = |operation_id| PreparationRequest {
+            operation_id,
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(30),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        };
+        let existing_capture = !matches!(action, "renew_writer" | "begin");
+        if existing_capture {
+            env.control.begin_preparation(request(capture_id)).unwrap();
+        }
+        let before = env.control.get_branch(branch(1)).unwrap();
+        let previous_capture =
+            existing_capture.then(|| env.control.get_operation(capture_id).unwrap());
+        let (authority, control) = advancing_control(&env);
+        authority
+            .advance_to
+            .store(grant.expires_at.as_nanos(), Ordering::SeqCst);
+        let operation_id = op(40);
+        let result = match action {
+            "renew_writer" => control.renew_writer(operation_id, grant).map(|_| ()),
+            "begin" => control.begin_preparation(request(operation_id)).map(|_| ()),
+            "renew_preparation" => control
+                .renew_preparation(operation_id, capture_id, grant)
+                .map(|_| ()),
+            "authorize" => control.authorize_capture_child(operation_id, capture_id, op(41), grant),
+            "seal" => control
+                .seal_capture(operation_id, capture_id, 1, grant)
+                .map(|_| ()),
+            _ => unreachable!(),
+        };
+        assert_eq!(result, Err(ControlError::Expired), "{action}");
+        assert_eq!(env.control.get_branch(branch(1)).unwrap(), before);
+        assert_eq!(
+            env.control.get_operation(operation_id),
+            Err(ControlError::NotFound)
+        );
+        if let Some(previous) = previous_capture {
+            assert_eq!(env.control.get_operation(capture_id), Ok(previous));
+        }
+    }
+}
+
+#[test]
+fn reader_protection_does_not_open_or_renew_after_its_deadline() {
+    let env = TestEnv::new();
+    let (authority, control) = advancing_control(&env);
+    authority.advance_to.store(
+        versionfs_core::control::READER_PROTECTION_NANOS,
+        Ordering::SeqCst,
+    );
+    assert_eq!(
+        control.open_generation(op(50), generation(1), protection(50)),
+        Err(ControlError::Expired)
+    );
+    let deadline = env
+        .control
+        .open_generation(op(51), generation(1), protection(50))
+        .expect("failed open left no protection claim");
+    authority
+        .advance_to
+        .store(deadline.as_nanos(), Ordering::SeqCst);
+    assert_eq!(
+        control.renew_protection(op(52), protection(50)),
+        Err(ControlError::Expired)
+    );
+    assert_eq!(
+        env.control.get_operation(op(52)),
+        Err(ControlError::NotFound)
+    );
+}
+
+#[test]
+fn capture_publication_rejects_a_verified_graph_from_another_object_namespace() {
+    let mut target_store = TestObjectStore::default();
+    let initial = empty_generation(&mut target_store, generation(1), 60);
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(61);
+    env.start_sealed_capture(capture_id, protection(61), grant, initial.roots);
+
+    let mut foreign_store = TestObjectStore::with_scope(ObjectStoreScopeId::from_bytes([0xD5; 16]));
+    let foreign_initial = empty_generation(&mut foreign_store, generation(1), 60);
+    assert_eq!(foreign_initial.roots, initial.roots);
+    let foreign_generation = create_generation(
+        &mut foreign_store,
+        generation(2),
+        Some(generation(1)),
+        foreign_initial.roots,
+        CaptureMode::BlockCut,
+        VolumeBoundaryId::from_bytes(id(62)),
+        62,
+    )
+    .expect("verify child Generation in foreign object namespace");
+
+    assert_eq!(
+        env.control.publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            foreign_generation,
+            true,
+        ),
+        Err(ControlError::InvalidTransition)
+    );
+    assert!(env.control.get_branch(branch(1)).unwrap().capture.is_some());
+    assert!(matches!(
+        env.control.get_operation(capture_id),
+        Ok(OperationState::Preparing { operation_id, .. }) if operation_id == capture_id
+    ));
+}
+
+#[test]
+fn detached_capture_publication_retains_generation_without_rebasing_branch() {
+    let mut object_store = TestObjectStore::default();
+    let initial = empty_generation(&mut object_store, generation(1), 40);
+    let new_generation = create_generation(
+        &mut object_store,
+        generation(3),
+        Some(initial.generation_id),
+        initial.roots,
+        CaptureMode::FilesystemFrozen,
+        VolumeBoundaryId::from_bytes(id(41)),
+        41,
+    )
+    .expect("create verified detached Generation");
+    let env = TestEnv::with_initial_seed(initial);
+    let grant = env.writer_and_attachment();
+    let capture_id = op(40);
+    env.start_sealed_capture(capture_id, protection(40), grant, initial.roots);
+
+    let published = env
+        .control
+        .publish_capture(
+            capture_id,
+            1,
+            generation(1),
+            grant,
+            attachment(1),
+            1,
+            new_generation,
+            false,
+        )
+        .expect("publish detached Generation");
+    assert!(!published.head_advanced);
+    assert_eq!(published.branch.head, generation(1));
+    assert_eq!(published.branch.revision, 1);
+    assert!(published.branch.capture.is_none());
+    assert_eq!(
+        published
+            .branch
+            .attachment
+            .expect("attachment remains on original base")
+            .base_generation,
+        generation(1)
+    );
+
+    env.control
+        .open_generation(op(41), generation(3), protection(41))
+        .expect("detached Generation remains retained and readable");
+    assert_eq!(
+        env.control
+            .mark_generation_unretained(op(42), generation(3)),
+        Err(ControlError::Busy)
+    );
+    env.control
+        .close_protection(op(43), protection(41))
+        .expect("release detached Generation reader");
+    env.control
+        .mark_generation_unretained(op(44), generation(3))
+        .expect("allow retention release after reader closes");
+    assert_eq!(
+        env.control
+            .open_generation(op(45), generation(3), protection(45)),
+        Err(ControlError::GenerationExpired)
     );
 }
 

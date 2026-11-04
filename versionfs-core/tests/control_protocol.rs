@@ -16,7 +16,8 @@ use versionfs_core::{
     },
     format::{ObjectRef, ObjectType, encode_object},
     identity::{
-        AttachmentId, BranchId, GenerationId, OperationId, PrincipalId, ProtectionId, WorkspaceId,
+        AttachmentId, BranchId, GenerationId, ObjectStoreScopeId, OperationId, PrincipalId,
+        ProtectionId, WorkspaceId,
     },
     metadata::{
         MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataSnapshot,
@@ -172,7 +173,13 @@ impl MetadataAuthority for MemoryAuthority {
 fn control() -> WorkspaceControl<MemoryAuthority> {
     let authority = Arc::new(MemoryAuthority::default());
     let owner = start_authority_owner(authority.as_ref(), op(250)).expect("start owner");
-    let control = WorkspaceControl::new(authority, workspace(1), principal(1), owner);
+    let control = WorkspaceControl::new(
+        authority,
+        workspace(1),
+        ObjectStoreScopeId::from_bytes([0xA5; 16]),
+        principal(1),
+        owner,
+    );
     control
         .create_workspace(op(1), branch(1), "main", 60_000, seed(1))
         .expect("create workspace");

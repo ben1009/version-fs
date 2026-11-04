@@ -53,6 +53,15 @@ records. If replacement returns an error after rename, the worker keeps the exac
 replacement and retries it before remote work resumes. Instance-scoped failure
 points exercise interruptions before publication and between rename and directory
 sync.
+Pending barrier records bind the workspace ID, principal, and object-store scope;
+a worker rejects a record belonging to a different scope. Older pending records
+without that binding remain readable for recovery, but are not replayed until
+the caller independently verifies their origin and explicitly binds their scope
+with `FileBarrierJournal::bind_legacy_pending_scope`.
+Generation construction can reuse proofs for roots that remain protected. A
+reused proof indexes the nodes visited during its own verification; retaining
+additional independently protected proofs can avoid rereading descendants that
+are absent from the newest proof's index.
 Branch reads reconcile a pending Metadata Authority outcome before reading fresh
 state, allowing barrier retries and worker reopen to pass the toy-kv outcome
 gate. A clean worker validates its writer and attachment identity before clearing
