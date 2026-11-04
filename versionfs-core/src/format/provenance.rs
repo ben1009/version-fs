@@ -202,6 +202,11 @@ impl GenerationDescriptorV2 {
                     "recorded binding must reference a provenance context",
                 ));
             }
+            if context_root.encoded_len > MAX_PROVENANCE_CONTEXT_BYTES as u64 {
+                return Err(FormatError::InvalidProvenance(
+                    "provenance context reference exceeds 64 KiB",
+                ));
+            }
             context_root.validate()?;
         }
         Ok(())

@@ -1,4 +1,4 @@
-//! Canonical Version FS v1 object and metadata envelopes.
+//! Canonical Version FS object formats and metadata envelopes.
 
 use crate::identity::{ArtifactId, GenerationId, LogId, ObjectId, VolumeBoundaryId};
 use sha2::{Digest, Sha256};
@@ -1269,7 +1269,10 @@ impl LogSegment {
     }
 }
 
-/// Complete immutable Generation descriptor payload.
+/// Legacy immutable v1 Generation descriptor payload.
+///
+/// New writers use [`GenerationDescriptorV2`]. General descriptor readers use
+/// [`decode_generation_descriptor`] to support both v1 and v2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationDescriptor {
     /// Stable Generation identity.
@@ -1291,7 +1294,7 @@ pub struct GenerationDescriptor {
 }
 
 impl GenerationDescriptor {
-    /// Encodes the complete descriptor as an immutable object.
+    /// Encodes the legacy descriptor as a v1 immutable object.
     pub fn encode(self) -> Result<Vec<u8>, FormatError> {
         if self.volume_root.object_type != ObjectType::VolumeRoot
             || self.logs_root.object_type != ObjectType::LogMapRoot
@@ -1318,7 +1321,9 @@ impl GenerationDescriptor {
         encode_object(ObjectType::GenerationDescriptor, &encoder.finish())
     }
 
-    /// Decodes a complete immutable Generation descriptor.
+    /// Decodes only a legacy v1 Generation descriptor.
+    ///
+    /// Use [`decode_generation_descriptor`] to read either supported version.
     pub fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
         let object = decode_object(bytes)?;
         if object.object_type != ObjectType::GenerationDescriptor {

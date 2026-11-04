@@ -1,10 +1,10 @@
 //! Compatibility and golden-vector tests for provenance-capable descriptors.
 
 use versionfs_core::format::{
-    CaptureMode, DecodedGenerationDescriptor, FormatError, GenerationDescriptorFormat,
-    GenerationDescriptorV2, ObjectRef, ObjectType, ProvenanceBinding, ProvenanceContext,
-    ProvenanceCoverage, ProvenanceStatus, decode_generation_descriptor, decode_object,
-    decode_object_versioned, object_id,
+    CaptureMode, DecodedGenerationDescriptor, FormatError, GenerationDescriptor,
+    GenerationDescriptorFormat, GenerationDescriptorV2, MAX_PROVENANCE_CONTEXT_BYTES, ObjectRef,
+    ObjectType, ProvenanceBinding, ProvenanceContext, ProvenanceCoverage, ProvenanceStatus,
+    decode_generation_descriptor, decode_object, decode_object_versioned, object_id,
 };
 use versionfs_core::identity::{GenerationId, ObjectId, PrincipalId, VolumeBoundaryId};
 
@@ -199,6 +199,54 @@ fn legacy_decoder_rejects_v2_before_reading_the_payload() {
             object_type: ObjectType::GenerationDescriptor,
         })
     );
+    assert_eq!(
+        GenerationDescriptor::decode(&bytes),
+        Err(FormatError::UnsupportedObjectVersion {
+            version: 2,
+            object_type: ObjectType::GenerationDescriptor,
+        })
+    );
+}
+
+#[test]
+fn recorded_descriptors_reject_oversized_context_references() {
+    let context_root = reference(
+        ObjectType::ProvenanceContext,
+        0x55,
+        MAX_PROVENANCE_CONTEXT_BYTES as u64,
+    );
+    let at_limit = descriptor(ProvenanceBinding::Recorded { context_root });
+    let mut bytes = at_limit.encode().expect("reference at the size limit");
+    assert_eq!(
+        GenerationDescriptorV2::decode(&bytes).expect("decode reference at the size limit"),
+        at_limit
+    );
+
+    let oversized_root = ObjectRef {
+        encoded_len: context_root.encoded_len + 1,
+        ..context_root
+    };
+    assert!(matches!(
+        descriptor(ProvenanceBinding::Recorded {
+            context_root: oversized_root,
+        })
+        .encode(),
+        Err(FormatError::InvalidProvenance(_))
+    ));
+
+    // Header, generation ID, absent parent, three view roots, status/coverage,
+    // then the context reference's type and digest precede its encoded length.
+    let context_len_offset = 16 + 16 + 1 + 3 * 42 + 2 + 2 + 32;
+    bytes[context_len_offset..context_len_offset + 8]
+        .copy_from_slice(&oversized_root.encoded_len.to_le_bytes());
+    assert!(matches!(
+        GenerationDescriptorV2::decode(&bytes),
+        Err(FormatError::InvalidProvenance(_))
+    ));
+    assert!(matches!(
+        decode_generation_descriptor(&bytes),
+        Err(FormatError::InvalidProvenance(_))
+    ));
 }
 
 #[test]

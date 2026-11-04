@@ -25,6 +25,16 @@ v1-only and rejects `(2, 11)` before payload validation. The upgraded
 `decode_object_versioned` and `decode_generation_descriptor` entry points
 accept the supported pairs above and reject unknown versions or pairs.
 
+`GenerationDescriptor::encode` and `GenerationDescriptor::decode` remain legacy
+v1 codecs. General readers use `decode_generation_descriptor`, which preserves
+the source version in its decoded result; new writers use
+`GenerationDescriptorV2`.
+
+Deploy v2-capable readers before allowing new SDK writers to publish v2
+descriptors. Once v2 objects exist, a binary rollback must retain v2 reader
+support. This MVP does not support mixed-version rolling upgrades with v1-only
+readers, and retained descriptors must not be rewritten for a downgrade.
+
 ## 2. Generation descriptor v2
 
 The v2 descriptor payload uses this exact field order:
@@ -48,6 +58,10 @@ Only `(recorded, generation_context, context_root present)` and
 other combination are rejected. V1 descriptors decode as source format v1,
 unattributed, coverage none, and no context root. Decoding never rewrites their
 bytes, digests, or publication binding.
+
+A recorded binding's context reference must declare an encoded length no larger
+than the complete context-object limit of 64 KiB. Descriptor validation rejects
+an oversized reference before graph verification fetches its target.
 
 ## 3. Provenance context object
 
