@@ -68,8 +68,8 @@ const TRANSITION_EXPIRE_PREPARATION: u16 = 4;
 const TRANSITION_PUBLISH_CAPTURE: u16 = 5;
 const OP_TOMBSTONE: u16 = u16::MAX;
 const CAPTURE_PROVENANCE_EXTENSION: &[u8; 4] = b"CPRV";
-const MAX_CALLER_PREPARATION_DEPENDENCIES: usize = 4096;
-const MAX_STORED_PREPARATION_DEPENDENCIES: usize = MAX_CALLER_PREPARATION_DEPENDENCIES + 1;
+// Bound the atomic preparation record to the MVP MetadataAuthority's value size.
+const MAX_PROTECTED_DEPENDENCIES: usize = 1024;
 
 /// A durable authority-owner incarnation. Every owner restart advances it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1417,11 +1417,6 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         } = request;
         let capture = kind == PreparationKind::CheckpointCapture;
         validate_provenance_binding(provenance)?;
-        if dependencies.len() > MAX_CALLER_PREPARATION_DEPENDENCIES {
-            return Err(ControlError::InvalidRequest(
-                "too many protected dependencies",
-            ));
-        }
         if !capture && provenance != ProvenanceBinding::Unattributed {
             return Err(ControlError::InvalidRequest(
                 "provenance may only be bound to checkpoint captures",
@@ -1432,7 +1427,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         {
             dependencies.push(context_root);
         }
-        if dependencies.len() > MAX_STORED_PREPARATION_DEPENDENCIES {
+        if dependencies.len() > MAX_PROTECTED_DEPENDENCIES {
             return Err(ControlError::InvalidRequest(
                 "too many protected dependencies",
             ));
@@ -3496,7 +3491,7 @@ fn decode_protection(bytes: &[u8]) -> Result<ProtectionRecord, ControlError> {
             let owner_incarnation = OwnerIncarnation(d.u64_le().map_err(corrupt)?);
             let expires_at = MonotonicTime::from_nanos(d.u64_le().map_err(corrupt)?);
             let count = d.u32_le().map_err(corrupt)? as usize;
-            if count > MAX_STORED_PREPARATION_DEPENDENCIES {
+            if count > MAX_PROTECTED_DEPENDENCIES {
                 return Err(ControlError::CorruptRecord(
                     "too many protected dependencies".into(),
                 ));

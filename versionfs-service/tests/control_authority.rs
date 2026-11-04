@@ -1160,42 +1160,63 @@ fn recorded_capture_binding_is_fingerprinted_published_and_reconciled() {
 }
 
 #[test]
-fn recorded_capture_context_does_not_consume_caller_dependency_limit() {
+fn recorded_capture_context_counts_toward_the_dependency_limit() {
     let mut store = TestObjectStore::default();
-    let initial = empty_generation(&mut store, generation(1), 86);
+    let initial = empty_generation(&mut store, generation(1), 87);
     let context = store_provenance_context(
         &mut store,
         principal(1),
         initial.seed().roots,
-        "many-dependencies",
+        "dependency-limit",
     );
     let env = TestEnv::with_initial_seed(initial.clone());
     let grant = env.writer_and_attachment();
-    let capture_id = op(181);
 
     env.control
         .begin_preparation_with_provenance(
             PreparationRequest {
-                operation_id: capture_id,
+                operation_id: op(182),
                 branch_id: branch(1),
                 expected_revision: 1,
                 grant,
                 attachment_id: attachment(1),
                 volume_epoch: 1,
-                protection_id: protection(181),
+                protection_id: protection(182),
                 kind: PreparationKind::CheckpointCapture,
                 expected_roots: None,
-                dependencies: vec![initial.seed().roots.volume; 4096],
+                dependencies: vec![initial.seed().roots.volume; 1023],
             },
             ProvenanceBinding::Recorded {
                 context_root: context,
             },
         )
-        .expect("context protection is in addition to the caller dependency limit");
-
+        .expect("the context root occupies the final allowed dependency slot");
     env.control
-        .abort_operation(capture_id)
-        .expect("decode and release all stored dependencies");
+        .abort_operation(op(182))
+        .expect("decode and release the maximum protected dependency set");
+
+    assert_eq!(
+        env.control.begin_preparation_with_provenance(
+            PreparationRequest {
+                operation_id: op(183),
+                branch_id: branch(1),
+                expected_revision: 1,
+                grant,
+                attachment_id: attachment(1),
+                volume_epoch: 1,
+                protection_id: protection(183),
+                kind: PreparationKind::CheckpointCapture,
+                expected_roots: None,
+                dependencies: vec![initial.seed().roots.volume; 1024],
+            },
+            ProvenanceBinding::Recorded {
+                context_root: context,
+            },
+        ),
+        Err(ControlError::InvalidRequest(
+            "too many protected dependencies"
+        ))
+    );
 }
 
 #[test]
