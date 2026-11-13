@@ -2,15 +2,16 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0–P5 merged; P1 real-S3 run pending; P2 locally qualified; P6 implementation in progress; qualification pending |
+| Status | P0–P5 merged; P1 implementation complete with real-S3 run pending; P2 locally qualified; P6/P7 implementation in progress; release qualification pending |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
 
 This plan implements the block-volume MVP from RFC-002. It supersedes the earlier
 directory-scanning plan. RFC-001 owns system semantics; RFC-002 owns mechanisms,
-durability boundaries, and release criteria. P0 is merged and P1 implementation is in progress. Writing this
-plan or building a smoke harness does not establish remote durability or
+durability boundaries, and release criteria. P0–P5 are merged. P1 implementation is complete, with its dedicated real-S3 run
+pending; P6/P7 implementation and release qualification remain in progress. Writing
+this plan or building a smoke harness does not establish remote durability or
 benchmark evidence.
 
 ## 1. Release outcome
@@ -305,13 +306,18 @@ their mutation protocols and connects them to this same coordinator.
   capture operation ID.
 - [x] Add RFC-002's provenance-capable v2 descriptor and bounded context format,
   typed evidence edges, and golden vectors. Keep v1 bytes stable and inspect
-  legacy descriptors as explicitly unattributed. The core codec and graph proof
-  implement this format slice; capture-time binding and the complete provenance
-  release gate remain pending and this does not yet qualify I16.
-- [ ] Bind explicit provenance at capture admission and in request fingerprints;
-  publish/retain its verified required graph with the descriptor and reconcile
-  the original binding on lost replies. Equal view roots may have different
-  Generation contexts; changed attribution on the same operation ID rejects.
+  legacy descriptors as explicitly unattributed. The core codec, graph proof,
+  and capture-time binding implement this slice; the complete provenance release
+  gate remains pending and this does not yet qualify I16.
+- [x] Bind explicit provenance at capture admission and in request fingerprints;
+  protect its context root during preparation, then publish/retain its verified
+  required graph with the descriptor and reconcile the original binding on lost
+  replies. Verify a context's recording principal against the authenticated
+  caller on first publication; later authorized publishers may reuse the
+  established context without changing its original principal. Apply this same
+  verification to initial workspace creation and standalone Generation catalog
+  publication. Equal view roots may have different Generation contexts; changed
+  attribution on the same operation ID rejects.
 - [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
 - [ ] Close local admission, read authoritative revision/live roots together,
@@ -338,9 +344,16 @@ retry by refreshing only the revision/roots. Ownership changes fence the origina
 worker. All three capture modes have distinct descriptor and recovery tests.
 Fork does not walk volume extents; journal replay uses a writable fork;
 name reuse and old-device commits cannot affect the new branch state.
-Recorded/unattributed and legacy descriptors round-trip unambiguously; required
-context/evidence failures prevent publication, and mismatching provenance cannot
-replace a committed binding on retry.
+Recorded and unattributed bindings, as well as legacy descriptors, round-trip
+unambiguously. Missing or corrupt required context or evidence prevents
+publication. Capture admission fixes the provenance binding in the operation
+fingerprint; publication and lost-reply reconciliation preserve that binding.
+On first publication, the authenticated caller must match the context's
+recording principal. A retry with mismatching provenance cannot replace a
+committed binding. Identical view roots can be published in different
+Generations with distinct verified contexts. I16 remains incomplete until
+protected inspection, retention closure, and the remaining acceptance campaign
+are implemented.
 
 ### P8. Native logs and artifacts
 
