@@ -2,15 +2,16 @@
 
 | Field | Value |
 | --- | --- |
-| Status | P0–P5 merged; P1 real-S3 run pending; P2 locally qualified; P6 implementation in progress; qualification pending |
+| Status | P0–P5 merged; P1 implementation complete with real-S3 run pending; P2 locally qualified; P6/P7 implementation in progress; release qualification pending |
 | Created | 2026-10-23 |
 | Design baseline | [RFC-001](../rfcs/001-version-fs.md) and the block-volume revision of [RFC-002](../rfcs/002-version-fs-mvp.md) |
 | Target | Version FS v0 |
 
 This plan implements the block-volume MVP from RFC-002. It supersedes the earlier
 directory-scanning plan. RFC-001 owns system semantics; RFC-002 owns mechanisms,
-durability boundaries, and release criteria. P0 is merged and P1 implementation is in progress. Writing this
-plan or building a smoke harness does not establish remote durability or
+durability boundaries, and release criteria. P0–P5 are merged. P1 implementation is complete, with its dedicated real-S3 run
+pending; P6/P7 implementation and release qualification remain in progress. Writing
+this plan or building a smoke harness does not establish remote durability or
 benchmark evidence.
 
 ## 1. Release outcome
