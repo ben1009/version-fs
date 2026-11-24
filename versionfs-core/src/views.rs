@@ -387,6 +387,39 @@ impl LogSegmentIndex {
             })
             .collect()
     }
+
+    /// Seeks to the first segment covering or following `from_seq` and returns
+    /// up to `limit` segment entries in sequence order without scanning earlier
+    /// index subtrees.
+    pub fn entries_from<S: MapObjectStore>(
+        &self,
+        store: &S,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, SegmentIndexEntry)>, ViewError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let raw =
+            self.map
+                .range_from_floor(store, &from_seq.to_be_bytes(), limit.saturating_add(1))?;
+        let mut out = Vec::with_capacity(limit.min(raw.len()));
+        for (key, value) in raw {
+            let first_seq = decode_u64_key(&key)?;
+            let entry = SegmentIndexEntry::decode(&value)?;
+            if first_seq >= entry.end_seq {
+                return Err(FormatError::InvalidNativeView("empty segment-index range").into());
+            }
+            if entry.end_seq <= from_seq {
+                continue;
+            }
+            out.push((first_seq, entry));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Persistent map from UTF-8 log names to complete log state.

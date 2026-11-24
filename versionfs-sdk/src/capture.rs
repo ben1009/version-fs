@@ -3049,6 +3049,14 @@ mod tests {
             drop(fail);
             self.active().get_operation(operation_id)
         }
+
+        fn get_committed_root_transition(
+            &self,
+            operation_id: OperationId,
+        ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError>
+        {
+            self.active().get_committed_root_transition(operation_id)
+        }
     }
 
     impl CaptureControl for FaultyControl {

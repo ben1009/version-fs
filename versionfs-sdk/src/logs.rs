@@ -5,14 +5,15 @@
 //! `PreparationKind::LogMutation` authority protocol without introducing a second
 //! checkpoint-coordination protocol or recopying historical segments.
 
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use versionfs_core::control::{
-    BranchState, CommittedRootTransition, ControlError, GenerationSeed, LiveRoots, OperationState,
-    PreparationKind, PreparationRequest, WorkspaceControl, WriterGrant,
-    decode_branch_operation_result,
+    BranchState, CommittedRootTransition, ControlError, GenerationSeed, LiveRoots,
+    NativeRootTransitionMeta, OperationState, PreparationKind, PreparationRequest,
+    WorkspaceControl, WriterGrant, decode_branch_operation_result,
 };
 use versionfs_core::format::{
     FormatError, LogMapEntry, LogSegment, MAX_LOG_RECORD_BYTES, MAX_LOG_RECORDS, ObjectRef,
@@ -33,6 +34,11 @@ use crate::barrier::{VolumeBarrierControl, same_grant_identity};
 
 /// Default preparation renewal interval during long native-view uploads (3 minutes).
 pub const DEFAULT_NATIVE_RENEWAL_INTERVAL: Duration = Duration::from_secs(180);
+
+/// Lead time before a read protection deadline at which multi-object reads renew
+/// protection (1/3 of `READER_PROTECTION_NANOS`).
+pub(crate) const READER_RENEW_LEAD_NANOS: u64 =
+    versionfs_core::control::READER_PROTECTION_NANOS / 3;
 
 /// Errors returned by native ordered-log operations.
 #[derive(Debug, Error)]
@@ -246,6 +252,9 @@ pub trait NativeControl: VolumeBarrierControl {
         operation_id: OperationId,
         protection_id: ProtectionId,
     ) -> Result<(), ControlError>;
+
+    /// Returns the authority's current monotonic clock reading.
+    fn now(&self) -> MonotonicTime;
 }
 
 impl<A: MetadataAuthority> NativeControl for WorkspaceControl<A> {
@@ -294,6 +303,67 @@ impl<A: MetadataAuthority> NativeControl for WorkspaceControl<A> {
         protection_id: ProtectionId,
     ) -> Result<(), ControlError> {
         WorkspaceControl::close_protection(self, operation_id, protection_id)
+    }
+
+    fn now(&self) -> MonotonicTime {
+        WorkspaceControl::now(self)
+    }
+}
+
+pub(crate) fn ensure_store_scope<S, C>(store: &S, control: &C) -> Result<(), ControlError>
+where
+    S: MapObjectStore,
+    C: VolumeBarrierControl,
+{
+    if store.proof_scope() != control.object_store_scope() {
+        return Err(ControlError::InvalidRequest(
+            "object store scope does not match workspace object_store_scope",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct ReadProtectionGuard<'a, C, F> {
+    control: &'a C,
+    protection_id: ProtectionId,
+    deadline: MonotonicTime,
+    next_renewal_id: F,
+}
+
+impl<'a, C, F> ReadProtectionGuard<'a, C, F>
+where
+    C: NativeControl,
+    F: FnMut() -> OperationId,
+{
+    pub(crate) fn new(
+        control: &'a C,
+        protection_id: ProtectionId,
+        deadline: MonotonicTime,
+        next_renewal_id: F,
+    ) -> Self {
+        Self {
+            control,
+            protection_id,
+            deadline,
+            next_renewal_id,
+        }
+    }
+
+    /// Ensures the read protection has not expired and renews it before expiry
+    /// when within [`READER_RENEW_LEAD_NANOS`] of the deadline.
+    pub(crate) fn ensure_live(&mut self) -> Result<(), ControlError> {
+        let now = self.control.now();
+        let remaining = self.deadline.as_nanos().saturating_sub(now.as_nanos());
+        if remaining == 0 {
+            return Err(ControlError::Expired);
+        }
+        if remaining <= READER_RENEW_LEAD_NANOS {
+            let renew_op = (self.next_renewal_id)();
+            self.deadline = self
+                .control
+                .renew_protection(renew_op, self.protection_id)?;
+        }
+        Ok(())
     }
 }
 
@@ -465,7 +535,7 @@ impl From<NativeCommitError> for LogError {
     }
 }
 
-fn is_unknown_control_error(error: &ControlError) -> bool {
+pub(crate) fn is_unknown_control_error(error: &ControlError) -> bool {
     matches!(
         error,
         ControlError::Metadata(
@@ -493,6 +563,7 @@ pub(crate) fn commit_native_root_mutation<S, C, F>(
     next_roots: LiveRoots,
     dependencies: Vec<ObjectRef>,
     staged_objects: Vec<(ObjectRef, Vec<u8>)>,
+    native_meta: Option<NativeRootTransitionMeta>,
     renewal_interval: Duration,
     mut next_renewal_id: F,
 ) -> Result<BranchState, NativeCommitError>
@@ -501,13 +572,13 @@ where
     C: VolumeBarrierControl,
     F: FnMut() -> OperationId,
 {
-    let mut current_grant = control.check_attachment_live(
-        ctx.branch_id,
-        ctx.attachment_id,
-        ctx.volume_epoch,
-        ctx.grant,
-    )?;
+    ensure_store_scope(store, control)?;
 
+    // Attempt preparation admission with the caller's grant first so an
+    // idempotent replay of an already-admitted preparation (after a lost reply
+    // and subsequent writer-lease heartbeat renewal) matches its original
+    // preparation fingerprint instead of failing with `OperationMismatch`.
+    let mut current_grant = ctx.grant;
     let begin_result = control.begin_preparation(PreparationRequest {
         operation_id,
         branch_id: ctx.branch_id,
@@ -522,7 +593,9 @@ where
     });
     let begin_state = match begin_result {
         Ok(state) => state,
-        Err(ControlError::Fenced) => {
+        Err(
+            err @ (ControlError::Fenced | ControlError::Expired | ControlError::OperationMismatch),
+        ) => {
             let live = control.check_attachment_live(
                 ctx.branch_id,
                 ctx.attachment_id,
@@ -546,7 +619,7 @@ where
                     dependencies,
                 })?
             } else {
-                return Err(ControlError::Fenced.into());
+                return Err(err.into());
             }
         }
         Err(error) => return Err(error.into()),
@@ -617,15 +690,16 @@ where
         }
     }
 
-    match control.commit_live_roots(
+    match control.commit_live_roots_with_meta(
         operation_id,
         expected_revision,
         current_grant,
         next_roots,
         None,
+        native_meta.clone(),
     ) {
         Ok(branch) => Ok(branch),
-        Err(ControlError::Fenced) => {
+        Err(err @ (ControlError::Fenced | ControlError::Expired)) => {
             match control.check_attachment_live(
                 ctx.branch_id,
                 ctx.attachment_id,
@@ -636,31 +710,32 @@ where
                     if same_grant_identity(current_grant, live)
                         && live.expires_at > current_grant.expires_at =>
                 {
-                    match control.commit_live_roots(
+                    match control.commit_live_roots_with_meta(
                         operation_id,
                         expected_revision,
                         live,
                         next_roots,
                         None,
+                        native_meta,
                     ) {
                         Ok(branch) => Ok(branch),
-                        Err(err) => {
-                            if !is_unknown_control_error(&err) {
+                        Err(retry_err) => {
+                            if !is_unknown_control_error(&retry_err) {
                                 let _ = control.abort_operation(operation_id);
                             }
-                            Err(err.into())
+                            Err(retry_err.into())
                         }
                     }
                 }
                 Ok(_) => {
                     let _ = control.abort_operation(operation_id);
-                    Err(ControlError::Fenced.into())
+                    Err(err.into())
                 }
-                Err(err) => {
-                    if !is_unknown_control_error(&err) {
+                Err(check_err) => {
+                    if !is_unknown_control_error(&check_err) {
                         let _ = control.abort_operation(operation_id);
                     }
-                    Err(err.into())
+                    Err(check_err.into())
                 }
             }
         }
@@ -739,39 +814,31 @@ impl LogClient {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
-        let _guard = self.enter_admission()?;
+        ensure_store_scope(store, control)?;
+        let req_fp = fingerprint_create_log(ctx.branch_id, name, log_id);
 
-        // Check for an already-terminal replay of `operation_id`.
+        // Check for an already-terminal replay of `operation_id` before
+        // requiring mutation admission so retries after capture closes admission
+        // still return the committed result.
         if let Some(transition) = control.get_committed_root_transition(operation_id)? {
-            if transition.kind != PreparationKind::LogMutation
-                || transition.branch.branch_id != ctx.branch_id
-            {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let prev_map = LogMap::open(store, transition.previous_roots.logs)?;
-            let next_map = LogMap::open(store, transition.branch.logs_root)?;
-            if prev_map.get(store, name)?.is_some() {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let Some(entry) = next_map.get(store, name)? else {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            };
-            if entry.log_id != log_id || entry.first_seq != 0 || entry.end_seq != 0 {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let stream_id = StreamId {
-                branch_id: transition.branch.branch_id,
-                stream_epoch: transition.branch.stream_epoch,
-                log_id,
-            };
-            return Ok((stream_id, transition.branch));
+            return verify_committed_create_log_replay(&transition, ctx.branch_id, log_id, req_fp);
         }
+
+        let _guard = self.enter_admission()?;
 
         let branch = control.get_branch(ctx.branch_id)?;
         let (next_logs_root, staged) = {
             let mut staging = StagingObjectStore::new(store);
             let log_map = LogMap::open(&staging, branch.logs_root)?;
             if log_map.get(&staging, name)?.is_some() {
+                if let Some(transition) = control.get_committed_root_transition(operation_id)? {
+                    return verify_committed_create_log_replay(
+                        &transition,
+                        ctx.branch_id,
+                        log_id,
+                        req_fp,
+                    );
+                }
                 return Err(LogError::LogAlreadyExists(name.to_owned()));
             }
             let empty_index = LogSegmentIndex::empty(&mut staging)?;
@@ -802,6 +869,11 @@ impl LogClient {
             next_roots,
             vec![next_logs_root],
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: Vec::new(),
+                claim_log_id: Some(log_id),
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -843,6 +915,52 @@ impl LogClient {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
+        ensure_store_scope(store, control)?;
+        if ctx.branch_id != stream_id.branch_id {
+            let actual_epoch = control
+                .get_branch(ctx.branch_id)
+                .map(|b| b.stream_epoch)
+                .unwrap_or(0);
+            return Err(LogError::StreamReplaced {
+                expected_epoch: stream_id.stream_epoch,
+                actual_epoch,
+            });
+        }
+
+        // Check for an already-terminal replay of `append_id` BEFORE batch
+        // validation or staging so invalid/changed inputs under a committed ID
+        // return `OperationMismatch` and matching retries return the exact
+        // original receipt even after the tail advances or GC runs.
+        if let Some(transition) = control.get_committed_root_transition(append_id)? {
+            let Ok(()) = validate_append_batch(&records, &attachments) else {
+                return Err(LogError::Control(ControlError::OperationMismatch));
+            };
+            let Some(end_seq) = match_seq_num.checked_add(records.len() as u64) else {
+                return Err(LogError::Control(ControlError::OperationMismatch));
+            };
+            let segment = LogSegment {
+                log_id: stream_id.log_id,
+                first_seq: match_seq_num,
+                end_seq,
+                records,
+                attachments,
+            };
+            let Ok(encoded_segment) = segment.encode() else {
+                return Err(LogError::Control(ControlError::OperationMismatch));
+            };
+            let Ok(expected_segment_ref) = ObjectRef::from_encoded(&encoded_segment) else {
+                return Err(LogError::Control(ControlError::OperationMismatch));
+            };
+            let req_fp = fingerprint_append(
+                ctx.branch_id,
+                name,
+                stream_id,
+                match_seq_num,
+                expected_segment_ref,
+            );
+            return verify_committed_append_replay(&transition, stream_id, append_id, req_fp);
+        }
+
         validate_append_batch(&records, &attachments)?;
         let record_count = records.len() as u64;
         let end_seq = match_seq_num
@@ -858,22 +976,13 @@ impl LogClient {
         };
         let encoded_segment = segment.encode()?;
         let expected_segment_ref = ObjectRef::from_encoded(&encoded_segment)?;
-
-        // Check for an already-terminal replay of `append_id` BEFORE staging
-        // against the current tail, so matching retries return the exact
-        // original receipt even after the tail has advanced.
-        if let Some(transition) = control.get_committed_root_transition(append_id)? {
-            return verify_committed_append_replay(
-                store,
-                &transition,
-                name,
-                stream_id,
-                append_id,
-                match_seq_num,
-                end_seq,
-                expected_segment_ref,
-            );
-        }
+        let req_fp = fingerprint_append(
+            ctx.branch_id,
+            name,
+            stream_id,
+            match_seq_num,
+            expected_segment_ref,
+        );
 
         // Verify caller-supplied attachment objects exist and pass digest/format
         // checks in `store` before registering a preparation or committing roots.
@@ -903,6 +1012,14 @@ impl LogClient {
                 });
             }
             if entry.end_seq != match_seq_num {
+                if let Some(transition) = control.get_committed_root_transition(append_id)? {
+                    return verify_committed_append_replay(
+                        &transition,
+                        stream_id,
+                        append_id,
+                        req_fp,
+                    );
+                }
                 return Err(LogError::MatchSeqMismatch {
                     expected: match_seq_num,
                     actual: entry.end_seq,
@@ -952,6 +1069,16 @@ impl LogClient {
             next_roots,
             dependencies,
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: encode_append_receipt_meta(
+                    stream_id,
+                    match_seq_num,
+                    end_seq,
+                    expected_segment_ref,
+                ),
+                claim_log_id: None,
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -990,54 +1117,24 @@ impl LogClient {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
-        let _guard = self.enter_admission()?;
+        ensure_store_scope(store, control)?;
+        if ctx.branch_id != stream_id.branch_id {
+            let actual_epoch = control
+                .get_branch(ctx.branch_id)
+                .map(|b| b.stream_epoch)
+                .unwrap_or(0);
+            return Err(LogError::StreamReplaced {
+                expected_epoch: stream_id.stream_epoch,
+                actual_epoch,
+            });
+        }
+        let req_fp = fingerprint_trim_log(ctx.branch_id, name, stream_id, trim_to_seq);
 
         if let Some(transition) = control.get_committed_root_transition(operation_id)? {
-            if transition.kind != PreparationKind::LogMutation
-                || transition.branch.branch_id != stream_id.branch_id
-                || transition.branch.stream_epoch != stream_id.stream_epoch
-            {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let mut replay_probe = StagingObjectStore::new(store);
-            let prev_map = LogMap::open(&replay_probe, transition.previous_roots.logs)?;
-            let Some(prev_entry) = prev_map.get(&replay_probe, name)? else {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            };
-            if prev_entry.log_id != stream_id.log_id
-                || trim_to_seq < prev_entry.first_seq
-                || trim_to_seq > prev_entry.end_seq
-            {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let seg_index = LogSegmentIndex::from_root(prev_entry.segment_index_root)?;
-            let segments = seg_index.entries(&replay_probe)?;
-            let is_boundary = trim_to_seq == prev_entry.first_seq
-                || trim_to_seq == prev_entry.end_seq
-                || segments.iter().any(|(first, _)| *first == trim_to_seq);
-            if !is_boundary {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let mut expected_index = seg_index;
-            for (seg_first, _) in &segments {
-                if *seg_first < trim_to_seq {
-                    expected_index = expected_index.remove(&mut replay_probe, *seg_first)?;
-                }
-            }
-            let expected_entry = LogMapEntry {
-                log_id: prev_entry.log_id,
-                first_seq: trim_to_seq,
-                end_seq: prev_entry.end_seq,
-                segment_index_root: expected_index.root(),
-            };
-            let expected_root = prev_map
-                .insert(&mut replay_probe, name, expected_entry)?
-                .seal(&mut replay_probe)?;
-            if expected_root != transition.branch.logs_root {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            return Ok((LogView::from_entry(name, expected_entry), transition.branch));
+            return verify_committed_trim_log_replay(&transition, name, stream_id, req_fp);
         }
+
+        let _guard = self.enter_admission()?;
 
         let branch = control.get_branch(ctx.branch_id)?;
         if branch.branch_id != stream_id.branch_id || branch.stream_epoch != stream_id.stream_epoch
@@ -1112,6 +1209,11 @@ impl LogClient {
             next_roots,
             vec![next_logs_root],
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: next_entry.encode()?,
+                claim_log_id: None,
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -1140,25 +1242,24 @@ impl LogClient {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
-        let _guard = self.enter_admission()?;
+        ensure_store_scope(store, control)?;
+        if ctx.branch_id != stream_id.branch_id {
+            let actual_epoch = control
+                .get_branch(ctx.branch_id)
+                .map(|b| b.stream_epoch)
+                .unwrap_or(0);
+            return Err(LogError::StreamReplaced {
+                expected_epoch: stream_id.stream_epoch,
+                actual_epoch,
+            });
+        }
+        let req_fp = fingerprint_delete_log(ctx.branch_id, name, stream_id);
 
         if let Some(transition) = control.get_committed_root_transition(operation_id)? {
-            if transition.kind != PreparationKind::LogMutation
-                || transition.branch.branch_id != stream_id.branch_id
-                || transition.branch.stream_epoch != stream_id.stream_epoch
-            {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            let prev_map = LogMap::open(store, transition.previous_roots.logs)?;
-            let next_map = LogMap::open(store, transition.branch.logs_root)?;
-            let Some(prev_entry) = prev_map.get(store, name)? else {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            };
-            if prev_entry.log_id != stream_id.log_id || next_map.get(store, name)?.is_some() {
-                return Err(LogError::Control(ControlError::OperationMismatch));
-            }
-            return Ok(transition.branch);
+            return verify_committed_delete_log_replay(&transition, stream_id, req_fp);
         }
+
+        let _guard = self.enter_admission()?;
 
         let branch = control.get_branch(ctx.branch_id)?;
         if branch.branch_id != stream_id.branch_id || branch.stream_epoch != stream_id.stream_epoch
@@ -1173,6 +1274,9 @@ impl LogClient {
             let mut staging = StagingObjectStore::new(store);
             let log_map = LogMap::open(&staging, branch.logs_root)?;
             let Some(entry) = log_map.get(&staging, name)? else {
+                if let Some(transition) = control.get_committed_root_transition(operation_id)? {
+                    return verify_committed_delete_log_replay(&transition, stream_id, req_fp);
+                }
                 return Err(LogError::LogNotFound(name.to_owned()));
             };
             if entry.log_id != stream_id.log_id {
@@ -1202,6 +1306,11 @@ impl LogClient {
             next_roots,
             vec![next_logs_root],
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: Vec::new(),
+                claim_log_id: None,
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -1211,7 +1320,7 @@ impl LogClient {
     /// Reads verified batches from a historical Generation's log view under a
     /// bounded Generation read protection, without mounting the volume.
     #[allow(clippy::too_many_arguments)]
-    pub fn read_historical_log<S, C>(
+    pub fn read_historical_log<S, C, F>(
         &self,
         store: &S,
         control: &C,
@@ -1222,18 +1331,30 @@ impl LogClient {
         open_op_id: OperationId,
         protection_id: ProtectionId,
         close_op_id: OperationId,
+        next_renewal_id: F,
     ) -> Result<(LogView, Vec<LogBatchView>), LogError>
     where
         S: MapObjectStore,
         C: NativeControl,
+        F: FnMut() -> OperationId,
     {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
-        control.open_generation(open_op_id, generation_id, protection_id)?;
+        ensure_store_scope(store, control)?;
+        let deadline = control.open_generation(open_op_id, generation_id, protection_id)?;
+        let mut guard = ReadProtectionGuard::new(control, protection_id, deadline, next_renewal_id);
         let read_result = (|| {
+            guard.ensure_live()?;
             let seed = control.get_generation(generation_id)?;
-            read_log_from_root(store, seed.roots.logs, name, from_seq, max_batches)
+            read_log_from_root_with_guard(
+                store,
+                seed.roots.logs,
+                name,
+                from_seq,
+                max_batches,
+                &mut || guard.ensure_live(),
+            )
         })();
         let _ = control.close_protection(close_op_id, protection_id);
         read_result
@@ -1245,7 +1366,7 @@ impl LogClient {
     /// the named log's `log_id` changed, or [`LogError::CursorExpired`] if the
     /// cursor points before the current retained `first_seq`.
     #[allow(clippy::too_many_arguments)]
-    pub fn poll_live_log<S, C>(
+    pub fn poll_live_log<S, C, F>(
         &self,
         store: &S,
         control: &C,
@@ -1255,14 +1376,17 @@ impl LogClient {
         open_op_id: OperationId,
         protection_id: ProtectionId,
         close_op_id: OperationId,
+        next_renewal_id: F,
     ) -> Result<(Vec<LogBatchView>, LiveLogCursor), LogError>
     where
         S: MapObjectStore,
         C: NativeControl,
+        F: FnMut() -> OperationId,
     {
         if name.is_empty() {
             return Err(LogError::InvalidName);
         }
+        ensure_store_scope(store, control)?;
         let branch = control.get_branch(cursor.stream_id.branch_id)?;
         if branch.stream_epoch != cursor.stream_id.stream_epoch {
             return Err(LogError::StreamReplaced {
@@ -1270,14 +1394,16 @@ impl LogClient {
                 actual_epoch: branch.stream_epoch,
             });
         }
-        control.open_live_log(
+        let deadline = control.open_live_log(
             open_op_id,
             branch.branch_id,
             branch.revision,
             branch.logs_root,
             protection_id,
         )?;
+        let mut guard = ReadProtectionGuard::new(control, protection_id, deadline, next_renewal_id);
         let read_result = (|| {
+            guard.ensure_live()?;
             let log_map = LogMap::open(store, branch.logs_root)?;
             let Some(entry) = log_map.get(store, name)? else {
                 return Err(LogError::StreamReplaced {
@@ -1297,7 +1423,13 @@ impl LogClient {
                     first_seq: entry.first_seq,
                 });
             }
-            let batches = read_batches_from_entry(store, entry, cursor.next_seq, max_batches)?;
+            let batches = read_batches_from_entry_with_guard(
+                store,
+                entry,
+                cursor.next_seq,
+                max_batches,
+                &mut || guard.ensure_live(),
+            )?;
             let next_seq = batches
                 .last()
                 .map_or(cursor.next_seq, |batch| batch.end_seq);
@@ -1322,6 +1454,25 @@ pub fn read_log_from_root<S: MapObjectStore>(
     from_seq: u64,
     max_batches: usize,
 ) -> Result<(LogView, Vec<LogBatchView>), LogError> {
+    read_log_from_root_with_guard(
+        store,
+        logs_root,
+        name,
+        from_seq,
+        max_batches,
+        &mut || Ok(()),
+    )
+}
+
+fn read_log_from_root_with_guard<S: MapObjectStore>(
+    store: &S,
+    logs_root: ObjectRef,
+    name: &str,
+    from_seq: u64,
+    max_batches: usize,
+    ensure_protected: &mut dyn FnMut() -> Result<(), ControlError>,
+) -> Result<(LogView, Vec<LogBatchView>), LogError> {
+    ensure_protected()?;
     let log_map = LogMap::open(store, logs_root)?;
     let Some(entry) = log_map.get(store, name)? else {
         return Err(LogError::LogNotFound(name.to_owned()));
@@ -1332,7 +1483,8 @@ pub fn read_log_from_root<S: MapObjectStore>(
             first_seq: entry.first_seq,
         });
     }
-    let batches = read_batches_from_entry(store, entry, from_seq, max_batches)?;
+    let batches =
+        read_batches_from_entry_with_guard(store, entry, from_seq, max_batches, ensure_protected)?;
     Ok((LogView::from_entry(name, entry), batches))
 }
 
@@ -1349,21 +1501,22 @@ pub fn list_logs_from_root<S: MapObjectStore>(
         .collect())
 }
 
-fn read_batches_from_entry<S: MapObjectStore>(
+fn read_batches_from_entry_with_guard<S: MapObjectStore>(
     store: &S,
     entry: LogMapEntry,
     from_seq: u64,
     max_batches: usize,
+    ensure_protected: &mut dyn FnMut() -> Result<(), ControlError>,
 ) -> Result<Vec<LogBatchView>, LogError> {
     if max_batches == 0 || from_seq >= entry.end_seq {
         return Ok(Vec::new());
     }
+    ensure_protected()?;
     let seg_index = LogSegmentIndex::from_root(entry.segment_index_root)?;
-    let mut batches = Vec::new();
-    for (seg_first, seg_entry) in seg_index.entries(store)? {
-        if seg_entry.end_seq <= from_seq {
-            continue;
-        }
+    let selected = seg_index.entries_from(store, from_seq, max_batches)?;
+    let mut batches = Vec::with_capacity(selected.len());
+    for (seg_first, seg_entry) in selected {
+        ensure_protected()?;
         let bytes = store
             .get_ref(seg_entry.segment)
             .map_err(LogError::ObjectStore)?
@@ -1376,16 +1529,25 @@ fn read_batches_from_entry<S: MapObjectStore>(
         {
             return Err(FormatError::InvalidLogSegment.into());
         }
+        let (first_seq, records) = if from_seq > segment.first_seq {
+            let skip = usize::try_from(from_seq - segment.first_seq)
+                .map_err(|_| FormatError::InvalidLogSegment)?;
+            if skip >= segment.records.len() {
+                return Err(FormatError::InvalidLogSegment.into());
+            }
+            let mut records = segment.records;
+            let suffix = records.split_off(skip);
+            (from_seq, suffix)
+        } else {
+            (segment.first_seq, segment.records)
+        };
         batches.push(LogBatchView {
             log_id: segment.log_id,
-            first_seq: segment.first_seq,
+            first_seq,
             end_seq: segment.end_seq,
-            records: segment.records,
+            records,
             attachments: segment.attachments,
         });
-        if batches.len() >= max_batches {
-            break;
-        }
     }
     Ok(batches)
 }
@@ -1449,55 +1611,218 @@ fn verify_attachment_objects_in_store<S: MapObjectStore>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn verify_committed_append_replay<S: MapObjectStore>(
-    store: &S,
-    transition: &CommittedRootTransition,
+pub(crate) fn sha256_domain(domain: &[u8], payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update([0]);
+    hasher.update(payload);
+    hasher.finalize().into()
+}
+
+pub(crate) fn push_len_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+pub(crate) fn push_object_ref(buf: &mut Vec<u8>, reference: ObjectRef) {
+    buf.extend_from_slice(&(reference.object_type as u16).to_le_bytes());
+    buf.extend_from_slice(reference.object_id.as_bytes());
+    buf.extend_from_slice(&reference.encoded_len.to_le_bytes());
+}
+
+fn fingerprint_create_log(branch_id: BranchId, name: &str, log_id: LogId) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    buf.extend_from_slice(log_id.as_bytes());
+    sha256_domain(b"versionfs.native.create_log.v1", &buf)
+}
+
+fn fingerprint_append(
+    branch_id: BranchId,
     name: &str,
     stream_id: StreamId,
-    append_id: OperationId,
     match_seq_num: u64,
+    segment_ref: ObjectRef,
+) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    buf.extend_from_slice(stream_id.branch_id.as_bytes());
+    buf.extend_from_slice(&stream_id.stream_epoch.to_le_bytes());
+    buf.extend_from_slice(stream_id.log_id.as_bytes());
+    buf.extend_from_slice(&match_seq_num.to_le_bytes());
+    push_object_ref(&mut buf, segment_ref);
+    sha256_domain(b"versionfs.native.append.v1", &buf)
+}
+
+fn fingerprint_trim_log(
+    branch_id: BranchId,
+    name: &str,
+    stream_id: StreamId,
+    trim_to_seq: u64,
+) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    buf.extend_from_slice(stream_id.branch_id.as_bytes());
+    buf.extend_from_slice(&stream_id.stream_epoch.to_le_bytes());
+    buf.extend_from_slice(stream_id.log_id.as_bytes());
+    buf.extend_from_slice(&trim_to_seq.to_le_bytes());
+    sha256_domain(b"versionfs.native.trim_log.v1", &buf)
+}
+
+fn fingerprint_delete_log(branch_id: BranchId, name: &str, stream_id: StreamId) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    buf.extend_from_slice(stream_id.branch_id.as_bytes());
+    buf.extend_from_slice(&stream_id.stream_epoch.to_le_bytes());
+    buf.extend_from_slice(stream_id.log_id.as_bytes());
+    sha256_domain(b"versionfs.native.delete_log.v1", &buf)
+}
+
+fn encode_append_receipt_meta(
+    stream_id: StreamId,
+    start_seq: u64,
     end_seq: u64,
-    expected_segment_ref: ObjectRef,
-) -> Result<AppendReceipt, LogError> {
-    let committed = &transition.branch;
+    segment_ref: ObjectRef,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(16 + 8 + 16 + 8 + 8 + 2 + 32 + 8);
+    buf.extend_from_slice(stream_id.branch_id.as_bytes());
+    buf.extend_from_slice(&stream_id.stream_epoch.to_le_bytes());
+    buf.extend_from_slice(stream_id.log_id.as_bytes());
+    buf.extend_from_slice(&start_seq.to_le_bytes());
+    buf.extend_from_slice(&end_seq.to_le_bytes());
+    push_object_ref(&mut buf, segment_ref);
+    buf
+}
+
+fn decode_append_receipt_meta(
+    bytes: &[u8],
+) -> Result<(StreamId, u64, u64, ObjectRef), ControlError> {
+    const EXPECTED_LEN: usize = 16 + 8 + 16 + 8 + 8 + 2 + 32 + 8;
+    if bytes.len() != EXPECTED_LEN {
+        return Err(ControlError::CorruptRecord(
+            "invalid append receipt metadata length".into(),
+        ));
+    }
+    let branch_id = BranchId::from_bytes(bytes[0..16].try_into().unwrap());
+    let stream_epoch = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+    let log_id = LogId::from_bytes(bytes[24..40].try_into().unwrap());
+    let start_seq = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+    let end_seq = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+    let raw_type = u16::from_le_bytes(bytes[56..58].try_into().unwrap());
+    let object_type = ObjectType::try_from(raw_type)
+        .map_err(|_| ControlError::CorruptRecord("invalid append receipt object type".into()))?;
+    let object_id = ObjectId::from_bytes(bytes[58..90].try_into().unwrap());
+    let encoded_len = u64::from_le_bytes(bytes[90..98].try_into().unwrap());
+    let segment_ref = ObjectRef {
+        object_id,
+        object_type,
+        encoded_len,
+    };
+    Ok((
+        StreamId {
+            branch_id,
+            stream_epoch,
+            log_id,
+        },
+        start_seq,
+        end_seq,
+        segment_ref,
+    ))
+}
+
+fn verify_committed_create_log_replay(
+    transition: &CommittedRootTransition,
+    branch_id: BranchId,
+    log_id: LogId,
+    expected_fp: [u8; 32],
+) -> Result<(StreamId, BranchState), LogError> {
+    let Some(meta) = &transition.native_meta else {
+        return Err(LogError::Control(ControlError::OperationMismatch));
+    };
     if transition.kind != PreparationKind::LogMutation
-        || committed.branch_id != stream_id.branch_id
-        || committed.stream_epoch != stream_id.stream_epoch
+        || transition.branch.branch_id != branch_id
+        || meta.request_fingerprint != expected_fp
     {
         return Err(LogError::Control(ControlError::OperationMismatch));
     }
-    let prev_map = LogMap::open(store, transition.previous_roots.logs)?;
-    let Some(prev_entry) = prev_map.get(store, name)? else {
+    Ok((
+        StreamId {
+            branch_id: transition.branch.branch_id,
+            stream_epoch: transition.branch.stream_epoch,
+            log_id,
+        },
+        transition.branch.clone(),
+    ))
+}
+
+fn verify_committed_append_replay(
+    transition: &CommittedRootTransition,
+    stream_id: StreamId,
+    append_id: OperationId,
+    expected_fp: [u8; 32],
+) -> Result<AppendReceipt, LogError> {
+    let Some(meta) = &transition.native_meta else {
         return Err(LogError::Control(ControlError::OperationMismatch));
     };
-    if prev_entry.log_id != stream_id.log_id || prev_entry.end_seq != match_seq_num {
+    if transition.kind != PreparationKind::LogMutation
+        || transition.branch.branch_id != stream_id.branch_id
+        || transition.branch.stream_epoch != stream_id.stream_epoch
+        || meta.request_fingerprint != expected_fp
+    {
         return Err(LogError::Control(ControlError::OperationMismatch));
     }
-    let log_map = LogMap::open(store, committed.logs_root)?;
-    let Some(entry) = log_map.get(store, name)? else {
+    let (recorded_stream, start_seq, end_seq, _segment_ref) =
+        decode_append_receipt_meta(&meta.receipt_bytes)?;
+    if recorded_stream != stream_id {
+        return Err(LogError::Control(ControlError::OperationMismatch));
+    }
+    Ok(AppendReceipt {
+        stream_id: recorded_stream,
+        append_id,
+        start_seq,
+        end_seq,
+        branch_revision: transition.branch.revision,
+    })
+}
+
+fn verify_committed_trim_log_replay(
+    transition: &CommittedRootTransition,
+    name: &str,
+    stream_id: StreamId,
+    expected_fp: [u8; 32],
+) -> Result<(LogView, BranchState), LogError> {
+    let Some(meta) = &transition.native_meta else {
         return Err(LogError::Control(ControlError::OperationMismatch));
     };
-    if entry.log_id != stream_id.log_id || entry.end_seq != end_seq {
+    if transition.kind != PreparationKind::LogMutation
+        || transition.branch.branch_id != stream_id.branch_id
+        || transition.branch.stream_epoch != stream_id.stream_epoch
+        || meta.request_fingerprint != expected_fp
+    {
         return Err(LogError::Control(ControlError::OperationMismatch));
     }
-    let seg_index = LogSegmentIndex::from_root(entry.segment_index_root)?;
-    let matched = seg_index
-        .entries(store)?
-        .into_iter()
-        .find(|(first, _)| *first == match_seq_num);
-    match matched {
-        Some((_, seg_entry))
-            if seg_entry.end_seq == end_seq && seg_entry.segment == expected_segment_ref =>
-        {
-            Ok(AppendReceipt {
-                stream_id,
-                append_id,
-                start_seq: match_seq_num,
-                end_seq,
-                branch_revision: committed.revision,
-            })
-        }
-        _ => Err(LogError::Control(ControlError::OperationMismatch)),
+    let entry = LogMapEntry::decode(&meta.receipt_bytes)?;
+    Ok((LogView::from_entry(name, entry), transition.branch.clone()))
+}
+
+fn verify_committed_delete_log_replay(
+    transition: &CommittedRootTransition,
+    stream_id: StreamId,
+    expected_fp: [u8; 32],
+) -> Result<BranchState, LogError> {
+    let Some(meta) = &transition.native_meta else {
+        return Err(LogError::Control(ControlError::OperationMismatch));
+    };
+    if transition.kind != PreparationKind::LogMutation
+        || transition.branch.branch_id != stream_id.branch_id
+        || transition.branch.stream_epoch != stream_id.stream_epoch
+        || meta.request_fingerprint != expected_fp
+    {
+        return Err(LogError::Control(ControlError::OperationMismatch));
     }
+    Ok(transition.branch.clone())
 }

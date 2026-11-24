@@ -11,12 +11,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
-use versionfs_core::control::{BranchState, ControlError, LiveRoots, PreparationKind};
+use versionfs_core::control::{
+    BranchState, ControlError, LiveRoots, NativeRootTransitionMeta, PreparationKind,
+};
 use versionfs_core::format::{
     ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, FormatError,
     MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType,
 };
-use versionfs_core::identity::{ArtifactId, GenerationId, OperationId, ProtectionId};
+use versionfs_core::identity::{ArtifactId, BranchId, GenerationId, OperationId, ProtectionId};
 use versionfs_core::persistent_map::{DurableObjectStore, MapObjectStore};
 use versionfs_core::views::{
     ArtifactChunkIndex, ArtifactMap, ViewError, decode_artifact_blob, decode_artifact_chunk,
@@ -27,7 +29,9 @@ use crate::barrier::VolumeBarrierControl;
 use crate::capture::ProducerGate;
 use crate::logs::{
     DEFAULT_NATIVE_RENEWAL_INTERVAL, NativeAdmissionGate, NativeAdmissionGuard, NativeCommitError,
-    NativeControl, NativeWriteContext, StagingObjectStore, commit_native_root_mutation,
+    NativeControl, NativeWriteContext, ReadProtectionGuard, StagingObjectStore,
+    commit_native_root_mutation, ensure_store_scope, is_unknown_control_error, push_len_bytes,
+    push_object_ref, sha256_domain,
 };
 
 impl From<NativeCommitError> for ArtifactError {
@@ -191,6 +195,15 @@ pub fn read_artifact_payload<S: MapObjectStore>(
     store: &S,
     descriptor: &ArtifactDescriptor,
 ) -> Result<Vec<u8>, ArtifactError> {
+    read_artifact_payload_with_guard(store, descriptor, &mut || Ok(()))
+}
+
+fn read_artifact_payload_with_guard<S: MapObjectStore>(
+    store: &S,
+    descriptor: &ArtifactDescriptor,
+    ensure_protected: &mut dyn FnMut() -> Result<(), ControlError>,
+) -> Result<Vec<u8>, ArtifactError> {
+    ensure_protected()?;
     if descriptor.logical_len <= MAX_ARTIFACT_BLOB_BYTES as u64 {
         let bytes = store
             .get_ref(descriptor.content_root)
@@ -209,16 +222,41 @@ pub fn read_artifact_payload<S: MapObjectStore>(
 
     let chunk_index = ArtifactChunkIndex::from_root(descriptor.content_root)?;
     let entries = chunk_index.entries(store)?;
-    let mut output = Vec::with_capacity(usize::try_from(descriptor.logical_len).map_err(|_| {
-        ArtifactError::LengthMismatch {
-            declared: descriptor.logical_len,
-            actual: 0,
-        }
-    })?);
-    for (expected_idx, (chunk_num, entry)) in entries.into_iter().enumerate() {
-        if chunk_num != expected_idx as u64 {
+    // Validate consecutive chunk indices and total indexed length BEFORE
+    // reserving memory so a malformed descriptor (e.g. logical_len = 2^63)
+    // returns an error instead of panicking in `Vec::with_capacity`.
+    let mut indexed_total: u64 = 0;
+    for (expected_idx, (chunk_num, entry)) in entries.iter().enumerate() {
+        if *chunk_num != expected_idx as u64 {
             return Err(FormatError::InvalidNativeView("non-consecutive artifact chunks").into());
         }
+        indexed_total = indexed_total
+            .checked_add(u64::from(entry.actual_len))
+            .ok_or(ArtifactError::LengthMismatch {
+                declared: descriptor.logical_len,
+                actual: u64::MAX,
+            })?;
+    }
+    if indexed_total != descriptor.logical_len {
+        return Err(ArtifactError::LengthMismatch {
+            declared: descriptor.logical_len,
+            actual: indexed_total,
+        });
+    }
+    let expected_len =
+        usize::try_from(descriptor.logical_len).map_err(|_| ArtifactError::LengthMismatch {
+            declared: descriptor.logical_len,
+            actual: 0,
+        })?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_len)
+        .map_err(|_| ArtifactError::LengthMismatch {
+            declared: descriptor.logical_len,
+            actual: 0,
+        })?;
+    for (_, entry) in entries {
+        ensure_protected()?;
         let bytes = store
             .get_ref(entry.chunk)
             .map_err(ArtifactError::ObjectStore)?
@@ -231,9 +269,23 @@ pub fn read_artifact_payload<S: MapObjectStore>(
                 actual: payload.len() as u64,
             });
         }
+        let next_len =
+            output
+                .len()
+                .checked_add(payload.len())
+                .ok_or(ArtifactError::LengthMismatch {
+                    declared: descriptor.logical_len,
+                    actual: u64::MAX,
+                })?;
+        if next_len > expected_len {
+            return Err(ArtifactError::LengthMismatch {
+                declared: descriptor.logical_len,
+                actual: next_len as u64,
+            });
+        }
         output.extend_from_slice(&payload);
     }
-    if output.len() as u64 != descriptor.logical_len {
+    if output.len() != expected_len {
         return Err(ArtifactError::LengthMismatch {
             declared: descriptor.logical_len,
             actual: output.len() as u64,
@@ -355,11 +407,12 @@ impl ArtifactClient {
         if name.is_empty() {
             return Err(ArtifactError::InvalidName);
         }
-        verify_dependency_objects_in_store(store, &dependencies)?;
-        let _guard = self.enter_admission()?;
+        ensure_store_scope(store, control)?;
 
-        // Compute expected content_root before checking committed replay so
-        // same-length different-payload retries are rejected with OperationMismatch.
+        // Compute expected content_root and logical request fingerprint before
+        // checking committed replay or requiring mutation admission so exact
+        // retries succeed even after admission closes or GC runs, while
+        // changed-name or changed-payload retries return `OperationMismatch`.
         let expected_prepared = {
             let mut probe = StagingObjectStore::new(store);
             stage_artifact_payload(&mut probe, payload)?
@@ -370,23 +423,23 @@ impl ArtifactClient {
             content_root: expected_prepared.content_root,
             dependencies: dependencies.clone(),
         };
+        let req_fp = fingerprint_put_artifact(ctx.branch_id, name, &expected_descriptor)?;
 
         if let Some(transition) = control.get_committed_root_transition(operation_id)? {
+            let Some(meta) = &transition.native_meta else {
+                return Err(ArtifactError::Control(ControlError::OperationMismatch));
+            };
             if transition.kind != PreparationKind::ArtifactMutation
                 || transition.branch.branch_id != ctx.branch_id
+                || meta.request_fingerprint != req_fp
             {
-                return Err(ArtifactError::Control(ControlError::OperationMismatch));
-            }
-            let mut replay_probe = StagingObjectStore::new(store);
-            let prev_map = ArtifactMap::open(&replay_probe, transition.previous_roots.artifacts)?;
-            let expected_next_root = prev_map
-                .insert(&mut replay_probe, name, &expected_descriptor)?
-                .seal(&mut replay_probe)?;
-            if expected_next_root != transition.branch.artifacts_root {
                 return Err(ArtifactError::Control(ControlError::OperationMismatch));
             }
             return Ok((expected_descriptor, transition.branch));
         }
+
+        verify_dependency_objects_in_store(store, &dependencies)?;
+        let _guard = self.enter_admission()?;
 
         let branch = control.get_branch(ctx.branch_id)?;
         let (descriptor, next_artifacts_root, staged, mut prep_deps) = {
@@ -425,6 +478,11 @@ impl ArtifactClient {
             next_roots,
             prep_deps,
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: Vec::new(),
+                claim_log_id: None,
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -451,33 +509,41 @@ impl ArtifactClient {
         if name.is_empty() {
             return Err(ArtifactError::InvalidName);
         }
-        let _guard = self.enter_admission()?;
+        ensure_store_scope(store, control)?;
+        let req_fp = fingerprint_delete_artifact(ctx.branch_id, name);
 
         if let Some(transition) = control.get_committed_root_transition(operation_id)? {
+            let Some(meta) = &transition.native_meta else {
+                return Err(ArtifactError::Control(ControlError::OperationMismatch));
+            };
             if transition.kind != PreparationKind::ArtifactMutation
                 || transition.branch.branch_id != ctx.branch_id
+                || meta.request_fingerprint != req_fp
             {
-                return Err(ArtifactError::Control(ControlError::OperationMismatch));
-            }
-            let mut replay_probe = StagingObjectStore::new(store);
-            let prev_map = ArtifactMap::open(&replay_probe, transition.previous_roots.artifacts)?;
-            if prev_map.get(&replay_probe, name)?.is_none() {
-                return Err(ArtifactError::Control(ControlError::OperationMismatch));
-            }
-            let expected_next_root = prev_map
-                .remove(&mut replay_probe, name)?
-                .seal(&mut replay_probe)?;
-            if expected_next_root != transition.branch.artifacts_root {
                 return Err(ArtifactError::Control(ControlError::OperationMismatch));
             }
             return Ok(transition.branch);
         }
+
+        let _guard = self.enter_admission()?;
 
         let branch = control.get_branch(ctx.branch_id)?;
         let (next_artifacts_root, staged) = {
             let mut staging = StagingObjectStore::new(store);
             let map = ArtifactMap::open(&staging, branch.artifacts_root)?;
             if map.get(&staging, name)?.is_none() {
+                if let Some(transition) = control.get_committed_root_transition(operation_id)? {
+                    let Some(meta) = &transition.native_meta else {
+                        return Err(ArtifactError::Control(ControlError::OperationMismatch));
+                    };
+                    if transition.kind == PreparationKind::ArtifactMutation
+                        && transition.branch.branch_id == ctx.branch_id
+                        && meta.request_fingerprint == req_fp
+                    {
+                        return Ok(transition.branch);
+                    }
+                    return Err(ArtifactError::Control(ControlError::OperationMismatch));
+                }
                 return Err(ArtifactError::NotFound(name.to_owned()));
             }
             let next_map = map.remove(&mut staging, name)?;
@@ -501,6 +567,11 @@ impl ArtifactClient {
             next_roots,
             vec![next_artifacts_root],
             staged,
+            Some(NativeRootTransitionMeta {
+                request_fingerprint: req_fp,
+                receipt_bytes: Vec::new(),
+                claim_log_id: None,
+            }),
             self.renewal_interval,
             next_renewal_id,
         )?;
@@ -510,7 +581,7 @@ impl ArtifactClient {
     /// Reads a named artifact from a historical Generation under a bounded
     /// Generation read protection, without mounting the block volume.
     #[allow(clippy::too_many_arguments)]
-    pub fn read_historical_artifact<S, C>(
+    pub fn read_historical_artifact<S, C, F>(
         &self,
         store: &S,
         control: &C,
@@ -519,22 +590,105 @@ impl ArtifactClient {
         open_op_id: OperationId,
         protection_id: ProtectionId,
         close_op_id: OperationId,
+        next_renewal_id: F,
     ) -> Result<(ArtifactDescriptor, Vec<u8>), ArtifactError>
     where
         S: MapObjectStore,
         C: NativeControl,
+        F: FnMut() -> OperationId,
     {
         if name.is_empty() {
             return Err(ArtifactError::InvalidName);
         }
-        control.open_generation(open_op_id, generation_id, protection_id)?;
+        ensure_store_scope(store, control)?;
+        let deadline = control.open_generation(open_op_id, generation_id, protection_id)?;
+        let mut guard = ReadProtectionGuard::new(control, protection_id, deadline, next_renewal_id);
         let read_result = (|| {
+            guard.ensure_live()?;
             let seed = control.get_generation(generation_id)?;
-            read_artifact_from_root(store, seed.roots.artifacts, name)
+            read_artifact_from_root_with_guard(store, seed.roots.artifacts, name, &mut || {
+                guard.ensure_live()
+            })
         })();
         let _ = control.close_protection(close_op_id, protection_id);
         read_result
     }
+}
+
+fn read_artifact_from_root_with_guard<S: MapObjectStore>(
+    store: &S,
+    artifacts_root: ObjectRef,
+    name: &str,
+    ensure_protected: &mut dyn FnMut() -> Result<(), ControlError>,
+) -> Result<(ArtifactDescriptor, Vec<u8>), ArtifactError> {
+    ensure_protected()?;
+    let map = ArtifactMap::open(store, artifacts_root)?;
+    let Some(descriptor) = map.get(store, name)? else {
+        return Err(ArtifactError::NotFound(name.to_owned()));
+    };
+    let payload = read_artifact_payload_with_guard(store, &descriptor, ensure_protected)?;
+    Ok((descriptor, payload))
+}
+
+fn fingerprint_put_artifact(
+    branch_id: BranchId,
+    name: &str,
+    descriptor: &ArtifactDescriptor,
+) -> Result<[u8; 32], FormatError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    push_len_bytes(&mut buf, &descriptor.encode()?);
+    Ok(sha256_domain(b"versionfs.native.put_artifact.v1", &buf))
+}
+
+fn fingerprint_delete_artifact(branch_id: BranchId, name: &str) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    push_len_bytes(&mut buf, name.as_bytes());
+    sha256_domain(b"versionfs.native.delete_artifact.v1", &buf)
+}
+
+fn fingerprint_staged_flush(
+    branch_id: BranchId,
+    staged: &BTreeMap<String, StagedArtifactChange>,
+) -> Result<[u8; 32], FormatError> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(branch_id.as_bytes());
+    buf.extend_from_slice(&(staged.len() as u64).to_le_bytes());
+    for (name, change) in staged {
+        push_len_bytes(&mut buf, name.as_bytes());
+        match change {
+            StagedArtifactChange::Put {
+                artifact_id,
+                payload,
+                dependencies,
+            } => {
+                buf.push(1);
+                buf.extend_from_slice(artifact_id.as_bytes());
+                push_len_bytes(&mut buf, payload);
+                buf.extend_from_slice(&(dependencies.len() as u64).to_le_bytes());
+                for dep in dependencies {
+                    push_object_ref(&mut buf, *dep);
+                }
+            }
+            StagedArtifactChange::Remove => {
+                buf.push(0);
+            }
+        }
+    }
+    Ok(sha256_domain(b"versionfs.native.staged_flush.v1", &buf))
+}
+
+struct PendingStagedFlush {
+    operation_id: OperationId,
+    protection_id: ProtectionId,
+    expected_revision: u64,
+    next_roots: LiveRoots,
+    prep_deps: Vec<ObjectRef>,
+    staged_objects: Vec<(ObjectRef, Vec<u8>)>,
+    native_meta: NativeRootTransitionMeta,
+    changes: BTreeMap<String, StagedArtifactChange>,
 }
 
 /// One locally staged named-artifact mutation waiting to be flushed into the
@@ -573,6 +727,7 @@ pub struct NativeProducerGate<S, C, ID> {
     control: C,
     ctx: NativeWriteContext,
     staged: BTreeMap<String, StagedArtifactChange>,
+    pending_flush: Option<PendingStagedFlush>,
     renewal_interval: Duration,
     next_ids: ID,
 }
@@ -598,6 +753,7 @@ where
             control,
             ctx,
             staged: BTreeMap::new(),
+            pending_flush: None,
             renewal_interval: DEFAULT_NATIVE_RENEWAL_INTERVAL,
             next_ids,
         }
@@ -620,6 +776,16 @@ where
         let name = name.into();
         if name.is_empty() {
             return Err(ArtifactError::InvalidName);
+        }
+        // Reject invalid dependency object types before mutating the overlay
+        // so an invalid call never clobbers a previously staged valid change.
+        for dependency in &dependencies {
+            if !matches!(
+                dependency.object_type,
+                ObjectType::ArtifactBlob | ObjectType::ArtifactChunk
+            ) {
+                return Err(FormatError::ObjectReferenceMismatch.into());
+            }
         }
         let _guard = self
             .admission
@@ -650,16 +816,101 @@ where
         Ok(())
     }
 
-    /// Returns the number of locally staged named-artifact changes awaiting flush.
+    /// Returns the number of locally staged named-artifact changes awaiting flush
+    /// (including any in-flight flush awaiting reconciliation after an unknown outcome).
     pub fn staged_len(&self) -> usize {
         self.staged.len()
+            + self
+                .pending_flush
+                .as_ref()
+                .map_or(0, |pending| pending.changes.len())
+    }
+
+    fn restore_changes_under_staged(&mut self, changes: BTreeMap<String, StagedArtifactChange>) {
+        for (name, change) in changes {
+            self.staged.entry(name).or_insert(change);
+        }
     }
 
     /// Flushes all locally staged named-artifact changes into the branch's live
     /// `artifacts_root` in one atomic `PreparationKind::ArtifactMutation` commit.
+    ///
+    /// If a previous flush returned an unknown authority outcome, this method
+    /// reconciles that exact original `operation_id` first before retiring its
+    /// staged changes or allocating a fresh operation ID for newer edits.
     pub fn flush_staged_artifacts(&mut self) -> Result<Option<BranchState>, ArtifactError> {
+        ensure_store_scope(&self.store, &self.control)?;
+
+        let mut last_committed: Option<BranchState> = None;
+
+        // 1. Reconcile any prior flush whose authority outcome was unknown.
+        if let Some(pending) = self.pending_flush.take() {
+            match self
+                .control
+                .get_committed_root_transition(pending.operation_id)
+            {
+                Ok(Some(transition)) => {
+                    let matches = transition.kind == PreparationKind::ArtifactMutation
+                        && transition.branch.branch_id == self.ctx.branch_id
+                        && transition.native_meta.as_ref().is_some_and(|m| {
+                            m.request_fingerprint == pending.native_meta.request_fingerprint
+                        });
+                    if !matches {
+                        self.pending_flush = Some(pending);
+                        return Err(ArtifactError::Control(ControlError::OperationMismatch));
+                    }
+                    last_committed = Some(transition.branch);
+                }
+                Err(ControlError::Aborted) => {
+                    self.restore_changes_under_staged(pending.changes);
+                }
+                Ok(None) => {
+                    // Either still `Preparing` or never admitted (`NotFound`):
+                    // finish or retry using the exact original operation ID,
+                    // protection ID, and staged request.
+                    let retry_result = commit_native_root_mutation(
+                        &mut self.store,
+                        &self.control,
+                        self.ctx,
+                        pending.operation_id,
+                        pending.protection_id,
+                        pending.expected_revision,
+                        PreparationKind::ArtifactMutation,
+                        pending.next_roots,
+                        pending.prep_deps.clone(),
+                        pending.staged_objects.clone(),
+                        Some(pending.native_meta.clone()),
+                        self.renewal_interval,
+                        || (self.next_ids)().0,
+                    );
+                    match retry_result {
+                        Ok(committed) => {
+                            last_committed = Some(committed);
+                        }
+                        Err(NativeCommitError::Control(err)) if is_unknown_control_error(&err) => {
+                            self.pending_flush = Some(pending);
+                            return Err(ArtifactError::Control(err));
+                        }
+                        Err(err) => {
+                            // Definite failure: `commit_native_root_mutation`
+                            // has aborted any active preparation; restore
+                            // un-overridden changes so a subsequent retry can
+                            // re-stage against the latest branch revision.
+                            self.restore_changes_under_staged(pending.changes);
+                            return Err(err.into());
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.pending_flush = Some(pending);
+                    return Err(ArtifactError::Control(err));
+                }
+            }
+        }
+
+        // 2. Flush any remaining locally staged changes.
         if self.staged.is_empty() {
-            return Ok(None);
+            return Ok(last_committed);
         }
         for change in self.staged.values() {
             if let StagedArtifactChange::Put { dependencies, .. } = change {
@@ -702,13 +953,30 @@ where
         };
         prep_deps.dedup();
 
+        let req_fp = fingerprint_staged_flush(self.ctx.branch_id, &self.staged)?;
+        let native_meta = NativeRootTransitionMeta {
+            request_fingerprint: req_fp,
+            receipt_bytes: Vec::new(),
+            claim_log_id: None,
+        };
         let (operation_id, protection_id) = (self.next_ids)();
         let next_roots = LiveRoots {
             volume: branch.volume_root,
             logs: branch.logs_root,
             artifacts: next_artifacts_root,
         };
-        let committed = commit_native_root_mutation(
+        let changes = std::mem::take(&mut self.staged);
+        let pending = PendingStagedFlush {
+            operation_id,
+            protection_id,
+            expected_revision: branch.revision,
+            next_roots,
+            prep_deps: prep_deps.clone(),
+            staged_objects: staged_objects.clone(),
+            native_meta: native_meta.clone(),
+            changes,
+        };
+        match commit_native_root_mutation(
             &mut self.store,
             &self.control,
             self.ctx,
@@ -719,11 +987,20 @@ where
             next_roots,
             prep_deps,
             staged_objects,
+            Some(native_meta),
             self.renewal_interval,
             || (self.next_ids)().0,
-        )?;
-        self.staged.clear();
-        Ok(Some(committed))
+        ) {
+            Ok(committed) => Ok(Some(committed)),
+            Err(NativeCommitError::Control(err)) if is_unknown_control_error(&err) => {
+                self.pending_flush = Some(pending);
+                Err(ArtifactError::Control(err))
+            }
+            Err(err) => {
+                self.restore_changes_under_staged(pending.changes);
+                Err(err.into())
+            }
+        }
     }
 }
 

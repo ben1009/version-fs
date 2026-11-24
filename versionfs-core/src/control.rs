@@ -246,6 +246,24 @@ pub struct LiveRoots {
     pub artifacts: ObjectRef,
 }
 
+/// Maximum size of the small canonical receipt payload stored in
+/// [`NativeRootTransitionMeta::receipt_bytes`].
+pub const MAX_NATIVE_RECEIPT_BYTES: usize = 64 * 1024;
+
+/// Optional native-view metadata recorded atomically with a `commit_live_roots`
+/// transition so exact replays verify the logical request and return receipts
+/// without reading superseded object-store maps that GC may later collect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeRootTransitionMeta {
+    /// BLAKE3 fingerprint of the logical native request (operation kind, target, and arguments).
+    pub request_fingerprint: [u8; 32],
+    /// Small opaque canonical receipt payload (for example `AppendReceipt` or
+    /// `ArtifactDescriptor`).
+    pub receipt_bytes: Vec<u8>,
+    /// Optional `LogId` atomically claimed for `(branch_id, branch.stream_epoch)` on log creation.
+    pub claim_log_id: Option<crate::identity::LogId>,
+}
+
 /// Recorded preparation kind and pre/post roots for a committed `commit_live_roots`
 /// operation, used by native log and artifact clients for exact idempotent replay.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,6 +274,8 @@ pub struct CommittedRootTransition {
     pub previous_roots: LiveRoots,
     /// Authoritative branch state committed by this operation.
     pub branch: BranchState,
+    /// Optional logical native request fingerprint and receipt metadata.
+    pub native_meta: Option<NativeRootTransitionMeta>,
 }
 
 /// The Generation catalog fields recorded by the authority.
@@ -2275,7 +2295,36 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         roots: LiveRoots,
         capture_child: Option<(OperationId, OperationId)>,
     ) -> Result<BranchState, ControlError> {
+        self.commit_live_roots_with_meta(
+            operation_id,
+            expected_revision,
+            grant,
+            roots,
+            capture_child,
+            None,
+        )
+    }
+
+    /// Advances live roots under exact revision/grant CAS, optionally recording
+    /// atomic native-view request metadata (request fingerprint, small receipt
+    /// payload, and/or claimed `(branch_id, stream_epoch, log_id)`).
+    pub fn commit_live_roots_with_meta(
+        &self,
+        operation_id: OperationId,
+        expected_revision: u64,
+        grant: WriterGrant,
+        roots: LiveRoots,
+        capture_child: Option<(OperationId, OperationId)>,
+        native_meta: Option<NativeRootTransitionMeta>,
+    ) -> Result<BranchState, ControlError> {
         validate_live_roots(roots)?;
+        if let Some(meta) = &native_meta
+            && meta.receipt_bytes.len() > MAX_NATIVE_RECEIPT_BYTES
+        {
+            return Err(ControlError::InvalidRequest(
+                "native receipt metadata exceeds limit",
+            ));
+        }
         let mut payload = CanonicalEncoder::new();
         payload.u64_le(expected_revision);
         encode_writer_grant(&mut payload, grant);
@@ -2287,6 +2336,20 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 payload.fixed(child_id.as_bytes());
             }
             None => payload.u8(0),
+        }
+        if let Some(meta) = &native_meta {
+            payload.u8(1);
+            payload.fixed(&meta.request_fingerprint);
+            payload
+                .bytes(&meta.receipt_bytes)
+                .map_err(|_| ControlError::InvalidRequest("native receipt metadata too large"))?;
+            match meta.claim_log_id {
+                Some(log_id) => {
+                    payload.u8(1);
+                    payload.fixed(log_id.as_bytes());
+                }
+                None => payload.u8(0),
+            }
         }
         let request = payload.finish();
         let fp = fingerprint(OP_COMMIT_LIVE_ROOTS, &request);
@@ -2428,6 +2491,18 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 logs: branch.logs_root,
                 artifacts: branch.artifacts_root,
             };
+            if let Some(log_id) = native_meta.as_ref().and_then(|meta| meta.claim_log_id) {
+                let claim_key = log_id_claim_key(
+                    self.workspace_id,
+                    branch.branch_id,
+                    branch.stream_epoch,
+                    log_id,
+                );
+                if txn.get(&claim_key)?.is_some() {
+                    return Err(MetadataError::Conflict);
+                }
+                txn.put(&claim_key, operation_id.as_bytes())?;
+            }
             branch.volume_root = roots.volume;
             branch.logs_root = roots.logs;
             branch.artifacts_root = roots.artifacts;
@@ -2447,7 +2522,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let rt_key = root_transition_key(self.workspace_id, self.principal_id, operation_id);
             txn.put(
                 &rt_key,
-                &encode_root_transition(prepared_kind, previous_roots),
+                &encode_root_transition(prepared_kind, previous_roots, native_meta.as_ref())
+                    .map_err(to_metadata_error)?,
             )?;
             let encoded = encode_operation(&operation).map_err(to_metadata_error)?;
             txn.put(&key, &encoded)?;
@@ -2815,6 +2891,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         )
     }
 
+    /// Returns the authority's current monotonic clock reading.
+    pub fn now(&self) -> MonotonicTime {
+        self.authority.now()
+    }
+
     /// Reads or reconciles an operation outcome after an uncertain response.
     pub fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         let key = self.operation_key(operation_id);
@@ -2843,12 +2924,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 else {
                     return Err(ControlError::OperationMismatch);
                 };
-                let (kind, previous_roots) = decode_root_transition(&rt_bytes)?;
+                let (kind, previous_roots, native_meta) = decode_root_transition(&rt_bytes)?;
                 let branch = decode_branch(&branch_bytes)?;
                 Ok(Some(CommittedRootTransition {
                     kind,
                     previous_roots,
                     branch,
+                    native_meta,
                 }))
             }
             Ok(OperationState::Aborted) => Err(ControlError::Aborted),
@@ -5402,6 +5484,23 @@ fn scoped_operation_key(
     .concat()
 }
 
+fn log_id_claim_key(
+    workspace: WorkspaceId,
+    branch: BranchId,
+    stream_epoch: u64,
+    log_id: crate::identity::LogId,
+) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"log-id-claim/",
+        workspace.as_bytes(),
+        branch.as_bytes(),
+        &stream_epoch.to_be_bytes(),
+        log_id.as_bytes(),
+    ]
+    .concat()
+}
+
 fn root_transition_key(
     workspace: WorkspaceId,
     principal: PrincipalId,
@@ -5417,17 +5516,67 @@ fn root_transition_key(
     .concat()
 }
 
-fn encode_root_transition(kind: PreparationKind, previous_roots: LiveRoots) -> Vec<u8> {
+fn encode_root_transition(
+    kind: PreparationKind,
+    previous_roots: LiveRoots,
+    native_meta: Option<&NativeRootTransitionMeta>,
+) -> Result<Vec<u8>, ControlError> {
     let mut e = CanonicalEncoder::new();
     e.u8(kind as u8);
     encode_live_roots(&mut e, previous_roots);
-    e.finish()
+    match native_meta {
+        Some(meta) => {
+            e.u8(1);
+            e.fixed(&meta.request_fingerprint);
+            e.bytes(&meta.receipt_bytes)
+                .map_err(|_| ControlError::InvalidRequest("native receipt metadata too large"))?;
+            match meta.claim_log_id {
+                Some(log_id) => {
+                    e.u8(1);
+                    e.fixed(log_id.as_bytes());
+                }
+                None => e.u8(0),
+            }
+        }
+        None => e.u8(0),
+    }
+    Ok(e.finish())
 }
 
-fn decode_root_transition(bytes: &[u8]) -> Result<(PreparationKind, LiveRoots), ControlError> {
+fn decode_root_transition(
+    bytes: &[u8],
+) -> Result<(PreparationKind, LiveRoots, Option<NativeRootTransitionMeta>), ControlError> {
     let mut d = CanonicalDecoder::new(bytes);
     let kind = decode_preparation_kind(d.u8().map_err(corrupt)?)?;
     let previous_roots = decode_live_roots(&mut d).map_err(corrupt)?;
+    let native_meta = match d.u8().map_err(corrupt)? {
+        0 => None,
+        1 => {
+            let request_fingerprint = d.fixed::<32>().map_err(corrupt)?;
+            let receipt_bytes = d.bytes(MAX_NATIVE_RECEIPT_BYTES).map_err(corrupt)?.to_vec();
+            let claim_log_id = match d.u8().map_err(corrupt)? {
+                0 => None,
+                1 => Some(crate::identity::LogId::from_bytes(
+                    d.fixed::<16>().map_err(corrupt)?,
+                )),
+                _ => {
+                    return Err(ControlError::CorruptRecord(
+                        "invalid claim_log_id tag".into(),
+                    ));
+                }
+            };
+            Some(NativeRootTransitionMeta {
+                request_fingerprint,
+                receipt_bytes,
+                claim_log_id,
+            })
+        }
+        _ => {
+            return Err(ControlError::CorruptRecord(
+                "invalid native_meta tag".into(),
+            ));
+        }
+    };
     d.finish().map_err(corrupt)?;
-    Ok((kind, previous_roots))
+    Ok((kind, previous_roots, native_meta))
 }
