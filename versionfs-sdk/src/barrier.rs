@@ -909,24 +909,13 @@ pub trait VolumeBarrierControl: Send + Sync {
 
     /// Verifies that the branch's writer grant and writable attachment remain
     /// live on the current authoritative owner incarnation and monotonic clock.
-    ///
-    /// Default implementation validates stored branch identities via `get_branch`.
     fn check_attachment_live(
         &self,
         branch_id: BranchId,
         attachment_id: AttachmentId,
         volume_epoch: u64,
         grant: WriterGrant,
-    ) -> Result<WriterGrant, ControlError> {
-        let branch = self.get_branch(branch_id)?;
-        validate_attachment(&branch, branch_id, attachment_id, volume_epoch, grant).map_err(
-            |error| match error {
-                BarrierError::Fenced => ControlError::Fenced,
-                BarrierError::Control(control) => control,
-                _ => ControlError::InvalidTransition,
-            },
-        )
-    }
+    ) -> Result<WriterGrant, ControlError>;
 }
 
 impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
@@ -1540,7 +1529,6 @@ where
                 capture_authorization_id,
             );
             self.pending = Some(barrier);
-            self.pending_replaces = None;
             self.pending_journaled = false;
             self.last_renewal = None;
         }
@@ -1705,9 +1693,11 @@ where
                 Err(error) => Err(error),
             },
             Ok(OperationState::Aborted) => {
-                // Verify attachment liveness before unlinking the local salvage
-                // journal: a forced handover can abort a preparing child in the
-                // same transaction that revokes this attachment.
+                // Verify attachment liveness before clearing local pending state.
+                // When dirty extents remain, keep the on-disk salvage journal in
+                // place until the next barrier atomically replaces it via
+                // `replace_pending`, so a handover racing after this probe can
+                // never leave local dirty bytes without a salvage record on disk.
                 match self.control.check_attachment_live(
                     self.branch_id,
                     self.attachment_id,
@@ -1723,10 +1713,14 @@ where
                     }
                     Err(error) => return Err(error.into()),
                 }
-                self.finish_pending_journal(operation_id)?;
+                if self.inner.dirty_extent_count() == 0 {
+                    self.finish_pending_journal(operation_id)?;
+                    self.pending_replaces = None;
+                } else {
+                    self.pending_replaces = Some(operation_id);
+                }
                 self.pending = None;
                 self.pending_map = None;
-                self.pending_replaces = None;
                 self.pending_journaled = false;
                 self.last_renewal = None;
                 Ok(())
@@ -2320,34 +2314,19 @@ where
     }
 
     fn classify_fenced_error(&self, used_grant: WriterGrant) -> BarrierError {
+        // `check_attachment_live` validates current authoritative owner
+        // incarnation, writer/attachment identity, and monotonic lease
+        // deadlines. If it returns `Ok`, the attachment is still live (the
+        // prior `ControlError::Fenced` was a concurrent heartbeat refresh or a
+        // foreign-principal capture-scope rejection, even if that foreign
+        // capture has since ended) and must not be permanently fenced.
         match self.control.check_attachment_live(
             self.branch_id,
             self.attachment_id,
             self.volume_epoch,
             used_grant,
         ) {
-            Ok(refreshed) => {
-                if same_grant_identity(used_grant, refreshed)
-                    && refreshed.expires_at > used_grant.expires_at
-                {
-                    return BarrierError::Control(ControlError::Fenced);
-                }
-                // A live attachment can still receive `ControlError::Fenced`
-                // from capture-scope authorization when another principal holds
-                // an active capture on the same branch; reject the flush
-                // without permanently fencing this attachment.
-                match self.control.get_branch(self.branch_id) {
-                    Ok(branch)
-                        if branch.capture.as_ref().is_some_and(|capture| {
-                            capture.principal_id != self.control.principal_id()
-                        }) =>
-                    {
-                        BarrierError::Control(ControlError::Fenced)
-                    }
-                    Ok(_) | Err(ControlError::NotFound) => BarrierError::Fenced,
-                    Err(error) => BarrierError::Control(error),
-                }
-            }
+            Ok(_) => BarrierError::Control(ControlError::Fenced),
             Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound) => {
                 BarrierError::Fenced
             }
@@ -2863,6 +2842,23 @@ mod tests {
                 return Err(ControlError::NotFound);
             }
             Ok(state.branch.clone())
+        }
+
+        fn check_attachment_live(
+            &self,
+            branch_id: BranchId,
+            attachment_id: AttachmentId,
+            volume_epoch: u64,
+            grant: WriterGrant,
+        ) -> Result<WriterGrant, ControlError> {
+            let branch = self.get_branch(branch_id)?;
+            validate_attachment(&branch, branch_id, attachment_id, volume_epoch, grant).map_err(
+                |error| match error {
+                    BarrierError::Fenced => ControlError::Fenced,
+                    BarrierError::Control(control) => control,
+                    _ => ControlError::InvalidTransition,
+                },
+            )
         }
 
         fn begin_preparation(

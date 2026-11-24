@@ -1181,6 +1181,114 @@ fn force_acquire_writer_aborts_ordinary_pending_preparations_so_replacement_can_
         .expect("replacement writer under different principal must be able to attach");
 }
 
+#[test]
+fn check_attachment_live_does_not_return_expired_when_heartbeat_renews_before_branch_read() {
+    struct RenewOnFirstBranchRead {
+        inner: Arc<MemoryAuthority>,
+        on_branch_read: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl MetadataAuthority for RenewOnFirstBranchRead {
+        type Snapshot = MemorySnapshot;
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+            // Fire the concurrent renewal hook when `check_attachment_live`
+            // reads the branch key (after `now()` was sampled).
+            if key.windows(7).any(|w| w == b"branch/")
+                && let Some(hook) = self.on_branch_read.lock().unwrap().take()
+            {
+                hook();
+            }
+            self.inner.get(key)
+        }
+
+        fn now(&self) -> MonotonicTime {
+            self.inner.now()
+        }
+
+        fn transact<R, F>(
+            &self,
+            operation: MutationIdentity<'_>,
+            body: F,
+        ) -> Result<R, MetadataError>
+        where
+            F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+        {
+            self.inner.transact(operation, body)
+        }
+
+        fn reconcile_unknown(
+            &self,
+            operation: MutationIdentity<'_>,
+        ) -> Result<ReconciledOutcome, MetadataError> {
+            self.inner.reconcile_unknown(operation)
+        }
+
+        fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+            self.inner.snapshot()
+        }
+
+        fn scan_prefix(
+            &self,
+            snapshot: &Self::Snapshot,
+            prefix: &[u8],
+            cursor: Option<&MetadataCursor>,
+            limit: NonZeroUsize,
+        ) -> Result<MetadataPage, MetadataError> {
+            self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+        }
+    }
+
+    let inner = Arc::new(MemoryAuthority::default());
+    let owner = start_authority_owner(inner.as_ref(), op(250)).expect("owner");
+    let direct = WorkspaceControl::new(
+        inner.clone(),
+        workspace(1),
+        ObjectStoreScopeId::from_bytes([0xA5; 16]),
+        principal(1),
+        owner,
+    );
+    direct
+        .create_workspace(op(1), branch(1), "main", 60_000, verified_seed(1))
+        .expect("create workspace");
+    let writer = direct
+        .acquire_writer(op(2), branch(1), 1, 0)
+        .expect("acquire writer");
+    direct
+        .attach_volume(op(3), branch(1), 1, writer, attachment(1), protection(1))
+        .expect("attach volume");
+
+    // Advance just before the initial 30s writer deadline so `now()` is sampled
+    // at 29s, then simulate a concurrent heartbeat renewing the grant before
+    // `get_branch` reads it and advancing the clock past the old 30s deadline.
+    inner.now_nanos.store(29_000_000_000, Ordering::SeqCst);
+    let inner_for_hook = inner.clone();
+    let wrapped = Arc::new(RenewOnFirstBranchRead {
+        inner: inner.clone(),
+        on_branch_read: std::sync::Mutex::new(Some(Box::new(move || {
+            let renewed = direct
+                .renew_writer(op(4), writer)
+                .expect("concurrent heartbeat renews grant");
+            assert!(renewed.expires_at > writer.expires_at);
+            // Clock crosses the OLD 30s deadline before `check_attachment_live` finishes.
+            inner_for_hook
+                .now_nanos
+                .store(35_000_000_000, Ordering::SeqCst);
+        }))),
+    });
+    let checking = WorkspaceControl::new(
+        wrapped,
+        workspace(1),
+        ObjectStoreScopeId::from_bytes([0xA5; 16]),
+        principal(1),
+        owner,
+    );
+    let live = checking
+        .check_attachment_live(branch(1), attachment(1), 1, writer)
+        .expect("concurrent heartbeat before branch read must not produce false Expired");
+    assert!(live.expires_at > writer.expires_at);
+}
+
 fn candidate_roots(branch: &versionfs_core::control::BranchState) -> LiveRoots {
     LiveRoots {
         volume: branch.volume_root,

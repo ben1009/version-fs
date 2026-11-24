@@ -736,6 +736,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         volume_epoch: u64,
         grant: WriterGrant,
     ) -> Result<WriterGrant, ControlError> {
+        // Sample the monotonic clock BEFORE reading the branch so a concurrent
+        // same-identity heartbeat renewing the grant cannot cause a false
+        // `ControlError::Expired` against an older grant snapshot.
+        let now = self.authority.now();
         let owner_bytes =
             read_authoritative_point(self.authority.as_ref(), &owner_incarnation_key())?
                 .ok_or(ControlError::Fenced)?;
@@ -753,7 +757,6 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         {
             return Err(ControlError::Fenced);
         }
-        let now = self.authority.now();
         if current_grant.expires_at <= now || attachment.protection_expires_at <= now {
             return Err(ControlError::Expired);
         }

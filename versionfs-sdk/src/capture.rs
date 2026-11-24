@@ -449,6 +449,11 @@ pub trait ProducerGate {
     fn drain_producers(&mut self) -> Result<(), String>;
 
     /// Reopens producer admission after publication, definite abort, or restart.
+    ///
+    /// Implementations must be idempotent when admission is already open so
+    /// crash or detached watchdog recovery can safely repeat cleanup after a
+    /// partial local failure (for example, if clearing the capture journal fails
+    /// after admission was already reopened).
     fn reopen_admission(&mut self) -> Result<(), String>;
 }
 
@@ -1915,15 +1920,18 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
             };
 
         for refresh_attempt in 0..=MAX_GRANT_REFRESH_RETRIES {
-            self.last_renewal_attempt = Some(Instant::now());
+            let attempt_started = Instant::now();
+            self.last_renewal_attempt = Some(attempt_started);
             match control.renew_preparation(renewal_id, pending.capture_id, renewal_grant) {
                 Ok(_) => {
                     pending.renewal_operation_id = None;
                     pending.renewal_grant = None;
                     self.persist(pending)?;
-                    let now = Instant::now();
-                    self.last_renewal = Some(now);
-                    self.last_renewal_attempt = Some(now);
+                    // Measure the next renewal interval conservatively from
+                    // before the RPC so slow replies or journal writes do not
+                    // delay the next heartbeat past the authority lease.
+                    self.last_renewal = Some(attempt_started);
+                    self.last_renewal_attempt = Some(attempt_started);
                     return Ok(());
                 }
                 Err(error @ (ControlError::Expired | ControlError::Fenced)) => {
@@ -2536,10 +2544,12 @@ fn create_dir_all_durable(directory: &Path) -> Result<(), String> {
     }
     fs::create_dir_all(directory).map_err(journal_io("create capture journal directory"))?;
     for created in missing.into_iter().rev() {
-        if let Some(parent) = created.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            sync_directory(parent)?;
+        if let Some(parent) = created.parent() {
+            if parent.as_os_str().is_empty() {
+                sync_directory(Path::new("."))?;
+            } else {
+                sync_directory(parent)?;
+            }
         }
     }
     Ok(())
@@ -2595,6 +2605,11 @@ where
     fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
         self.check_renewal()?;
         self.store.get(id)
+    }
+
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+        self.check_renewal()?;
+        self.store.get_ref(reference)
     }
 
     fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
@@ -5503,30 +5518,33 @@ mod tests {
             control: Arc<WorkspaceControl<MemoryAuthority>>,
             grant: Arc<Mutex<WriterGrant>>,
             next_op: Arc<Mutex<u8>>,
-            reads: Arc<Mutex<usize>>,
+            armed: Arc<std::sync::atomic::AtomicBool>,
+            initial_capture_deadline: Arc<Mutex<Option<u64>>>,
+            verification_reads: Arc<Mutex<usize>>,
         }
 
-        impl MapObjectStore for SlowAdvancingStore {
-            fn proof_scope(&self) -> ObjectStoreScopeId {
-                self.inner.proof_scope()
-            }
-
-            fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        impl SlowAdvancingStore {
+            fn advance_during_verification(&self) -> Result<(), String> {
+                if !self.armed.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
                 let read_index = {
-                    let mut count = self.reads.lock().unwrap();
+                    let mut count = self.verification_reads.lock().unwrap();
                     *count += 1;
                     *count
                 };
-                // Advance the authority clock by 200 seconds per object read so
-                // total verification exceeds the 10-minute (600s) preparation lease,
-                // while keeping writer & attachment heartbeats live.
+                // Advance the authority clock by 200 seconds per object read
+                // during descriptor verification so verification crosses the
+                // capture's initial 600s deadline while keeping writer and
+                // attachment heartbeats live.
                 if read_index <= 4 {
-                    let new_now = (read_index as u64) * 200_000_000_000;
+                    let target_now =
+                        self.authority.now_nanos.load(Ordering::SeqCst) + 200_000_000_000;
                     let mut current_now = self.authority.now_nanos.load(Ordering::SeqCst);
                     let mut grant = self.grant.lock().unwrap();
                     let mut op_byte = self.next_op.lock().unwrap();
-                    while current_now < new_now {
-                        current_now = (current_now + 20_000_000_000).min(new_now);
+                    while current_now < target_now {
+                        current_now = (current_now + 20_000_000_000).min(target_now);
                         self.authority
                             .now_nanos
                             .store(current_now, Ordering::SeqCst);
@@ -5556,7 +5574,23 @@ mod tests {
                         }
                     }
                 }
+                Ok(())
+            }
+        }
+
+        impl MapObjectStore for SlowAdvancingStore {
+            fn proof_scope(&self) -> ObjectStoreScopeId {
+                self.inner.proof_scope()
+            }
+
+            fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+                self.advance_during_verification()?;
                 self.inner.get(id)
+            }
+
+            fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+                self.advance_during_verification()?;
+                self.inner.get_ref(reference)
             }
 
             fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
@@ -5566,6 +5600,22 @@ mod tests {
 
         impl DurableObjectStore for SlowAdvancingStore {
             fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+                if reference.object_type == ObjectType::GenerationDescriptor
+                    && !self.armed.swap(true, Ordering::SeqCst)
+                {
+                    let capture = self
+                        .control
+                        .get_branch(branch())
+                        .map_err(|error| error.to_string())?
+                        .capture
+                        .expect("capture must be active when uploading descriptor");
+                    if let Ok(OperationState::Preparing { expires_at, .. }) =
+                        self.control.get_operation(capture.operation_id)
+                    {
+                        *self.initial_capture_deadline.lock().unwrap() =
+                            Some(expires_at.as_nanos());
+                    }
+                }
                 self.inner.put_durable(reference, encoded)
             }
         }
@@ -5577,7 +5627,9 @@ mod tests {
             control: fixture.control.inner.clone(),
             grant: Arc::new(Mutex::new(fixture.grant)),
             next_op: Arc::new(Mutex::new(100)),
-            reads: Arc::new(Mutex::new(0)),
+            armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initial_capture_deadline: Arc::new(Mutex::new(None)),
+            verification_reads: Arc::new(Mutex::new(0)),
         };
         let mut volume = DurableVolume::open(
             slow_store.clone(),
@@ -5617,11 +5669,22 @@ mod tests {
                 &CheckpointRequest::attached(CaptureMode::BlockCut, 29_000),
                 &[],
             )
-            .expect("verification must keep renewing capture preparation past 600s");
+            .expect(
+                "verification must keep renewing capture preparation past its initial deadline",
+            );
         assert!(published.head_advanced);
+        let initial_deadline = slow_store
+            .initial_capture_deadline
+            .lock()
+            .unwrap()
+            .expect("descriptor upload must record initial capture deadline");
         assert!(
-            fixture._authority.now_nanos.load(Ordering::SeqCst) >= 800_000_000_000,
-            "authority clock must have advanced past the initial 600s capture preparation lease"
+            fixture._authority.now_nanos.load(Ordering::SeqCst) > initial_deadline,
+            "verification reads must advance authority clock past the capture's initial deadline"
+        );
+        assert!(
+            *slow_store.verification_reads.lock().unwrap() >= 4,
+            "verification must have performed multiple timed object reads"
         );
         assert!(
             fixture.control.renew_ids.lock().unwrap().len() >= 3,
