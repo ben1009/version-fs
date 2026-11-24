@@ -854,6 +854,10 @@ impl<'a> JournalReader<'a> {
 /// while this device is open. The barrier coordinator renews preparation
 /// protection during long uploads, but does not run the attachment heartbeat.
 pub trait VolumeBarrierControl: Send + Sync {
+    /// Returns the workspace identity bound to this control handle.
+    /// This identity must stay fixed for the lifetime of the control handle.
+    fn workspace_id(&self) -> WorkspaceId;
+
     /// Returns the immutable-object namespace configured for this workspace.
     /// This identity must stay fixed for the lifetime of the control handle.
     fn object_store_scope(&self) -> ObjectStoreScopeId;
@@ -919,6 +923,10 @@ pub trait VolumeBarrierControl: Send + Sync {
 }
 
 impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
+    fn workspace_id(&self) -> WorkspaceId {
+        WorkspaceControl::workspace_id(self)
+    }
+
     fn object_store_scope(&self) -> ObjectStoreScopeId {
         WorkspaceControl::object_store_scope(self)
     }
@@ -2828,6 +2836,10 @@ mod tests {
     }
 
     impl VolumeBarrierControl for FakeControl {
+        fn workspace_id(&self) -> WorkspaceId {
+            self.0.lock().unwrap().branch.workspace_id
+        }
+
         fn object_store_scope(&self) -> ObjectStoreScopeId {
             ObjectStoreScopeId::from_bytes([0xA7; 16])
         }

@@ -497,6 +497,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
     }
 
+    /// Returns the workspace identity bound to this control handle.
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
     /// Returns the immutable-object namespace configured for this workspace.
     pub const fn object_store_scope(&self) -> ObjectStoreScopeId {
         self.object_store_scope

@@ -1103,11 +1103,11 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
     ///
     /// Use this watchdog entry point after worker loss and writer takeover when
     /// the original attachment can no longer be reopened via
-    /// [`DurableVolume::open`]. It verifies the caller's principal and
-    /// object-store scope against the journal, reconciles or aborts the capture
-    /// operation on the authority, thaws `boundary` if `freeze_active`, reopens
-    /// `producers`, and clears the capture journal without mutating or rebasing
-    /// any replacement volume.
+    /// [`DurableVolume::open`]. It verifies the caller's workspace, principal,
+    /// and object-store scope against the journal, reconciles or aborts the
+    /// capture operation on the authority, thaws `boundary` if `freeze_active`,
+    /// reopens `producers`, and clears the capture journal without mutating or
+    /// rebasing any replacement volume.
     pub fn recover_pending_capture_detached<C, P, B>(
         &mut self,
         control: &C,
@@ -1122,7 +1122,8 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         let Some(mut pending) = self.journal.load_pending().map_err(CaptureError::Journal)? else {
             return Ok(RecoveredCapture::None);
         };
-        if pending.scope.principal_id != control.principal_id()
+        if pending.scope.workspace_id != control.workspace_id()
+            || pending.scope.principal_id != control.principal_id()
             || pending.scope.object_store_scope != control.object_store_scope()
         {
             return Err(CaptureError::JournalScopeMismatch);
@@ -1513,8 +1514,14 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                                 }
                                 continue;
                             }
-                            Ok(_)
-                            | Err(
+                            Ok(_) => {
+                                // Attachment, writer grant, and authority owner
+                                // incarnation are still live (for example, a
+                                // foreign principal acquired a capture between
+                                // pre-drain read and begin_capture). Reject this
+                                // capture attempt without permanently fencing.
+                            }
+                            Err(
                                 ControlError::Fenced
                                 | ControlError::Expired
                                 | ControlError::NotFound,
@@ -1526,9 +1533,8 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                                 // Cannot confirm whether we are fenced; keep journal intact.
                                 return Err(CaptureError::Control(branch_err));
                             }
-                            Err(_) => {
-                                volume.mark_fenced();
-                                final_error = CaptureError::Fenced;
+                            Err(branch_err) => {
+                                return Err(CaptureError::Control(branch_err));
                             }
                         }
                     } else if matches!(
@@ -2909,6 +2915,10 @@ mod tests {
     }
 
     impl VolumeBarrierControl for FaultyControl {
+        fn workspace_id(&self) -> WorkspaceId {
+            self.active().workspace_id()
+        }
+
         fn object_store_scope(&self) -> ObjectStoreScopeId {
             self.active().object_store_scope()
         }
@@ -5914,5 +5924,154 @@ mod tests {
         volume
             .flush()
             .expect("ordinary barrier must still commit cleanly");
+    }
+
+    #[test]
+    fn recover_pending_capture_detached_rejects_mismatched_workspace_scope() {
+        let fixture = TestFixture::new();
+        let failures = Arc::new(OneShotFailures::default());
+        failures.arm(FailurePoint::FilesystemFreezeAfter);
+        let mut volume = fixture.open_volume();
+        let mut coordinator = fixture.coordinator_with_failures(failures);
+        let mut producers = CallbackProducerGate::new(|_| Ok(()));
+        let mut boundary = RecordingBoundary::default();
+
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::FilesystemFrozen, 32_000),
+                &[],
+            )
+            .expect_err("injected crash after freeze");
+        assert!(matches!(err, CaptureError::InjectedFailure(_)));
+        assert!(boundary.frozen);
+        let capture_id = coordinator
+            .pending_capture()
+            .unwrap()
+            .expect("pending capture must exist")
+            .capture_id;
+        drop(coordinator);
+        drop(volume);
+
+        // Construct a control handle with the SAME principal and object-store
+        // scope, but a DIFFERENT workspace ID.
+        let wrong_workspace_control = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([2; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([7; 16]),
+            fixture._owner,
+        );
+        let mut watchdog = fixture.coordinator();
+        let err = watchdog
+            .recover_pending_capture_detached(
+                &wrong_workspace_control,
+                &mut producers,
+                &mut boundary,
+            )
+            .expect_err("detached recovery must reject mismatched workspace_id");
+        assert!(matches!(err, CaptureError::JournalScopeMismatch));
+        assert!(boundary.frozen, "must not thaw on workspace mismatch");
+        assert_eq!(boundary.thaw_calls, 0);
+        assert_eq!(
+            producers.reopen_calls, 0,
+            "must not reopen admission on workspace mismatch"
+        );
+        assert!(
+            watchdog.pending_capture().unwrap().is_some(),
+            "must not delete capture journal on workspace mismatch"
+        );
+        assert!(
+            matches!(
+                fixture.control.get_operation(capture_id),
+                Ok(OperationState::Preparing { .. })
+            ),
+            "original workspace capture must remain Preparing"
+        );
+        assert_eq!(
+            wrong_workspace_control.get_operation(capture_id),
+            Err(ControlError::NotFound),
+            "must not create an aborted tombstone in the wrong workspace"
+        );
+    }
+
+    #[test]
+    fn foreign_principal_capture_during_acquire_does_not_permanently_fence_volume() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        let mut coordinator = fixture.coordinator();
+        let mut boundary = BlockCutOnlyBoundary;
+
+        let foreign_control = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([8; 16]),
+            fixture._owner,
+        );
+        let grant = fixture.grant;
+        let foreign_capture_id = op(198);
+        let foreign_for_drain = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([8; 16]),
+            fixture._owner,
+        );
+        let mut producers = CallbackProducerGate::new(move |_| {
+            // Between Principal A's pre-drain branch read and begin_capture,
+            // Principal B acquires a capture using the same valid writer grant.
+            let current = foreign_for_drain.get_branch(branch()).unwrap();
+            foreign_for_drain
+                .begin_capture(
+                    PreparationRequest {
+                        operation_id: foreign_capture_id,
+                        branch_id: branch(),
+                        expected_revision: current.revision,
+                        grant,
+                        attachment_id: attachment(),
+                        volume_epoch: current.volume_epoch,
+                        protection_id: ProtectionId::from_bytes([198; 16]),
+                        kind: PreparationKind::CheckpointCapture,
+                        expected_roots: None,
+                        dependencies: vec![],
+                    },
+                    ProvenanceBinding::Unattributed,
+                )
+                .expect("foreign principal begins capture during drain");
+            Ok(())
+        });
+
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::BlockCut, 33_000),
+                &[],
+            )
+            .expect_err("capture acquisition during foreign capture must be rejected");
+        assert!(matches!(err, CaptureError::Control(ControlError::Fenced)));
+        assert!(
+            !volume.is_fenced(),
+            "foreign-principal capture during acquire must not permanently fence a live attachment"
+        );
+        assert!(coordinator.pending_capture().unwrap().is_none());
+
+        // Once the foreign principal aborts its capture, Principal A's volume
+        // must still accept normal writes and flush cleanly.
+        foreign_control.abort_operation(foreign_capture_id).unwrap();
+        volume
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0x5E; 4096],
+                fua: false,
+            })
+            .expect("live attachment must still accept writes after foreign capture ends");
+        volume
+            .flush()
+            .expect("live attachment must still flush cleanly after foreign capture ends");
     }
 }
