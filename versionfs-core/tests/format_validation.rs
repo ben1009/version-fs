@@ -1,8 +1,8 @@
 //! Payload-budget checks for canonical log segments.
 
 use versionfs_core::format::{
-    ArtifactChunkEntry, ArtifactDescriptor, FormatError, LogSegment, MAX_OBJECT_PAYLOAD_BYTES,
-    ObjectRef, ObjectType, decode_object, encode_object,
+    ArtifactChunkEntry, ArtifactDescriptor, CaptureMode, FormatError, LogSegment,
+    MAX_OBJECT_PAYLOAD_BYTES, ObjectRef, ObjectType, decode_object, encode_object,
 };
 use versionfs_core::identity::{ArtifactId, LogId, ObjectId};
 
@@ -95,4 +95,41 @@ fn artifact_chunk_entries_reject_zero_length_chunks() {
         entry.encode(),
         Err(FormatError::InvalidNativeView(_))
     ));
+}
+
+#[test]
+fn capture_modes_round_trip_canonical_names_and_reject_unknown_values() {
+    for (mode, expected_name) in [
+        (CaptureMode::BlockCut, "block_cut"),
+        (CaptureMode::FilesystemFrozen, "filesystem_frozen"),
+        (
+            CaptureMode::FilesystemCleanUnmount,
+            "filesystem_clean_unmount",
+        ),
+    ] {
+        assert_eq!(mode.as_str(), expected_name);
+        assert_eq!(CaptureMode::from_name(expected_name), Ok(mode));
+        assert_eq!(CaptureMode::try_from(mode as u8), Ok(mode));
+    }
+
+    for invalid in [
+        "",
+        "frozen",
+        "unmount",
+        "BLOCK_CUT",
+        "application_consistent",
+    ] {
+        assert!(matches!(
+            CaptureMode::from_name(invalid),
+            Err(FormatError::InvalidGenerationDescriptor(_))
+        ));
+    }
+    assert_eq!(
+        CaptureMode::try_from(0),
+        Err(FormatError::UnknownCaptureMode(0))
+    );
+    assert_eq!(
+        CaptureMode::try_from(4),
+        Err(FormatError::UnknownCaptureMode(4))
+    );
 }

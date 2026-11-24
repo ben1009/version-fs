@@ -33,6 +33,9 @@ pub enum BlockError {
     /// A durable barrier is unresolved; dependent writes cannot pass it.
     #[error("a durable block barrier is unresolved")]
     BarrierUnresolved,
+    /// Block mutation admission is closed while a checkpoint capture seals or publishes.
+    #[error("block mutation admission is closed during capture")]
+    MutationAdmissionClosed,
     /// A durable barrier failed before it could be acknowledged.
     #[error("durable block barrier failed: {0}")]
     Barrier(String),
@@ -126,6 +129,10 @@ impl<S: MapObjectStore> DirtyVolume<S> {
     /// Returns the number of dirty extents currently held in memory.
     pub fn dirty_extent_count(&self) -> usize {
         self.dirty.len()
+    }
+
+    pub(crate) const fn dirty_revision(&self) -> u64 {
+        self.revision
     }
 
     /// Returns bytes currently held in the dirty overlay.

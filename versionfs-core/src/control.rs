@@ -4,6 +4,7 @@
 //! filesystem/device operations, and external effects remain outside authority
 //! transactions. Callers supply stable IDs before issuing any mutation.
 
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
@@ -61,6 +62,10 @@ const OP_SEAL_CAPTURE: u16 = 21;
 const OP_MARK_UNRETAINED: u16 = 23;
 const OP_EXPIRE_PROTECTION: u16 = 24;
 const OP_PUBLISH_CAPTURE: u16 = 25;
+const OP_MOVE_HEAD: u16 = 26;
+const OP_PROMOTE: u16 = 27;
+const OP_DELETE_BRANCH: u16 = 28;
+const OP_FORCE_ACQUIRE_WRITER: u16 = 29;
 const TRANSITION_BEGIN: u16 = 1;
 const TRANSITION_COMMIT_LIVE_ROOTS: u16 = 2;
 const TRANSITION_ABORT: u16 = 3;
@@ -117,6 +122,9 @@ pub enum ControlError {
     /// A Generation is no longer eligible for new protection.
     #[error("Generation is not retained")]
     GenerationExpired,
+    /// Durable live roots differ from the branch head and explicit discard was not set.
+    #[error("durable live state differs from branch head; explicit discard_live_state is required")]
+    LiveStateDiscardRequired,
     /// The requested state transition is not valid from the stored phase.
     #[error("invalid control-state transition")]
     InvalidTransition,
@@ -775,6 +783,308 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 Ok((encode_writer_grant_result(grant), Some(grant.expires_at)))
             })?;
         decode_writer_grant_result(&result)
+    }
+
+    /// Forces writer ownership handover under exact revision and writer-epoch preconditions.
+    ///
+    /// Revokes any active writer lease, fences its attachment (advancing writer,
+    /// volume, and stream epochs), and atomically aborts any open capture token
+    /// along with its pending drain-flush child (whether unstarted or preparing)
+    /// before issuing the replacement grant.
+    pub fn force_acquire_writer(
+        &self,
+        operation_id: OperationId,
+        branch_id: BranchId,
+        expected_revision: u64,
+        expected_writer_epoch: u64,
+    ) -> Result<WriterGrant, ControlError> {
+        let mut payload = CanonicalEncoder::new();
+        payload.fixed(branch_id.as_bytes());
+        payload.u64_le(expected_revision);
+        payload.u64_le(expected_writer_epoch);
+        let result = self.run_atomic_checked(
+            operation_id,
+            OP_FORCE_ACQUIRE_WRITER,
+            payload.finish(),
+            |txn| {
+                self.require_current_owner(txn)?;
+                let key = branch_key(self.workspace_id, branch_id);
+                let mut branch = read_branch(txn, &key)?;
+                ensure_live_branch(&branch)?;
+                if branch.revision != expected_revision
+                    || branch.writer_epoch != expected_writer_epoch
+                {
+                    return Err(MetadataError::Conflict);
+                }
+                if let Some(capture) = branch.capture.clone() {
+                    let capture_op_key = scoped_operation_key(
+                        self.workspace_id,
+                        capture.principal_id,
+                        capture.operation_id,
+                    );
+                    let capture_bytes = txn
+                        .get(&capture_op_key)?
+                        .ok_or_else(|| reject("corrupt_record"))?;
+                    let mut capture_record =
+                        decode_operation(&capture_bytes).map_err(to_metadata_error)?;
+                    let capture_grant = match capture_record.status {
+                        StoredOperationStatus::Preparing {
+                            branch_id: prepared_branch,
+                            protection_id,
+                            grant,
+                            capture: is_capture,
+                            ..
+                        } if prepared_branch == branch_id
+                            && protection_id == capture.protection_id
+                            && is_capture =>
+                        {
+                            grant
+                        }
+                        _ => return Err(reject("corrupt_record")),
+                    };
+                    if let Some(child_id) = capture.pending_child {
+                        abort_capture_child_for_handover(
+                            txn,
+                            self.workspace_id,
+                            capture.principal_id,
+                            branch_id,
+                            capture.operation_id,
+                            capture_grant,
+                            child_id,
+                        )?;
+                    }
+                    retire_protection(txn, self.workspace_id, capture.protection_id)?;
+                    capture_record.status = StoredOperationStatus::Aborted;
+                    txn.put(
+                        &capture_op_key,
+                        &encode_operation(&capture_record).map_err(to_metadata_error)?,
+                    )?;
+                    branch.capture = None;
+                }
+                let had_attachment = branch.attachment.is_some();
+                fence_attachment(txn, self.workspace_id, &mut branch)?;
+                if !had_attachment && branch.writer.is_some() {
+                    branch.volume_epoch = increment(branch.volume_epoch)?;
+                    branch.stream_epoch = increment(branch.stream_epoch)?;
+                }
+                branch.writer_epoch = increment(branch.writer_epoch)?;
+                let grant = WriterGrant {
+                    branch_id,
+                    writer_epoch: branch.writer_epoch,
+                    owner_incarnation: self.owner_incarnation,
+                    grant_id: operation_id,
+                    expires_at: txn.now().saturating_add_nanos(WRITER_LEASE_NANOS),
+                };
+                branch.writer = Some(grant);
+                txn.put(&key, &encode_branch(&branch).map_err(to_metadata_error)?)?;
+                Ok((encode_writer_grant_result(grant), Some(grant.expires_at)))
+            },
+        )?;
+        decode_writer_grant_result(&result)
+    }
+
+    /// Conditionally adopts or rolls back a branch head to a retained Generation.
+    ///
+    /// Replaces live volume, log, and artifact roots from `target_generation`,
+    /// advances branch revision and writer/volume/stream epochs, and revokes the
+    /// active writer grant and writable attachment. Requires `discard_live_state`
+    /// when durable live roots differ from the branch's current head Generation.
+    pub fn move_head(
+        &self,
+        operation_id: OperationId,
+        branch_id: BranchId,
+        expected_revision: u64,
+        target_generation: GenerationId,
+        grant: WriterGrant,
+        discard_live_state: bool,
+    ) -> Result<BranchState, ControlError> {
+        let mut payload = CanonicalEncoder::new();
+        payload.fixed(branch_id.as_bytes());
+        payload.u64_le(expected_revision);
+        payload.fixed(target_generation.as_bytes());
+        encode_writer_grant(&mut payload, grant);
+        payload.u8(u8::from(discard_live_state));
+        let result =
+            self.run_atomic_checked(operation_id, OP_MOVE_HEAD, payload.finish(), |txn| {
+                self.require_current_owner(txn)?;
+                let key = branch_key(self.workspace_id, branch_id);
+                let mut branch = read_branch(txn, &key)?;
+                validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
+                if branch.revision != expected_revision {
+                    return Err(MetadataError::Conflict);
+                }
+                if branch.capture.is_some() || branch.pending_mutation_preparations != 0 {
+                    return Err(reject("busy"));
+                }
+                reset_branch_head(
+                    txn,
+                    self.workspace_id,
+                    &mut branch,
+                    target_generation,
+                    discard_live_state,
+                )?;
+                let encoded = encode_branch(&branch).map_err(to_metadata_error)?;
+                txn.put(&key, &encoded)?;
+                Ok((encoded, Some(grant.expires_at)))
+            })?;
+        decode_branch(&result)
+    }
+
+    /// Conditionally promotes a source branch's published head Generation onto a
+    /// destination branch in one atomic authority transaction.
+    ///
+    /// Validates both stable branch IDs and exact revisions together, adopts only
+    /// `source.head` (never uncheckpointed live state on the source branch),
+    /// revokes the destination writer/attachment, and advances destination
+    /// revision and fencing epochs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn promote(
+        &self,
+        operation_id: OperationId,
+        source_branch_id: BranchId,
+        expected_source_revision: u64,
+        destination_branch_id: BranchId,
+        expected_destination_revision: u64,
+        destination_grant: WriterGrant,
+        discard_live_state: bool,
+    ) -> Result<BranchState, ControlError> {
+        if source_branch_id == destination_branch_id {
+            return Err(ControlError::InvalidRequest(
+                "source and destination branches must differ",
+            ));
+        }
+        let mut payload = CanonicalEncoder::new();
+        payload.fixed(source_branch_id.as_bytes());
+        payload.u64_le(expected_source_revision);
+        payload.fixed(destination_branch_id.as_bytes());
+        payload.u64_le(expected_destination_revision);
+        encode_writer_grant(&mut payload, destination_grant);
+        payload.u8(u8::from(discard_live_state));
+        let result =
+            self.run_atomic_checked(operation_id, OP_PROMOTE, payload.finish(), |txn| {
+                self.require_current_owner(txn)?;
+                let source = read_branch(txn, &branch_key(self.workspace_id, source_branch_id))?;
+                ensure_live_branch(&source)?;
+                if source.revision != expected_source_revision {
+                    return Err(MetadataError::Conflict);
+                }
+                let dest_key = branch_key(self.workspace_id, destination_branch_id);
+                let mut destination = read_branch(txn, &dest_key)?;
+                validate_writer(
+                    &destination,
+                    destination_grant,
+                    self.owner_incarnation,
+                    txn.now(),
+                )?;
+                if destination.revision != expected_destination_revision {
+                    return Err(MetadataError::Conflict);
+                }
+                if destination.capture.is_some() || destination.pending_mutation_preparations != 0 {
+                    return Err(reject("busy"));
+                }
+                reset_branch_head(
+                    txn,
+                    self.workspace_id,
+                    &mut destination,
+                    source.head,
+                    discard_live_state,
+                )?;
+                let encoded = encode_branch(&destination).map_err(to_metadata_error)?;
+                txn.put(&dest_key, &encoded)?;
+                Ok((encoded, Some(destination_grant.expires_at)))
+            })?;
+        decode_branch(&result)
+    }
+
+    /// Deletes a branch under exact identity, revision, and write-authority CAS.
+    ///
+    /// Requires `discard_live_state` when durable live roots differ from the branch
+    /// head. Atomically revokes any active writer/attachment, decrements Generation
+    /// references, removes the branch-name binding for future reuse by a new branch
+    /// ID, and leaves a permanent deleted tombstone on the old branch ID.
+    pub fn delete_branch(
+        &self,
+        operation_id: OperationId,
+        branch_id: BranchId,
+        expected_revision: u64,
+        grant: WriterGrant,
+        discard_live_state: bool,
+    ) -> Result<(), ControlError> {
+        let mut payload = CanonicalEncoder::new();
+        payload.fixed(branch_id.as_bytes());
+        payload.u64_le(expected_revision);
+        encode_writer_grant(&mut payload, grant);
+        payload.u8(u8::from(discard_live_state));
+        self.run_atomic_checked(operation_id, OP_DELETE_BRANCH, payload.finish(), |txn| {
+            self.require_current_owner(txn)?;
+            let key = branch_key(self.workspace_id, branch_id);
+            let mut branch = read_branch(txn, &key)?;
+            validate_writer(&branch, grant, self.owner_incarnation, txn.now())?;
+            if branch.revision != expected_revision {
+                return Err(MetadataError::Conflict);
+            }
+            if branch.capture.is_some() || branch.pending_mutation_preparations != 0 {
+                return Err(reject("busy"));
+            }
+
+            let mut generations = BTreeMap::new();
+            let head_id = branch.head;
+            generations.insert(
+                head_id,
+                read_generation(txn, &generation_key(self.workspace_id, head_id))?,
+            );
+            if branch_live_roots(&branch) != generations[&head_id].seed.roots && !discard_live_state
+            {
+                return Err(reject("live_state_discard_required"));
+            }
+
+            if let Some(attachment) = branch.attachment.take() {
+                if let Entry::Vacant(entry) = generations.entry(attachment.base_generation) {
+                    entry.insert(read_generation(
+                        txn,
+                        &generation_key(self.workspace_id, attachment.base_generation),
+                    )?);
+                }
+                let base_gen = generations
+                    .get_mut(&attachment.base_generation)
+                    .ok_or_else(|| reject("corrupt_record"))?;
+                base_gen.attachment_refs = decrement(base_gen.attachment_refs)?;
+                retire_attachment_protection(txn, self.workspace_id, attachment)?;
+            }
+
+            let head_gen = generations
+                .get_mut(&head_id)
+                .ok_or_else(|| reject("corrupt_record"))?;
+            head_gen.branch_refs = decrement(head_gen.branch_refs)?;
+
+            for (generation_id, record) in &generations {
+                txn.put(
+                    &generation_key(self.workspace_id, *generation_id),
+                    &encode_generation(record).map_err(to_metadata_error)?,
+                )?;
+            }
+
+            let name_key = branch_name_key(self.workspace_id, &branch.name);
+            let bound = txn
+                .get(&name_key)?
+                .map(|bytes| decode_name_binding(&bytes).map_err(to_metadata_error))
+                .transpose()?;
+            if bound != Some(branch_id) {
+                return Err(reject("corrupt_record"));
+            }
+            txn.delete(&name_key)?;
+
+            branch.writer = None;
+            branch.attachment = None;
+            branch.revision = increment(branch.revision)?;
+            branch.writer_epoch = increment(branch.writer_epoch)?;
+            branch.volume_epoch = increment(branch.volume_epoch)?;
+            branch.stream_epoch = increment(branch.stream_epoch)?;
+            branch.deleted = true;
+            txn.put(&key, &encode_branch(&branch).map_err(to_metadata_error)?)?;
+            Ok((Vec::new(), Some(grant.expires_at)))
+        })?;
+        Ok(())
     }
 
     /// Renews a grant. Replaying the renewal operation returns its original deadline.
@@ -2697,51 +3007,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         grant: WriterGrant,
         child_id: OperationId,
     ) -> Result<(), MetadataError> {
-        let key = self.operation_key(child_id);
-        let Some(bytes) = txn.get(&key)? else {
-            let reservation_key =
-                capture_child_reservation_key(self.workspace_id, self.principal_id, child_id);
-            let reservation_bytes = txn
-                .get(&reservation_key)?
-                .ok_or_else(|| reject("corrupt_record"))?;
-            let reservation =
-                decode_capture_child_reservation(&reservation_bytes).map_err(to_metadata_error)?;
-            if reservation
-                != (CaptureChildReservation {
-                    capture_id,
-                    branch_id,
-                })
-            {
-                return Err(reject("corrupt_record"));
-            }
-            let tombstone = StoredOperation::aborted(OP_TOMBSTONE, [0; 32]);
-            txn.put(
-                &key,
-                &encode_operation(&tombstone).map_err(to_metadata_error)?,
-            )?;
-            txn.delete(&reservation_key)?;
-            return Ok(());
-        };
-
-        let record = decode_operation(&bytes).map_err(to_metadata_error)?;
-        match record.status {
-            StoredOperationStatus::Aborted => Ok(()),
-            StoredOperationStatus::Preparing {
-                branch_id: child_branch,
-                grant: child_grant,
-                capture,
-                ..
-            } if record.kind == OP_BEGIN_PREPARATION
-                && child_branch == branch_id
-                && same_grant_identity(child_grant, grant)
-                && !capture =>
-            {
-                Err(reject("busy"))
-            }
-            StoredOperationStatus::Preparing { .. } | StoredOperationStatus::Committed(_) => {
-                Err(reject("corrupt_record"))
-            }
-        }
+        retire_unstarted_capture_child_in_scope(
+            txn,
+            self.workspace_id,
+            self.principal_id,
+            branch_id,
+            capture_id,
+            grant,
+            child_id,
+        )
     }
 
     fn transition_key(&self, id: OperationId, transition: u16) -> Vec<u8> {
@@ -3229,6 +3503,12 @@ fn encode_branch(branch: &BranchState) -> Result<Vec<u8>, FormatError> {
         encode_capture_provenance_extension(&mut e, capture.provenance)?;
     }
     encode_metadata_record(MetadataRecordType::Branch, &e.finish())
+}
+
+/// Decodes the committed [`BranchState`] carried by [`OperationState::Committed`]
+/// for branch-returning operations such as `commit_live_roots` and `publish_capture`.
+pub fn decode_branch_operation_result(bytes: &[u8]) -> Result<BranchState, ControlError> {
+    decode_branch(bytes)
 }
 
 fn decode_branch(bytes: &[u8]) -> Result<BranchState, ControlError> {
@@ -4257,6 +4537,221 @@ fn read_generation(
         .ok_or_else(|| reject("not_found"))
 }
 
+fn retire_attachment_protection(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    attachment: AttachmentState,
+) -> Result<(), MetadataError> {
+    let pkey = protection_key(workspace, attachment.protection_id);
+    let bytes = txn.get(&pkey)?.ok_or_else(|| reject("corrupt_record"))?;
+    match decode_protection(&bytes).map_err(to_metadata_error)? {
+        ProtectionRecord::AttachmentBase {
+            attachment_id,
+            generation_id,
+            ..
+        } if attachment_id == attachment.attachment_id
+            && generation_id == attachment.base_generation => {}
+        _ => return Err(reject("corrupt_record")),
+    }
+    retire_protection(txn, workspace, attachment.protection_id)
+}
+
+fn reset_branch_head(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch: &mut BranchState,
+    target_generation: GenerationId,
+    discard_live_state: bool,
+) -> Result<(), MetadataError> {
+    let mut generations = BTreeMap::new();
+    let old_head = branch.head;
+    generations.insert(
+        old_head,
+        read_generation(txn, &generation_key(workspace, old_head))?,
+    );
+    if branch_live_roots(branch) != generations[&old_head].seed.roots && !discard_live_state {
+        return Err(reject("live_state_discard_required"));
+    }
+    if let Entry::Vacant(entry) = generations.entry(target_generation) {
+        entry.insert(read_generation(
+            txn,
+            &generation_key(workspace, target_generation),
+        )?);
+    }
+    if !generations[&target_generation].eligible() {
+        return Err(reject("generation_expired"));
+    }
+    let target_roots = generations[&target_generation].seed.roots;
+
+    if let Some(attachment) = branch.attachment.take() {
+        if let Entry::Vacant(entry) = generations.entry(attachment.base_generation) {
+            entry.insert(read_generation(
+                txn,
+                &generation_key(workspace, attachment.base_generation),
+            )?);
+        }
+        let base_gen = generations
+            .get_mut(&attachment.base_generation)
+            .ok_or_else(|| reject("corrupt_record"))?;
+        base_gen.attachment_refs = decrement(base_gen.attachment_refs)?;
+        retire_attachment_protection(txn, workspace, attachment)?;
+    }
+
+    if target_generation != old_head {
+        let old_record = generations
+            .get_mut(&old_head)
+            .ok_or_else(|| reject("corrupt_record"))?;
+        old_record.branch_refs = decrement(old_record.branch_refs)?;
+        let target_record = generations
+            .get_mut(&target_generation)
+            .ok_or_else(|| reject("corrupt_record"))?;
+        target_record.branch_refs = increment(target_record.branch_refs)?;
+    }
+
+    for (generation_id, record) in &generations {
+        txn.put(
+            &generation_key(workspace, *generation_id),
+            &encode_generation(record).map_err(to_metadata_error)?,
+        )?;
+    }
+
+    branch.head = target_generation;
+    branch.volume_root = target_roots.volume;
+    branch.logs_root = target_roots.logs;
+    branch.artifacts_root = target_roots.artifacts;
+    branch.writer = None;
+    branch.attachment = None;
+    branch.revision = increment(branch.revision)?;
+    branch.writer_epoch = increment(branch.writer_epoch)?;
+    branch.volume_epoch = increment(branch.volume_epoch)?;
+    branch.stream_epoch = increment(branch.stream_epoch)?;
+    Ok(())
+}
+
+fn retire_unstarted_capture_child_in_scope(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    principal: PrincipalId,
+    branch_id: BranchId,
+    capture_id: OperationId,
+    grant: WriterGrant,
+    child_id: OperationId,
+) -> Result<(), MetadataError> {
+    let key = scoped_operation_key(workspace, principal, child_id);
+    let Some(bytes) = txn.get(&key)? else {
+        let reservation_key = capture_child_reservation_key(workspace, principal, child_id);
+        let reservation_bytes = txn
+            .get(&reservation_key)?
+            .ok_or_else(|| reject("corrupt_record"))?;
+        let reservation =
+            decode_capture_child_reservation(&reservation_bytes).map_err(to_metadata_error)?;
+        if reservation
+            != (CaptureChildReservation {
+                capture_id,
+                branch_id,
+            })
+        {
+            return Err(reject("corrupt_record"));
+        }
+        let tombstone = StoredOperation::aborted(OP_TOMBSTONE, [0; 32]);
+        txn.put(
+            &key,
+            &encode_operation(&tombstone).map_err(to_metadata_error)?,
+        )?;
+        txn.delete(&reservation_key)?;
+        return Ok(());
+    };
+
+    let record = decode_operation(&bytes).map_err(to_metadata_error)?;
+    match record.status {
+        StoredOperationStatus::Aborted => Ok(()),
+        StoredOperationStatus::Preparing {
+            branch_id: child_branch,
+            grant: child_grant,
+            capture,
+            ..
+        } if record.kind == OP_BEGIN_PREPARATION
+            && child_branch == branch_id
+            && same_grant_identity(child_grant, grant)
+            && !capture =>
+        {
+            Err(reject("busy"))
+        }
+        StoredOperationStatus::Preparing { .. } | StoredOperationStatus::Committed(_) => {
+            Err(reject("corrupt_record"))
+        }
+    }
+}
+
+/// Aborts a capture child during forced handover whether it is still an
+/// unstarted reservation or an active `Preparing` volume barrier.
+/// Already-committed children have cleared `capture.pending_child` and are never
+/// undone.
+fn abort_capture_child_for_handover(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    principal: PrincipalId,
+    branch_id: BranchId,
+    capture_id: OperationId,
+    capture_grant: WriterGrant,
+    child_id: OperationId,
+) -> Result<(), MetadataError> {
+    let key = scoped_operation_key(workspace, principal, child_id);
+    let Some(bytes) = txn.get(&key)? else {
+        return retire_unstarted_capture_child_in_scope(
+            txn,
+            workspace,
+            principal,
+            branch_id,
+            capture_id,
+            capture_grant,
+            child_id,
+        );
+    };
+
+    let mut record = decode_operation(&bytes).map_err(to_metadata_error)?;
+    match record.status {
+        StoredOperationStatus::Aborted => Ok(()),
+        StoredOperationStatus::Preparing {
+            branch_id: child_branch,
+            protection_id: child_protection_id,
+            grant: child_grant,
+            expires_at: child_expires_at,
+            capture,
+            ..
+        } if record.kind == OP_BEGIN_PREPARATION
+            && child_branch == branch_id
+            && same_grant_identity(child_grant, capture_grant)
+            && !capture =>
+        {
+            let pkey = protection_key(workspace, child_protection_id);
+            let protection = txn.get(&pkey)?.ok_or_else(|| reject("corrupt_record"))?;
+            match decode_protection(&protection).map_err(to_metadata_error)? {
+                ProtectionRecord::Preparation {
+                    operation_id: prepared_id,
+                    branch_id: protected_branch,
+                    grant: protected_grant,
+                    owner_incarnation,
+                    expires_at: protected_deadline,
+                    ..
+                } if prepared_id == child_id
+                    && protected_branch == branch_id
+                    && protected_grant == child_grant
+                    && owner_incarnation == child_grant.owner_incarnation
+                    && protected_deadline == child_expires_at => {}
+                _ => return Err(reject("corrupt_record")),
+            }
+            retire_protection(txn, workspace, child_protection_id)?;
+            record.status = StoredOperationStatus::Aborted;
+            txn.put(&key, &encode_operation(&record).map_err(to_metadata_error)?)?;
+            Ok(())
+        }
+        StoredOperationStatus::Preparing { .. } | StoredOperationStatus::Committed(_) => {
+            Err(reject("corrupt_record"))
+        }
+    }
+}
+
 fn fence_attachment(
     txn: &mut dyn MetadataTxn,
     workspace: WorkspaceId,
@@ -4485,6 +4980,7 @@ fn to_metadata_error(error: impl Into<ControlError>) -> MetadataError {
         ControlError::Expired => reject("expired"),
         ControlError::Busy => reject("busy"),
         ControlError::GenerationExpired => reject("generation_expired"),
+        ControlError::LiveStateDiscardRequired => reject("live_state_discard_required"),
         ControlError::InvalidTransition => reject("invalid_transition"),
         ControlError::InvalidRequest(_) => reject("invalid_request"),
         ControlError::CorruptRecord(message) => MetadataError::Backend(message),
@@ -4523,6 +5019,11 @@ fn map_metadata_error(error: MetadataError) -> ControlError {
             if message == format!("{REJECT_PREFIX}generation_expired") =>
         {
             ControlError::GenerationExpired
+        }
+        MetadataError::Rejected(message)
+            if message == format!("{REJECT_PREFIX}live_state_discard_required") =>
+        {
+            ControlError::LiveStateDiscardRequired
         }
         MetadataError::Rejected(message)
             if message == format!("{REJECT_PREFIX}invalid_transition") =>

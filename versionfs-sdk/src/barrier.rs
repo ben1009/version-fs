@@ -575,7 +575,7 @@ fn validate_pending(barrier: &PendingBarrier) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_roots(roots: LiveRoots) -> Result<(), String> {
+pub(crate) fn validate_roots(roots: LiveRoots) -> Result<(), String> {
     if roots.volume.object_type != ObjectType::VolumeRoot
         || roots.logs.object_type != ObjectType::LogMapRoot
         || roots.artifacts.object_type != ObjectType::ArtifactMapRoot
@@ -588,7 +588,7 @@ fn validate_roots(roots: LiveRoots) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_grant(bytes: &mut Vec<u8>, grant: WriterGrant) {
+pub(crate) fn encode_grant(bytes: &mut Vec<u8>, grant: WriterGrant) {
     bytes.extend_from_slice(grant.branch_id.as_bytes());
     push_u64(bytes, grant.writer_epoch);
     push_u64(bytes, grant.owner_incarnation.get());
@@ -596,7 +596,7 @@ fn encode_grant(bytes: &mut Vec<u8>, grant: WriterGrant) {
     push_u64(bytes, grant.expires_at.as_nanos());
 }
 
-fn decode_grant(reader: &mut JournalReader<'_>) -> Result<WriterGrant, String> {
+pub(crate) fn decode_grant(reader: &mut JournalReader<'_>) -> Result<WriterGrant, String> {
     Ok(WriterGrant {
         branch_id: BranchId::from_bytes(reader.fixed()?),
         writer_epoch: reader.u64()?,
@@ -606,13 +606,13 @@ fn decode_grant(reader: &mut JournalReader<'_>) -> Result<WriterGrant, String> {
     })
 }
 
-fn encode_roots(bytes: &mut Vec<u8>, roots: LiveRoots) {
+pub(crate) fn encode_roots(bytes: &mut Vec<u8>, roots: LiveRoots) {
     encode_ref(bytes, roots.volume);
     encode_ref(bytes, roots.logs);
     encode_ref(bytes, roots.artifacts);
 }
 
-fn decode_roots(reader: &mut JournalReader<'_>) -> Result<LiveRoots, String> {
+pub(crate) fn decode_roots(reader: &mut JournalReader<'_>) -> Result<LiveRoots, String> {
     Ok(LiveRoots {
         volume: reader.object_ref()?,
         logs: reader.object_ref()?,
@@ -620,13 +620,13 @@ fn decode_roots(reader: &mut JournalReader<'_>) -> Result<LiveRoots, String> {
     })
 }
 
-fn encode_ref(bytes: &mut Vec<u8>, reference: ObjectRef) {
+pub(crate) fn encode_ref(bytes: &mut Vec<u8>, reference: ObjectRef) {
     push_u16(bytes, reference.object_type as u16);
     bytes.extend_from_slice(reference.object_id.as_bytes());
     push_u64(bytes, reference.encoded_len);
 }
 
-fn encode_optional_operation_id(bytes: &mut Vec<u8>, operation_id: Option<OperationId>) {
+pub(crate) fn encode_optional_operation_id(bytes: &mut Vec<u8>, operation_id: Option<OperationId>) {
     if let Some(operation_id) = operation_id {
         bytes.push(1);
         bytes.extend_from_slice(operation_id.as_bytes());
@@ -635,21 +635,21 @@ fn encode_optional_operation_id(bytes: &mut Vec<u8>, operation_id: Option<Operat
     }
 }
 
-fn push_count(bytes: &mut Vec<u8>, count: usize) -> Result<(), String> {
+pub(crate) fn push_count(bytes: &mut Vec<u8>, count: usize) -> Result<(), String> {
     let count = u32::try_from(count).map_err(|_| "barrier journal list is too large".to_owned())?;
     bytes.extend_from_slice(&count.to_le_bytes());
     Ok(())
 }
 
-fn push_u16(bytes: &mut Vec<u8>, value: u16) {
+pub(crate) fn push_u16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_u64(bytes: &mut Vec<u8>, value: u64) {
+pub(crate) fn push_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-fn encode_checked(magic: &[u8; 8], payload: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_checked(magic: &[u8; 8], payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(16 + payload.len() + CHECKSUM_BYTES);
     bytes.extend_from_slice(magic);
     push_u64(&mut bytes, payload.len() as u64);
@@ -659,7 +659,7 @@ fn encode_checked(magic: &[u8; 8], payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn decode_checked<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], String> {
+pub(crate) fn decode_checked<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], String> {
     if bytes.len() < 16 + CHECKSUM_BYTES || &bytes[..8] != magic {
         return Err("invalid barrier journal header".to_owned());
     }
@@ -683,7 +683,7 @@ fn decode_checked<'a>(magic: &[u8; 8], bytes: &'a [u8]) -> Result<&'a [u8], Stri
     Ok(&bytes[16..checksum_start])
 }
 
-fn atomic_replace(
+pub(crate) fn atomic_replace(
     directory: &Path,
     destination: &Path,
     bytes: &[u8],
@@ -732,13 +732,13 @@ fn atomic_replace(
 }
 
 #[cfg(unix)]
-fn restrict_journal_directory(directory: &Path) -> Result<(), String> {
+pub(crate) fn restrict_journal_directory(directory: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
         .map_err(journal_io("restrict barrier journal directory permissions"))
 }
 
-fn set_private_creation_mode(options: &mut OpenOptions, mode: u32) {
+pub(crate) fn set_private_creation_mode(options: &mut OpenOptions, mode: u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -748,23 +748,23 @@ fn set_private_creation_mode(options: &mut OpenOptions, mode: u32) {
     let _ = (options, mode);
 }
 
-fn sync_directory(directory: &Path) -> Result<(), String> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<(), String> {
     File::open(directory)
         .and_then(|directory| directory.sync_all())
         .map_err(journal_io("sync barrier journal directory"))
 }
 
-fn journal_io(action: &'static str) -> impl FnOnce(std::io::Error) -> String {
+pub(crate) fn journal_io(action: &'static str) -> impl FnOnce(std::io::Error) -> String {
     move |error| format!("{action}: {error}")
 }
 
-struct JournalReader<'a> {
+pub(crate) struct JournalReader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> JournalReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
@@ -781,29 +781,29 @@ impl<'a> JournalReader<'a> {
         Ok(value)
     }
 
-    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], String> {
+    pub(crate) fn fixed<const N: usize>(&mut self) -> Result<[u8; N], String> {
         self.take(N)?
             .try_into()
             .map_err(|_| "truncated fixed field in barrier journal".to_owned())
     }
 
-    fn u8(&mut self) -> Result<u8, String> {
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
         Ok(self.fixed::<1>()?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, String> {
+    pub(crate) fn u16(&mut self) -> Result<u16, String> {
         Ok(u16::from_le_bytes(self.fixed()?))
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.fixed()?))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    pub(crate) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.fixed()?))
     }
 
-    fn optional_operation_id(&mut self) -> Result<Option<OperationId>, String> {
+    pub(crate) fn optional_operation_id(&mut self) -> Result<Option<OperationId>, String> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(OperationId::from_bytes(self.fixed()?))),
@@ -811,7 +811,7 @@ impl<'a> JournalReader<'a> {
         }
     }
 
-    fn count(&mut self) -> Result<usize, String> {
+    pub(crate) fn count(&mut self) -> Result<usize, String> {
         let count = usize::try_from(self.u32()?)
             .map_err(|_| "barrier journal count does not fit memory".to_owned())?;
         if count > self.bytes.len().saturating_sub(self.offset) {
@@ -820,11 +820,11 @@ impl<'a> JournalReader<'a> {
         Ok(count)
     }
 
-    fn bytes(&mut self, length: usize) -> Result<&'a [u8], String> {
+    pub(crate) fn bytes(&mut self, length: usize) -> Result<&'a [u8], String> {
         self.take(length)
     }
 
-    fn object_ref(&mut self) -> Result<ObjectRef, String> {
+    pub(crate) fn object_ref(&mut self) -> Result<ObjectRef, String> {
         let object_type = ObjectType::try_from(self.u16()?)
             .map_err(|error| format!("invalid object type in barrier journal: {error}"))?;
         let object_id = ObjectId::from_bytes(self.fixed()?);
@@ -839,7 +839,7 @@ impl<'a> JournalReader<'a> {
         })
     }
 
-    fn finish(self) -> Result<(), String> {
+    pub(crate) fn finish(self) -> Result<(), String> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
@@ -1294,6 +1294,10 @@ pub struct DurableVolume<S, C, J> {
     last_renewal: Option<Instant>,
     // Known ownership loss cannot be reversed beneath a mounted filesystem.
     fenced: bool,
+    // Monotone count of live-root barriers committed by this attachment.
+    committed_barriers: u64,
+    // Closed between the final capture drain barrier and publication/thaw.
+    mutations_closed: bool,
 }
 
 impl<S, C, J> DurableVolume<S, C, J>
@@ -1384,6 +1388,8 @@ where
             pending_replaces: None,
             last_renewal: None,
             fenced: false,
+            committed_barriers: 0,
+            mutations_closed: false,
         };
         if volume.pending.is_some() {
             volume.resume_pending()?;
@@ -1416,13 +1422,22 @@ where
             return Err(BarrierError::Fenced);
         }
         let result = self.flush_inner();
-        // A raw ControlError::Fenced can also mean that a concurrent heartbeat
-        // refreshed the exact grant. Stable attachment/epoch validation detects
-        // ownership loss without turning that recoverable race into a fence.
+        // Mutating authority RPCs classify ControlError::Fenced via
+        // `classify_fenced_error`: only a concurrent heartbeat that strictly
+        // extended the same writer grant remains unfenced; real ownership loss
+        // and authority owner restarts become `BarrierError::Fenced`.
+        // ControlError::Expired on a capture child may reflect an expired
+        // capture preparation rather than an expired writer/attachment.
+        let is_capture_child = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.capture_id.is_some());
         if matches!(
             &result,
-            Err(BarrierError::Fenced | BarrierError::Control(ControlError::Expired))
-        ) {
+            Err(BarrierError::Fenced | BarrierError::Control(ControlError::NotFound))
+        ) || (matches!(&result, Err(BarrierError::Control(ControlError::Expired)))
+            && !is_capture_child)
+        {
             self.fenced = true;
         }
         result
@@ -1445,7 +1460,13 @@ where
                     .filter(|capture| !capture.sealed)
                     .and_then(|capture| capture.pending_child)
                     && matches!(
-                        self.control.abort_operation(child_id)?,
+                        self.control.abort_operation(child_id).map_err(|error| {
+                            if matches!(error, ControlError::Fenced) {
+                                BarrierError::Fenced
+                            } else {
+                                error.into()
+                            }
+                        })?,
                         OperationState::Committed(_)
                     )
                 {
@@ -1494,6 +1515,147 @@ where
     /// Returns the current live roots observed by this attachment.
     pub const fn live_roots(&self) -> LiveRoots {
         self.live_roots
+    }
+
+    /// Returns the stable branch identity for this writable attachment.
+    pub const fn branch_id(&self) -> BranchId {
+        self.branch_id
+    }
+
+    /// Returns the stable attachment identity bound to this worker.
+    pub const fn attachment_id(&self) -> AttachmentId {
+        self.attachment_id
+    }
+
+    /// Returns the block-volume fencing epoch bound to this worker.
+    pub const fn volume_epoch(&self) -> u64 {
+        self.volume_epoch
+    }
+
+    /// Returns the latest writer grant observed for this worker's original grant identity.
+    pub const fn writer_grant(&self) -> WriterGrant {
+        self.writer_grant
+    }
+
+    /// Returns the workspace, caller, and object-store scope for this attachment.
+    pub const fn journal_scope(&self) -> BarrierJournalScope {
+        self.journal_scope
+    }
+
+    /// Returns the number of live-volume barriers committed by this handle.
+    pub const fn committed_barriers(&self) -> u64 {
+        self.committed_barriers
+    }
+
+    /// Returns the number of dirty extents currently buffered locally.
+    pub fn dirty_extent_count(&self) -> usize {
+        self.inner.dirty_extent_count()
+    }
+
+    /// Returns whether a durable barrier is currently unresolved.
+    pub const fn has_pending_barrier(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Returns the operation ID of an unresolved pending barrier, if any.
+    pub fn pending_barrier_operation_id(&self) -> Option<OperationId> {
+        self.pending.as_ref().map(|pending| pending.operation_id)
+    }
+
+    /// Returns whether this attachment has observed terminal fencing or lease expiry.
+    pub const fn is_fenced(&self) -> bool {
+        self.fenced
+    }
+
+    /// Permanently marks this attachment fenced so no further writes or barriers proceed.
+    pub fn mark_fenced(&mut self) {
+        self.fenced = true;
+    }
+
+    /// Returns whether block mutation admission is closed for capture sealing/publication.
+    pub const fn mutations_closed(&self) -> bool {
+        self.mutations_closed
+    }
+
+    /// Opens or closes block mutation admission while keeping reads available.
+    pub fn set_mutations_closed(&mut self, closed: bool) {
+        self.mutations_closed = closed;
+    }
+
+    /// Returns mutable access to the durable object store backing this attachment.
+    pub fn store_mut(&mut self) -> &mut S {
+        self.inner.store_mut()
+    }
+
+    /// Returns the authority control handle bound to this attachment.
+    pub const fn control(&self) -> &C {
+        &self.control
+    }
+
+    /// Syncs local branch metadata and base map to an authoritative branch snapshot.
+    ///
+    /// Never hot-switches a fenced attachment and never discards local dirty extents
+    /// or an unresolved barrier.
+    pub fn sync_branch_state(&mut self, branch: &BranchState) -> Result<(), BarrierError> {
+        if self.fenced {
+            return Err(BarrierError::Fenced);
+        }
+        let grant = match validate_attachment(
+            branch,
+            self.branch_id,
+            self.attachment_id,
+            self.volume_epoch,
+            self.writer_grant,
+        ) {
+            Ok(grant) => grant,
+            Err(BarrierError::Fenced) => {
+                self.fenced = true;
+                return Err(BarrierError::Fenced);
+            }
+            Err(error) => return Err(error),
+        };
+        if branch.volume_root != self.live_roots.volume {
+            if self.pending.is_some() || self.inner.dirty_extent_count() > 0 {
+                return Err(BarrierError::Conflict);
+            }
+            let map = self.inner.load_map(branch.volume_root)?;
+            self.inner.replace_base(map);
+        }
+        self.live_roots = roots(branch);
+        self.revision = branch.revision;
+        self.writer_grant = grant;
+        Ok(())
+    }
+
+    /// Reconciles an unresolved pending barrier that has already reached a terminal
+    /// state on the authority, preserving local dirty extents if it was aborted.
+    pub fn reconcile_pending_outcome(&mut self) -> Result<(), BarrierError> {
+        let Some(operation_id) = self.pending_barrier_operation_id() else {
+            return Ok(());
+        };
+        match self.control.get_operation(operation_id) {
+            Ok(OperationState::Committed(_)) => match self.finish_committed() {
+                Ok(()) => Ok(()),
+                Err(BarrierError::Fenced | BarrierError::Control(ControlError::NotFound)) => {
+                    self.fenced = true;
+                    Err(BarrierError::Fenced)
+                }
+                Err(error) => Err(error),
+            },
+            Ok(OperationState::Aborted) => {
+                self.finish_pending_journal(operation_id)?;
+                self.pending = None;
+                self.pending_map = None;
+                self.pending_replaces = None;
+                self.pending_journaled = false;
+                self.last_renewal = None;
+                Ok(())
+            }
+            Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {
+                Err(BarrierError::Conflict)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn refresh_clean_branch(&mut self) -> Result<(), BarrierError> {
@@ -1686,6 +1848,9 @@ where
                                 }
                                 continue;
                             }
+                            if matches!(error, ControlError::Fenced) {
+                                return Err(self.classify_fenced_error(saved_grant));
+                            }
                             return Err(error.into());
                         }
                     }
@@ -1721,6 +1886,9 @@ where
                             return Ok(());
                         }
                         continue;
+                    }
+                    Err(ControlError::Fenced) => {
+                        return Err(self.classify_fenced_error(current_grant));
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -1801,6 +1969,9 @@ where
                     }
                     continue;
                 }
+                Err(ControlError::Fenced) => {
+                    return Err(self.classify_fenced_error(current_grant));
+                }
                 Err(error) => return Err(error.into()),
             };
             if committed.volume_root != next_roots.volume {
@@ -1812,13 +1983,16 @@ where
                 .as_ref()
                 .ok_or(BarrierError::Conflict)?
                 .dirty_revision;
+            if self.inner.dirty_revision() != dirty_revision {
+                return Err(BlockError::BarrierUnresolved.into());
+            }
+            let writer_grant = committed.writer.ok_or(BarrierError::Fenced)?;
+            self.finish_pending_journal(operation_id)?;
             self.inner.commit_durable_map(map, dirty_revision)?;
             self.live_roots = roots(&committed);
             self.revision = committed.revision;
-            self.writer_grant = committed.writer.ok_or(BarrierError::Fenced)?;
-            self.journal
-                .finish_pending(operation_id)
-                .map_err(BarrierError::Journal)?;
+            self.writer_grant = writer_grant;
+            self.committed_barriers = self.committed_barriers.saturating_add(1);
             self.pending = None;
             self.pending_map = None;
             self.pending_replaces = None;
@@ -1905,7 +2079,16 @@ where
     }
 
     fn abort_and_restage(&mut self, operation_id: OperationId) -> Result<bool, BarrierError> {
-        match self.control.abort_operation(operation_id)? {
+        match self
+            .control
+            .abort_operation(operation_id)
+            .map_err(|error| {
+                if matches!(error, ControlError::Fenced) {
+                    BarrierError::Fenced
+                } else {
+                    error.into()
+                }
+            })? {
             OperationState::Committed(_) => {
                 self.finish_committed()?;
                 Ok(true)
@@ -2035,6 +2218,9 @@ where
                 self.ensure_pending_journaled()?;
                 return self.renew_preparation(grant);
             }
+            Err(ControlError::Fenced) => {
+                return Err(self.classify_fenced_error(renewal_grant));
+            }
             Err(error) => return Err(error.into()),
         }
         let pending = self.pending.as_mut().ok_or(BarrierError::Conflict)?;
@@ -2050,6 +2236,57 @@ where
             return Err(error);
         }
         self.last_renewal = Some(Instant::now());
+        Ok(())
+    }
+
+    fn classify_fenced_error(&self, used_grant: WriterGrant) -> BarrierError {
+        match self.control.get_branch(self.branch_id) {
+            Ok(branch) => match validate_attachment(
+                &branch,
+                self.branch_id,
+                self.attachment_id,
+                self.volume_epoch,
+                used_grant,
+            ) {
+                Ok(refreshed)
+                    if same_grant_identity(used_grant, refreshed)
+                        && refreshed.expires_at > used_grant.expires_at =>
+                {
+                    BarrierError::Control(ControlError::Fenced)
+                }
+                Ok(_) | Err(BarrierError::Fenced) => BarrierError::Fenced,
+                Err(error) => error,
+            },
+            Err(ControlError::NotFound) => BarrierError::Fenced,
+            Err(error) => BarrierError::Control(error),
+        }
+    }
+
+    fn finish_pending_journal(&mut self, operation_id: OperationId) -> Result<(), BarrierError> {
+        if self.pending_journaled {
+            self.journal
+                .finish_pending(operation_id)
+                .map_err(BarrierError::Journal)?;
+            return Ok(());
+        }
+        match self.journal.load_pending().map_err(BarrierError::Journal)? {
+            Some(on_disk) if on_disk.operation_id == operation_id => {
+                self.journal
+                    .finish_pending(operation_id)
+                    .map_err(BarrierError::Journal)?;
+            }
+            Some(on_disk) if self.pending_replaces == Some(on_disk.operation_id) => {
+                self.journal
+                    .finish_pending(on_disk.operation_id)
+                    .map_err(BarrierError::Journal)?;
+            }
+            None => {}
+            Some(_) => {
+                return Err(BarrierError::Journal(
+                    "on-disk pending barrier does not match in-memory replacement".to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -2075,7 +2312,12 @@ where
         } else {
             self.inner.load_map(branch.volume_root)?
         };
-        if self.inner.dirty_extent_count() > 0 {
+        let has_dirty = self.inner.dirty_extent_count() > 0;
+        if has_dirty && self.inner.dirty_revision() != dirty_revision {
+            return Err(BlockError::BarrierUnresolved.into());
+        }
+        self.finish_pending_journal(operation_id)?;
+        if has_dirty {
             self.inner.commit_durable_map(map, dirty_revision)?;
         } else {
             self.inner.replace_base(map);
@@ -2083,9 +2325,7 @@ where
         self.live_roots = roots(&branch);
         self.revision = branch.revision;
         self.writer_grant = grant;
-        self.journal
-            .finish_pending(operation_id)
-            .map_err(BarrierError::Journal)?;
+        self.committed_barriers = self.committed_barriers.saturating_add(1);
         self.pending = None;
         self.pending_map = None;
         self.pending_replaces = None;
@@ -2118,6 +2358,9 @@ where
                 if self.fenced {
                     return Err(BlockError::Barrier(BarrierError::Fenced.to_string()));
                 }
+                if self.mutations_closed {
+                    return Err(BlockError::MutationAdmissionClosed);
+                }
                 if self.pending.is_some() {
                     return Err(BlockError::BarrierUnresolved);
                 }
@@ -2128,10 +2371,14 @@ where
                 }
                 Ok(BlockResponse::Written(data.len()))
             }
-            BlockRequest::Flush => self
-                .flush()
-                .map(|()| BlockResponse::Written(0))
-                .map_err(|error| BlockError::Barrier(error.to_string())),
+            BlockRequest::Flush => {
+                if self.mutations_closed {
+                    return Err(BlockError::MutationAdmissionClosed);
+                }
+                self.flush()
+                    .map(|()| BlockResponse::Written(0))
+                    .map_err(|error| BlockError::Barrier(error.to_string()))
+            }
             BlockRequest::Unsupported(operation) => {
                 Err(BlockError::UnsupportedOperation(operation))
             }
@@ -2147,14 +2394,14 @@ fn roots(branch: &BranchState) -> LiveRoots {
     }
 }
 
-fn same_grant_identity(left: WriterGrant, right: WriterGrant) -> bool {
+pub(crate) fn same_grant_identity(left: WriterGrant, right: WriterGrant) -> bool {
     left.branch_id == right.branch_id
         && left.writer_epoch == right.writer_epoch
         && left.owner_incarnation == right.owner_incarnation
         && left.grant_id == right.grant_id
 }
 
-fn validate_attachment(
+pub(crate) fn validate_attachment(
     branch: &BranchState,
     branch_id: BranchId,
     attachment_id: AttachmentId,

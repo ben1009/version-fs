@@ -70,6 +70,18 @@ Once stable attachment fencing or terminal lease expiry is observed, the worker
 rejects further writes and barriers. Dirty data and pending journal records remain
 available for salvage. Committed-barrier recovery revalidates the original
 attachment before changing its local base or clearing its journal.
+Checkpoint capture coordination (`versionfs_sdk::capture`) persists capture and
+freeze intent in a separate private Unix directory outside the exported volume.
+`block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount` keep block
+service active while establishing the boundary, close block mutation admission
+before sealing, and reconcile unknown authority outcomes before thawing or
+reopening admission. A definite capture-token acquisition conflict tombstones
+the abandoned attempt ID and restarts Step 1 with a fresh operation ID and
+drain. Branch lifecycle transitions (`create_branch`, `move_head`, `promote`,
+`delete_branch`, and `force_acquire_writer`) enforce exact revision/epoch CAS,
+explicit `discard_live_state` when durable live roots differ from head, and
+attachment/writer fencing without hot-rebasing a mounted device. Real Linux
+`fsfreeze`, clean-unmount, ublk, and real-S3 qualification remain pending.
 
 ## Setup and tools
 

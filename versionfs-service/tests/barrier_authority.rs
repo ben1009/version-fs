@@ -459,3 +459,107 @@ fn branch_reads_reconcile_unknown_capture_cleanup_without_a_pending_barrier() {
             .unwrap();
     }
 }
+
+#[test]
+fn move_head_and_delete_branch_fence_mounted_volume_without_hot_rebasing() {
+    let fixture = Fixture::new();
+    let ctrl = control(fixture.authority.clone(), fixture.owner);
+    let mut worker = fixture.open();
+
+    // Write local dirty bytes to the mounted volume, then reset the branch head
+    // via move_head (rolling back to G1) without flushing.
+    worker
+        .dispatch(BlockRequest::Write {
+            offset: 4096,
+            data: &[0xAB; 4096],
+            fua: false,
+        })
+        .unwrap();
+    let initial_head = ctrl.get_branch(branch()).unwrap().head;
+    let moved = ctrl
+        .move_head(op(30), branch(), 1, initial_head, fixture.grant, false)
+        .expect("move_head revokes attachment and advances epochs");
+    assert!(moved.attachment.is_none());
+
+    // The old mounted volume must be fenced on persistence, reject new writes,
+    // never hot-switch its backing root, and preserve local dirty bytes for salvage.
+    assert!(matches!(worker.flush(), Err(BarrierError::Fenced)));
+    assert!(worker.is_fenced());
+    assert!(
+        worker
+            .dispatch(BlockRequest::Write {
+                offset: 8192,
+                data: &[0xCD; 4096],
+                fua: false,
+            })
+            .is_err()
+    );
+    assert_eq!(
+        worker
+            .dispatch(BlockRequest::Read {
+                offset: 4096,
+                length: 4096,
+            })
+            .unwrap(),
+        BlockResponse::Read(vec![0xAB; 4096])
+    );
+
+    // Now test delete_branch fencing a live volume on a forked branch.
+    let fork_id = BranchId::from_bytes([9; 16]);
+    ctrl.create_branch(op(31), fork_id, "ephemeral", initial_head)
+        .unwrap();
+    let fork_grant = ctrl.acquire_writer(op(32), fork_id, 1, 0).unwrap();
+    let fork_att = AttachmentId::from_bytes([9; 16]);
+    ctrl.attach_volume(
+        op(33),
+        fork_id,
+        1,
+        fork_grant,
+        fork_att,
+        ProtectionId::from_bytes([33; 16]),
+    )
+    .unwrap();
+    let fork_journal = TestDirectory::new();
+    let mut fork_worker = DurableVolume::open(
+        fixture.store.clone(),
+        control(fixture.authority.clone(), fixture.owner),
+        FileBarrierJournal::open(&fork_journal.0).unwrap(),
+        fork_id,
+        fork_grant,
+        fork_att,
+        EXTENT_BYTES as usize,
+    )
+    .unwrap();
+    fork_worker
+        .dispatch(BlockRequest::Write {
+            offset: 0,
+            data: &[0xEF; 4096],
+            fua: false,
+        })
+        .unwrap();
+    ctrl.delete_branch(op(34), fork_id, 1, fork_grant, false)
+        .expect("delete forked branch");
+    assert!(matches!(
+        fork_worker.flush(),
+        Err(BarrierError::Control(ControlError::NotFound))
+    ));
+    assert!(fork_worker.is_fenced());
+    assert!(
+        fork_worker
+            .dispatch(BlockRequest::Write {
+                offset: 4096,
+                data: &[0x11; 4096],
+                fua: false,
+            })
+            .is_err()
+    );
+    assert_eq!(
+        fork_worker
+            .dispatch(BlockRequest::Read {
+                offset: 0,
+                length: 4096,
+            })
+            .unwrap(),
+        BlockResponse::Read(vec![0xEF; 4096])
+    );
+}

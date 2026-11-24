@@ -318,32 +318,35 @@ their mutation protocols and connects them to this same coordinator.
   verification to initial workspace creation and standalone Generation catalog
   publication. Equal view roots may have different Generation contexts; changed
   attribution on the same operation ID rejects.
-- [ ] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
+- [x] Implement `block_cut`, `filesystem_frozen`, and `filesystem_clean_unmount`
   boundaries, persisting only the mode actually established and rejecting unknown modes.
-- [ ] Close local admission, read authoritative revision/live roots together,
+- [x] Close local admission, read authoritative revision/live roots together,
   then drain producers and acquire the capture token against those exact pre-drain
   preconditions. Keep the worker's original writer grant, attachment identity,
   and fencing epochs; never adopt a new owner.
   A definite conflict restarts capture with a new operation ID and a fresh drain;
   never refresh roots and reuse the old cut. Reconcile unknown acquisition first.
-- [ ] Keep block service alive during freeze or clean unmount; drain permitted
+- [x] Keep block service alive during freeze or clean unmount; drain permitted
   child barriers, then stop block mutation admission and seal the volume root,
   canonical empty native roots, and final revision through the common-cut framework.
-- [ ] Publish attached/detached Generations with retention/outcome/capture-token
+- [x] Publish attached/detached Generations with retention/outcome/capture-token
   changes atomically. Reconcile/sync the local result before thaw/reopening.
-- [ ] Implement metadata-only fork, conditional adoption/rollback/promotion/delete,
+- [x] Implement metadata-only fork, conditional adoption/rollback/promotion/delete,
   stable identity/revision CAS, volume/stream/writer fencing, and explicit live-state
   discard. Never swap a backing root beneath a mounted filesystem.
-- [ ] Coordinate watchdog/restart cleanup of freeze intent outside the mounted
+- [x] Coordinate watchdog/restart cleanup of freeze intent outside the mounted
   volume. An aborted capture does not undo a previously acknowledged child flush.
 
-**Exit evidence:** failed freeze/CAS/descriptor upload never publishes a false
-checkpoint. Any live mutation between the pre-drain root read and token CAS forces
-a fresh capture/drain, including a legitimate drain-time volume barrier. Never
-retry by refreshing only the revision/roots. Ownership changes fence the original
-worker. All three capture modes have distinct descriptor and recovery tests.
-Fork does not walk volume extents; journal replay uses a writable fork;
-name reuse and old-device commits cannot affect the new branch state.
+**Exit evidence:** deterministic protocol tests and toy-kv authority tests verify
+the capture coordinator, durable capture/freeze intent journal, provenance binding,
+and branch lifecycle transitions: failed freeze/unmount/CAS/descriptor upload never
+publishes a false checkpoint; any live mutation between the pre-drain root read and
+token CAS forces a fresh capture/drain (including a legitimate drain-time barrier
+or log mutation) without rebasing the old cut; ownership changes fence the original
+worker without adopting a replacement owner; all three capture modes persist and
+recover their exact mode; metadata-only fork does not walk volume extents; name
+reuse, ABA revision checks, explicit live-state discard, and old-device fencing
+prevent stale writes from affecting reset or recreated branches.
 Recorded and unattributed bindings, as well as legacy descriptors, round-trip
 unambiguously. Missing or corrupt required context or evidence prevents
 publication. Capture admission fixes the provenance binding in the operation
@@ -351,9 +354,12 @@ fingerprint; publication and lost-reply reconciliation preserve that binding.
 On first publication, the authenticated caller must match the context's
 recording principal. A retry with mismatching provenance cannot replace a
 committed binding. Identical view roots can be published in different
-Generations with distinct verified contexts. I16 remains incomplete until
-protected inspection, retention closure, and the remaining acceptance campaign
-are implemented.
+Generations with distinct verified contexts.
+This qualifies the backend-neutral P7 coordinator and authority protocols against
+toy-kv, the `FilesystemBoundary` trait, and test object stores; real Linux
+`fsfreeze`, real clean-unmount, ext4 journal replay on a writable fork, ublk
+integration, real-S3 runs, and the remaining I16 gates (protected inspection,
+retention closure, and acceptance campaigns) remain pending in P9/P10/P11/P12.
 
 ### P8. Native logs and artifacts
 
