@@ -10,6 +10,7 @@
 //! before thawing or reopening admission, without inferring publication from a
 //! local freeze flag or undoing already-committed drain barriers.
 
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -27,19 +28,21 @@ use versionfs_core::format::{
 };
 use versionfs_core::graph::DependencyProof;
 use versionfs_core::identity::{
-    AttachmentId, BranchId, GenerationId, ObjectStoreScopeId, OperationId, PrincipalId,
+    AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PrincipalId,
     ProtectionId, VolumeBoundaryId, WorkspaceId,
 };
 use versionfs_core::metadata::{MetadataAuthority, MetadataError};
-use versionfs_core::persistent_map::DurableObjectStore;
+use versionfs_core::persistent_map::{DurableObjectStore, MapObjectStore};
 
+#[cfg(unix)]
+use crate::barrier::restrict_journal_directory;
 use crate::barrier::{
     BarrierError, BarrierJournal, BarrierJournalScope, DurableVolume, JournalReader,
     VolumeBarrierControl, atomic_replace, create_generation_with_reuse_and_provenance,
     decode_checked, decode_grant, decode_roots, encode_checked, encode_grant,
     encode_optional_operation_id, encode_ref, encode_roots, journal_io, push_u64,
-    restrict_journal_directory, same_grant_identity, set_private_creation_mode, sync_directory,
-    validate_attachment, validate_roots,
+    same_grant_identity, set_private_creation_mode, sync_directory, validate_attachment,
+    validate_roots,
 };
 use crate::volume::BlockDevice;
 
@@ -231,7 +234,7 @@ impl FileCaptureJournal {
     #[cfg(unix)]
     fn open_unix(directory: &Path, failures: Arc<dyn FailureInjector>) -> Result<Self, String> {
         let directory = directory.to_path_buf();
-        fs::create_dir_all(&directory).map_err(journal_io("create capture journal directory"))?;
+        create_dir_all_durable(&directory)?;
         restrict_journal_directory(&directory)?;
         let ids_path = directory.join("capture-ids.v1");
         let pending_path = directory.join("pending-capture.v1");
@@ -921,7 +924,8 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
             return self.abort_and_return_error(volume, producers, boundary, &mut pending, error);
         }
 
-        // Step 4: Renew capture preparation if due, then build, durably store,
+        // Step 4: Renew capture preparation if due (and throughout descriptor
+        // upload and dependency-graph verification), then build, durably store,
         // and verify the complete Generation descriptor.
         if let Err(error) = self.renew_if_due(volume, &mut pending) {
             if is_unknown_capture_error(&error) {
@@ -929,25 +933,25 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
             }
             return self.abort_and_return_error(volume, producers, boundary, &mut pending, error);
         }
-        let verified = match create_generation_with_reuse_and_provenance(
-            volume.store_mut(),
-            pending.generation_id,
-            Some(pending.expected_parent),
+        let verified = match self.create_verified_generation_with_renewal(
+            volume,
+            &mut pending,
             expected_sealed_roots,
-            pending.mode,
-            pending.boundary_id,
-            pending.created_at_unix_ms,
-            pending.provenance,
             protected_proofs,
         ) {
             Ok(seed) => seed,
+            Err(error) if is_unknown_capture_error(&error) => {
+                // Pause object work and publication until the unresolved
+                // renewal operation ID is reconciled.
+                return Err(error);
+            }
             Err(error) => {
                 return self.abort_and_return_error(
                     volume,
                     producers,
                     boundary,
                     &mut pending,
-                    CaptureError::Barrier(error),
+                    error,
                 );
             }
         };
@@ -1089,6 +1093,127 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         }
     }
 
+    /// Reconciles an interrupted capture or freeze intent without requiring the
+    /// original [`DurableVolume`] handle.
+    ///
+    /// Use this watchdog entry point after worker loss and writer takeover when
+    /// the original attachment can no longer be reopened via
+    /// [`DurableVolume::open`]. It verifies the caller's principal and
+    /// object-store scope against the journal, reconciles or aborts the capture
+    /// operation on the authority, thaws `boundary` if `freeze_active`, reopens
+    /// `producers`, and clears the capture journal without mutating or rebasing
+    /// any replacement volume.
+    pub fn recover_pending_capture_detached<C, P, B>(
+        &mut self,
+        control: &C,
+        producers: &mut P,
+        boundary: &mut B,
+    ) -> Result<RecoveredCapture, CaptureError>
+    where
+        C: CaptureControl,
+        P: ProducerGate,
+        B: FilesystemBoundary,
+    {
+        let Some(mut pending) = self.journal.load_pending().map_err(CaptureError::Journal)? else {
+            return Ok(RecoveredCapture::None);
+        };
+        if pending.scope.principal_id != control.principal_id()
+            || pending.scope.object_store_scope != control.object_store_scope()
+        {
+            return Err(CaptureError::JournalScopeMismatch);
+        }
+
+        let finish_detached_abort = |coordinator: &mut Self,
+                                     producers: &mut P,
+                                     boundary: &mut B,
+                                     pending: &mut PendingCapture|
+         -> Result<RecoveredCapture, CaptureError> {
+            let mut freeze_thawed = false;
+            if pending.freeze_active {
+                boundary.thaw().map_err(CaptureError::ThawFailed)?;
+                pending.freeze_active = false;
+                freeze_thawed = true;
+            }
+            producers
+                .reopen_admission()
+                .map_err(CaptureError::Producer)?;
+            coordinator
+                .journal
+                .finish_pending(pending.capture_id)
+                .map_err(CaptureError::Journal)?;
+            coordinator.last_renewal = None;
+            coordinator.last_renewal_attempt = None;
+            Ok(RecoveredCapture::Aborted {
+                capture_id: pending.capture_id,
+                freeze_thawed,
+            })
+        };
+
+        let finish_detached_publish = |coordinator: &mut Self,
+                                       producers: &mut P,
+                                       boundary: &mut B,
+                                       pending: &mut PendingCapture,
+                                       branch_bytes: &[u8]|
+         -> Result<RecoveredCapture, CaptureError> {
+            let committed_branch = decode_branch_operation_result(branch_bytes)?;
+            let published = PublishedGeneration {
+                generation_id: pending.generation_id,
+                branch: committed_branch,
+                head_advanced: pending.advance_head,
+            };
+            if pending.freeze_active {
+                boundary.thaw().map_err(CaptureError::ThawFailed)?;
+                pending.freeze_active = false;
+            }
+            producers
+                .reopen_admission()
+                .map_err(CaptureError::Producer)?;
+            coordinator
+                .journal
+                .finish_pending(pending.capture_id)
+                .map_err(CaptureError::Journal)?;
+            coordinator.last_renewal = None;
+            coordinator.last_renewal_attempt = None;
+            Ok(RecoveredCapture::Published(Box::new(published)))
+        };
+
+        match control.get_operation(pending.capture_id) {
+            Ok(OperationState::Committed(branch_bytes)) => {
+                finish_detached_publish(self, producers, boundary, &mut pending, &branch_bytes)
+            }
+            Ok(OperationState::Aborted) => {
+                finish_detached_abort(self, producers, boundary, &mut pending)
+            }
+            Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => {
+                let authority_child = match control.get_branch(pending.branch_id) {
+                    Ok(branch) => branch
+                        .capture
+                        .filter(|capture| capture.operation_id == pending.capture_id)
+                        .and_then(|capture| capture.pending_child),
+                    Err(ControlError::NotFound) => None,
+                    Err(error) => return Err(CaptureError::Control(error)),
+                };
+                if let Some(child_id) = authority_child {
+                    self.abort_uncommitted_child_operation(control, child_id)?;
+                }
+                match control.abort_operation(pending.capture_id)? {
+                    OperationState::Committed(branch_bytes) => finish_detached_publish(
+                        self,
+                        producers,
+                        boundary,
+                        &mut pending,
+                        &branch_bytes,
+                    ),
+                    OperationState::Aborted => {
+                        finish_detached_abort(self, producers, boundary, &mut pending)
+                    }
+                    OperationState::Preparing { .. } => Err(CaptureError::Conflict),
+                }
+            }
+            Err(error) => Err(CaptureError::Control(error)),
+        }
+    }
+
     /// Resumes an interrupted capture that already reached `Publishing` with a
     /// sealed tuple and verified descriptor, or reconciles a committed outcome.
     ///
@@ -1163,18 +1288,14 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
             return self.recover_pending_capture(volume, producers, boundary);
         }
 
-        let verified = match create_generation_with_reuse_and_provenance(
-            volume.store_mut(),
-            pending.generation_id,
-            Some(pending.expected_parent),
+        let verified = match self.create_verified_generation_with_renewal(
+            volume,
+            &mut pending,
             sealed_roots,
-            pending.mode,
-            pending.boundary_id,
-            pending.created_at_unix_ms,
-            pending.provenance,
             protected_proofs,
         ) {
             Ok(seed) => seed,
+            Err(error) if is_unknown_capture_error(&error) => return Err(error),
             Err(_) => return self.recover_pending_capture(volume, producers, boundary),
         };
         if pending
@@ -1332,19 +1453,19 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                 Ok(()) => return Ok((pending, pre_drain)),
                 Err(CaptureError::Control(ControlError::Conflict)) => {
                     // Definite conflict: tombstone this attempt's operation ID,
-                    // release local intent, reopen admission, and restart Step 1
-                    // with a new capture ID and a fresh drain. Never rebase.
+                    // reopen admission before clearing local intent, and restart
+                    // Step 1 with a new capture ID and a fresh drain. Never rebase.
                     match volume.control().abort_operation(ids.capture_id) {
                         Ok(OperationState::Aborted) => {}
                         Ok(_) => return Err(CaptureError::Conflict),
                         Err(error) => return Err(CaptureError::Control(error)),
                     }
-                    self.journal
-                        .finish_pending(ids.capture_id)
-                        .map_err(CaptureError::Journal)?;
                     producers
                         .reopen_admission()
                         .map_err(CaptureError::Producer)?;
+                    self.journal
+                        .finish_pending(ids.capture_id)
+                        .map_err(CaptureError::Journal)?;
                     if attempt == self.config.max_acquisition_retries {
                         return Err(CaptureError::Conflict);
                     }
@@ -1356,47 +1477,43 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                 Err(error) => {
                     let mut final_error = error;
                     if matches!(&final_error, CaptureError::Control(ControlError::Fenced)) {
-                        match volume.control().get_branch(branch_id) {
-                            Ok(refreshed_branch) => {
-                                match validate_attachment(
-                                    &refreshed_branch,
-                                    branch_id,
-                                    attachment_id,
-                                    volume_epoch,
-                                    original_grant,
-                                ) {
-                                    Ok(refreshed_grant)
-                                        if refreshed_grant.expires_at
-                                            > current_grant.expires_at =>
-                                    {
-                                        // An independent heartbeat renewed the same writer grant
-                                        // during drain_producers(). Tombstone this attempt ID and
-                                        // restart Step 1 cleanly with the refreshed grant.
-                                        match volume.control().abort_operation(ids.capture_id) {
-                                            Ok(OperationState::Aborted) => {}
-                                            Ok(_) => return Err(CaptureError::Conflict),
-                                            Err(abort_err) => {
-                                                return Err(CaptureError::Control(abort_err));
-                                            }
-                                        }
-                                        self.journal
-                                            .finish_pending(ids.capture_id)
-                                            .map_err(CaptureError::Journal)?;
-                                        producers
-                                            .reopen_admission()
-                                            .map_err(CaptureError::Producer)?;
-                                        if attempt == self.config.max_acquisition_retries {
-                                            return Err(CaptureError::Conflict);
-                                        }
-                                        continue;
-                                    }
-                                    Ok(_) | Err(_) => {
-                                        volume.mark_fenced();
-                                        final_error = CaptureError::Fenced;
+                        match volume.control().check_attachment_live(
+                            branch_id,
+                            attachment_id,
+                            volume_epoch,
+                            original_grant,
+                        ) {
+                            Ok(refreshed_grant)
+                                if refreshed_grant.expires_at > current_grant.expires_at =>
+                            {
+                                // An independent heartbeat renewed the same writer grant
+                                // during drain_producers(). Tombstone this attempt ID,
+                                // reopen admission before clearing local intent, and
+                                // restart Step 1 cleanly with the refreshed grant.
+                                match volume.control().abort_operation(ids.capture_id) {
+                                    Ok(OperationState::Aborted) => {}
+                                    Ok(_) => return Err(CaptureError::Conflict),
+                                    Err(abort_err) => {
+                                        return Err(CaptureError::Control(abort_err));
                                     }
                                 }
+                                producers
+                                    .reopen_admission()
+                                    .map_err(CaptureError::Producer)?;
+                                self.journal
+                                    .finish_pending(ids.capture_id)
+                                    .map_err(CaptureError::Journal)?;
+                                if attempt == self.config.max_acquisition_retries {
+                                    return Err(CaptureError::Conflict);
+                                }
+                                continue;
                             }
-                            Err(ControlError::NotFound) => {
+                            Ok(_)
+                            | Err(
+                                ControlError::Fenced
+                                | ControlError::Expired
+                                | ControlError::NotFound,
+                            ) => {
                                 volume.mark_fenced();
                                 final_error = CaptureError::Fenced;
                             }
@@ -1417,14 +1534,15 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                         volume.mark_fenced();
                     }
 
-                    // Only clear the local capture intent and reopen admission once
-                    // the authority confirms this attempt ID is durably aborted.
+                    // Only clear the local capture intent once the authority
+                    // confirms this attempt ID is durably aborted and producer
+                    // admission has reopened.
                     if matches!(
                         volume.control().abort_operation(ids.capture_id),
                         Ok(OperationState::Aborted)
-                    ) {
+                    ) && producers.reopen_admission().is_ok()
+                    {
                         let _ = self.journal.finish_pending(ids.capture_id);
-                        let _ = producers.reopen_admission();
                     }
                     return Err(final_error);
                 }
@@ -1561,6 +1679,16 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                     volume.mark_fenced();
                     return Err(CaptureError::Fenced);
                 }
+                Err(CaptureError::Control(ControlError::Expired)) => {
+                    // Distinguish terminal writer/attachment expiry from
+                    // capture-only preparation expiry.
+                    if let Err(CaptureError::Fenced) =
+                        self.validate_live_worker(volume, original_grant)
+                    {
+                        return Err(CaptureError::Fenced);
+                    }
+                    return Err(CaptureError::Control(ControlError::Expired));
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -1611,10 +1739,75 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                     volume.mark_fenced();
                     return Err(CaptureError::Fenced);
                 }
+                Err(ControlError::Expired) => {
+                    if let Err(CaptureError::Fenced) =
+                        self.validate_live_worker(volume, original_grant)
+                    {
+                        return Err(CaptureError::Fenced);
+                    }
+                    return Err(CaptureError::Control(ControlError::Expired));
+                }
                 Err(error) => return Err(CaptureError::Control(error)),
             }
         }
         Err(CaptureError::Conflict)
+    }
+
+    fn create_verified_generation_with_renewal<S, C, BJ>(
+        &mut self,
+        volume: &mut DurableVolume<S, C, BJ>,
+        pending: &mut PendingCapture,
+        sealed_roots: LiveRoots,
+        protected_proofs: &[&DependencyProof],
+    ) -> Result<VerifiedGenerationSeed, CaptureError>
+    where
+        S: DurableObjectStore,
+        C: CaptureControl,
+        BJ: BarrierJournal,
+    {
+        let branch_id = volume.branch_id();
+        let attachment_id = volume.attachment_id();
+        let volume_epoch = volume.volume_epoch();
+        let generation_id = pending.generation_id;
+        let expected_parent = pending.expected_parent;
+        let mode = pending.mode;
+        let boundary_id = pending.boundary_id;
+        let created_at_unix_ms = pending.created_at_unix_ms;
+        let provenance = pending.provenance;
+
+        let (result, renewal_error) = {
+            let (store, control) = volume.store_and_control_mut();
+            let mut renewing_store = RenewingObjectStore {
+                store,
+                control,
+                coordinator: RefCell::new(self),
+                pending: RefCell::new(pending),
+                branch_id,
+                attachment_id,
+                volume_epoch,
+                renewal_error: RefCell::new(None),
+            };
+            let result = create_generation_with_reuse_and_provenance(
+                &mut renewing_store,
+                generation_id,
+                Some(expected_parent),
+                sealed_roots,
+                mode,
+                boundary_id,
+                created_at_unix_ms,
+                provenance,
+                protected_proofs,
+            );
+            let renewal_error = renewing_store.renewal_error.into_inner();
+            (result, renewal_error)
+        };
+        if let Some(error) = renewal_error {
+            if matches!(error, CaptureError::Fenced) {
+                volume.mark_fenced();
+            }
+            return Err(error);
+        }
+        result.map_err(CaptureError::Barrier)
     }
 
     fn renew_if_due<S, C, BJ>(
@@ -1627,6 +1820,33 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         C: CaptureControl,
         BJ: BarrierJournal,
     {
+        let branch_id = volume.branch_id();
+        let attachment_id = volume.attachment_id();
+        let volume_epoch = volume.volume_epoch();
+        match self.renew_if_due_with_control(
+            volume.control(),
+            branch_id,
+            attachment_id,
+            volume_epoch,
+            pending,
+        ) {
+            Ok(()) => Ok(()),
+            Err(CaptureError::Fenced) => {
+                volume.mark_fenced();
+                Err(CaptureError::Fenced)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn renew_if_due_with_control<C: CaptureControl>(
+        &mut self,
+        control: &C,
+        branch_id: BranchId,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        pending: &mut PendingCapture,
+    ) -> Result<(), CaptureError> {
         const MAX_GRANT_REFRESH_RETRIES: usize = 2;
         let unresolved = pending.renewal_operation_id.is_some();
         let due = self
@@ -1644,14 +1864,14 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         // - Aborted: clear and issue a fresh renewal.
         // - NotFound: retry the exact same renewal_operation_id.
         if let Some(existing_id) = pending.renewal_operation_id {
-            let attempt_stale = self
-                .last_renewal_attempt
-                .is_none_or(|last| last.elapsed() >= self.config.renewal_interval);
-            match volume.control().get_operation(existing_id) {
+            match control.get_operation(existing_id) {
                 Ok(OperationState::Committed(_)) => {
                     pending.renewal_operation_id = None;
                     pending.renewal_grant = None;
                     self.persist(pending)?;
+                    let attempt_stale = self
+                        .last_renewal_attempt
+                        .is_none_or(|last| last.elapsed() >= self.config.renewal_interval);
                     if !attempt_stale {
                         self.last_renewal = self.last_renewal_attempt;
                         return Ok(());
@@ -1667,7 +1887,13 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
             }
         }
 
-        let current_grant = self.validate_live_worker(volume, pending.writer_grant)?;
+        let current_grant = Self::validate_live_worker_with_control(
+            control,
+            branch_id,
+            attachment_id,
+            volume_epoch,
+            pending.writer_grant,
+        )?;
         let (mut renewal_id, mut renewal_grant) =
             match (pending.renewal_operation_id, pending.renewal_grant) {
                 (Some(id), Some(grant)) => (id, grant),
@@ -1690,10 +1916,7 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
 
         for refresh_attempt in 0..=MAX_GRANT_REFRESH_RETRIES {
             self.last_renewal_attempt = Some(Instant::now());
-            match volume
-                .control()
-                .renew_preparation(renewal_id, pending.capture_id, renewal_grant)
-            {
+            match control.renew_preparation(renewal_id, pending.capture_id, renewal_grant) {
                 Ok(_) => {
                     pending.renewal_operation_id = None;
                     pending.renewal_grant = None;
@@ -1704,7 +1927,13 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                     return Ok(());
                 }
                 Err(error @ (ControlError::Expired | ControlError::Fenced)) => {
-                    let refreshed = self.validate_live_worker(volume, pending.writer_grant)?;
+                    let refreshed = Self::validate_live_worker_with_control(
+                        control,
+                        branch_id,
+                        attachment_id,
+                        volume_epoch,
+                        pending.writer_grant,
+                    )?;
                     if same_grant_identity(renewal_grant, refreshed)
                         && refreshed.expires_at > renewal_grant.expires_at
                     {
@@ -1723,7 +1952,6 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
                         continue;
                     }
                     if matches!(error, ControlError::Fenced) {
-                        volume.mark_fenced();
                         return Err(CaptureError::Fenced);
                     }
                     return Err(CaptureError::Control(error));
@@ -1744,27 +1972,36 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         C: CaptureControl,
         BJ: BarrierJournal,
     {
-        let branch = match volume.control().get_branch(volume.branch_id()) {
-            Ok(branch) => branch,
-            Err(ControlError::NotFound) => {
-                volume.mark_fenced();
-                return Err(CaptureError::Fenced);
-            }
-            Err(error) => return Err(CaptureError::Control(error)),
-        };
-        match validate_attachment(
-            &branch,
+        match Self::validate_live_worker_with_control(
+            volume.control(),
             volume.branch_id(),
             volume.attachment_id(),
             volume.volume_epoch(),
             original_grant,
         ) {
             Ok(grant) => Ok(grant),
-            Err(BarrierError::Fenced) => {
+            Err(CaptureError::Fenced) => {
                 volume.mark_fenced();
                 Err(CaptureError::Fenced)
             }
-            Err(error) => Err(CaptureError::Barrier(error)),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn validate_live_worker_with_control<C: CaptureControl>(
+        control: &C,
+        branch_id: BranchId,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        original_grant: WriterGrant,
+    ) -> Result<WriterGrant, CaptureError> {
+        match control.check_attachment_live(branch_id, attachment_id, volume_epoch, original_grant)
+        {
+            Ok(grant) => Ok(grant),
+            Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound) => {
+                Err(CaptureError::Fenced)
+            }
+            Err(error) => Err(CaptureError::Control(error)),
         }
     }
 
@@ -1792,12 +2029,13 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         if let Some(child_id) = authority_child {
             self.abort_uncommitted_child_operation(volume.control(), child_id)?;
         }
-        self.resolve_local_pending_barrier_for_abort(volume, authority_child)
+        self.resolve_local_pending_barrier_for_abort(volume, pending.capture_id, authority_child)
     }
 
     fn resolve_local_pending_barrier_for_abort<S, C, BJ>(
         &self,
         volume: &mut DurableVolume<S, C, BJ>,
+        capture_id: OperationId,
         already_resolved: Option<OperationId>,
     ) -> Result<(), CaptureError>
     where
@@ -1805,7 +2043,9 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         C: CaptureControl,
         BJ: BarrierJournal,
     {
-        if let Some(local_child_id) = volume.pending_barrier_operation_id() {
+        if volume.pending_barrier_capture_id() == Some(capture_id)
+            && let Some(local_child_id) = volume.pending_barrier_operation_id()
+        {
             if Some(local_child_id) != already_resolved {
                 self.abort_uncommitted_child_operation(volume.control(), local_child_id)?;
             }
@@ -1896,7 +2136,7 @@ impl<J: CaptureJournal> CheckpointCoordinator<J> {
         P: ProducerGate,
         B: FilesystemBoundary,
     {
-        self.resolve_local_pending_barrier_for_abort(volume, None)?;
+        self.resolve_local_pending_barrier_for_abort(volume, pending.capture_id, None)?;
         match volume.control().get_branch(pending.branch_id) {
             Ok(branch) => match volume.sync_branch_state(&branch) {
                 Ok(()) => volume.set_mutations_closed(false),
@@ -2283,6 +2523,98 @@ fn decode_bool(tag: u8) -> Result<bool, String> {
     }
 }
 
+#[cfg(unix)]
+fn create_dir_all_durable(directory: &Path) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let mut cursor = directory;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        match cursor.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+            _ => break,
+        }
+    }
+    fs::create_dir_all(directory).map_err(journal_io("create capture journal directory"))?;
+    for created in missing.into_iter().rev() {
+        if let Some(parent) = created.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+struct RenewingObjectStore<'a, S, C, J> {
+    store: &'a mut S,
+    control: &'a C,
+    coordinator: RefCell<&'a mut CheckpointCoordinator<J>>,
+    pending: RefCell<&'a mut PendingCapture>,
+    branch_id: BranchId,
+    attachment_id: AttachmentId,
+    volume_epoch: u64,
+    renewal_error: RefCell<Option<CaptureError>>,
+}
+
+impl<S, C, J> RenewingObjectStore<'_, S, C, J>
+where
+    S: DurableObjectStore,
+    C: CaptureControl,
+    J: CaptureJournal,
+{
+    fn check_renewal(&self) -> Result<(), String> {
+        if self.renewal_error.borrow().is_some() {
+            return Err("capture preparation renewal interrupted".to_owned());
+        }
+        let mut coordinator = self.coordinator.borrow_mut();
+        let mut pending = self.pending.borrow_mut();
+        if let Err(error) = coordinator.renew_if_due_with_control(
+            self.control,
+            self.branch_id,
+            self.attachment_id,
+            self.volume_epoch,
+            &mut pending,
+        ) {
+            *self.renewal_error.borrow_mut() = Some(error);
+            return Err("capture preparation renewal interrupted".to_owned());
+        }
+        Ok(())
+    }
+}
+
+impl<S, C, J> MapObjectStore for RenewingObjectStore<'_, S, C, J>
+where
+    S: DurableObjectStore,
+    C: CaptureControl,
+    J: CaptureJournal,
+{
+    fn proof_scope(&self) -> ObjectStoreScopeId {
+        self.store.proof_scope()
+    }
+
+    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        self.check_renewal()?;
+        self.store.get(id)
+    }
+
+    fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+        self.check_renewal()?;
+        self.store.put(id, bytes)
+    }
+}
+
+impl<S, C, J> DurableObjectStore for RenewingObjectStore<'_, S, C, J>
+where
+    S: DurableObjectStore,
+    C: CaptureControl,
+    J: CaptureJournal,
+{
+    fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+        self.check_renewal()?;
+        self.store.put_durable(reference, encoded)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -2380,6 +2712,10 @@ mod tests {
 
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
             Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn now(&self) -> MonotonicTime {
+            MonotonicTime::from_nanos(self.now_nanos.load(Ordering::SeqCst))
         }
 
         fn transact<R, F>(
@@ -2568,6 +2904,17 @@ mod tests {
 
         fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError> {
             self.active().get_branch(branch_id)
+        }
+
+        fn check_attachment_live(
+            &self,
+            branch_id: BranchId,
+            attachment_id: AttachmentId,
+            volume_epoch: u64,
+            grant: WriterGrant,
+        ) -> Result<WriterGrant, ControlError> {
+            self.active()
+                .check_attachment_live(branch_id, attachment_id, volume_epoch, grant)
         }
 
         fn begin_preparation(
@@ -3913,8 +4260,8 @@ mod tests {
             assert_eq!(renew_ids[0], first_renewal_id);
             if commit_renewal_first {
                 // With renewal_interval = ZERO, the prior committed renewal is already due
-                // for a fresh extension, so reconciliation clears R1 and issues fresh R2.
-                assert_eq!(renew_ids.len(), 2);
+                // for a fresh extension, and subsequent object verification reads also renew.
+                assert!(renew_ids.len() >= 2);
                 assert_ne!(renew_ids[1], first_renewal_id);
             } else {
                 // Uncommitted R1 is replayed first, then rebound to R2 on stale writer grant.
@@ -3922,9 +4269,8 @@ mod tests {
                     renew_ids[1], first_renewal_id,
                     "uncommitted renewal must replay the exact original renewal_operation_id first"
                 );
-                assert_eq!(
-                    renew_ids.len(),
-                    3,
+                assert!(
+                    renew_ids.len() >= 3,
                     "uncommitted renewal with stale grant rebinds to a fresh replacement ID"
                 );
                 assert_ne!(renew_ids[2], first_renewal_id);
@@ -5016,5 +5362,494 @@ mod tests {
                 Err(BlockError::Barrier(_))
             ));
         }
+    }
+
+    #[test]
+    fn fenced_worker_retains_barrier_salvage_journal_when_handover_aborts_child() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        let mut coordinator = fixture.coordinator();
+        let mut producers = NoopProducerGate;
+        let mut boundary = RecordingBoundary::default();
+
+        // Write dirty data and inject an unknown commit_live_roots outcome (not committed)
+        // so the child barrier stays Preparing in the barrier journal when capture pauses.
+        volume
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0xAB; 4096],
+                fua: false,
+            })
+            .unwrap();
+        *fixture
+            .control
+            .drop_next_commit_live_roots_reply
+            .lock()
+            .unwrap() = Some(false);
+
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::FilesystemFrozen, 27_000),
+                &[],
+            )
+            .expect_err("unknown child commit outcome must pause capture");
+        assert!(is_unknown_capture_error(&err));
+        assert!(boundary.frozen);
+        assert!(volume.has_pending_barrier());
+
+        // Force writer handover under another principal: aborts both capture and
+        // preparing child barrier in the same transaction that revokes attachment.
+        let other_control = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([8; 16]),
+            fixture._owner,
+        );
+        let current = other_control.get_branch(branch()).unwrap();
+        let _new_grant = other_control
+            .force_acquire_writer(op(180), branch(), current.revision, current.writer_epoch)
+            .expect("forced handover");
+
+        // Watchdog recovery thaws and clears capture intent, marks the old volume
+        // fenced, AND preserves the barrier salvage journal on disk.
+        let recovered = coordinator
+            .recover_pending_capture(&mut volume, &mut producers, &mut boundary)
+            .expect("watchdog recovery should finish thaw and capture cleanup");
+        assert!(matches!(
+            recovered,
+            RecoveredCapture::Aborted {
+                freeze_thawed: true,
+                ..
+            }
+        ));
+        assert!(volume.is_fenced());
+        assert!(
+            volume.has_pending_barrier(),
+            "fenced worker must retain its local pending barrier salvage record"
+        );
+        drop(volume);
+        let mut reopened_journal = FileBarrierJournal::open(&fixture.barrier_dir).unwrap();
+        assert!(
+            reopened_journal.load_pending().unwrap().is_some(),
+            "barrier salvage journal file must remain intact on disk after fenced abort recovery"
+        );
+    }
+
+    #[test]
+    fn recover_pending_capture_detached_thaws_and_reconciles_without_volume_handle() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        let failures = Arc::new(OneShotFailures::default());
+        failures.arm(FailurePoint::FilesystemFreezeAfter);
+        let mut coordinator = fixture.coordinator_with_failures(failures);
+        let mut producers = NoopProducerGate;
+        let mut boundary = RecordingBoundary::default();
+
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::FilesystemFrozen, 28_000),
+                &[],
+            )
+            .expect_err("injected crash after freeze");
+        assert!(matches!(err, CaptureError::InjectedFailure(_)));
+        assert!(boundary.frozen);
+
+        // Lose the original coordinator & volume handle and force writer takeover.
+        drop(coordinator);
+        drop(volume);
+        let other_control = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([8; 16]),
+            fixture._owner,
+        );
+        let current = other_control.get_branch(branch()).unwrap();
+        let _new_grant = other_control
+            .force_acquire_writer(op(181), branch(), current.revision, current.writer_epoch)
+            .expect("forced handover");
+
+        // Detached watchdog recovery succeeds with just the scope-checked authority
+        // handle + original boundary, thawing the filesystem and clearing the journal.
+        let mut watchdog = fixture.coordinator();
+        let recovered = watchdog
+            .recover_pending_capture_detached(&fixture.control, &mut producers, &mut boundary)
+            .expect("detached watchdog recovery must succeed after takeover");
+        assert!(matches!(
+            recovered,
+            RecoveredCapture::Aborted {
+                freeze_thawed: true,
+                ..
+            }
+        ));
+        assert!(!boundary.frozen);
+        assert_eq!(boundary.thaw_calls, 1);
+        assert!(watchdog.pending_capture().unwrap().is_none());
+    }
+
+    #[test]
+    fn large_verification_renews_capture_preparation_during_object_reads() {
+        #[derive(Clone)]
+        struct SlowAdvancingStore {
+            inner: MemoryStore,
+            authority: Arc<MemoryAuthority>,
+            control: Arc<WorkspaceControl<MemoryAuthority>>,
+            grant: Arc<Mutex<WriterGrant>>,
+            next_op: Arc<Mutex<u8>>,
+            reads: Arc<Mutex<usize>>,
+        }
+
+        impl MapObjectStore for SlowAdvancingStore {
+            fn proof_scope(&self) -> ObjectStoreScopeId {
+                self.inner.proof_scope()
+            }
+
+            fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+                let read_index = {
+                    let mut count = self.reads.lock().unwrap();
+                    *count += 1;
+                    *count
+                };
+                // Advance the authority clock by 200 seconds per object read so
+                // total verification exceeds the 10-minute (600s) preparation lease,
+                // while keeping writer & attachment heartbeats live.
+                if read_index <= 4 {
+                    let new_now = (read_index as u64) * 200_000_000_000;
+                    let mut current_now = self.authority.now_nanos.load(Ordering::SeqCst);
+                    let mut grant = self.grant.lock().unwrap();
+                    let mut op_byte = self.next_op.lock().unwrap();
+                    while current_now < new_now {
+                        current_now = (current_now + 20_000_000_000).min(new_now);
+                        self.authority
+                            .now_nanos
+                            .store(current_now, Ordering::SeqCst);
+                        *grant = self
+                            .control
+                            .renew_writer(op(*op_byte), *grant)
+                            .map_err(|error| error.to_string())?;
+                        *op_byte = op_byte.wrapping_add(1);
+                        let att = self
+                            .control
+                            .get_branch(branch())
+                            .map_err(|error| error.to_string())?
+                            .attachment
+                            .unwrap();
+                        if att.protection_expires_at.as_nanos() <= current_now + 60_000_000_000 {
+                            self.control
+                                .renew_attachment_base(
+                                    op(*op_byte),
+                                    branch(),
+                                    att.attachment_id,
+                                    att.volume_epoch,
+                                    att.protection_id,
+                                    *grant,
+                                )
+                                .map_err(|error| error.to_string())?;
+                            *op_byte = op_byte.wrapping_add(1);
+                        }
+                    }
+                }
+                self.inner.get(id)
+            }
+
+            fn put(&mut self, id: ObjectId, bytes: Vec<u8>) -> Result<(), String> {
+                self.inner.put(id, bytes)
+            }
+        }
+
+        impl DurableObjectStore for SlowAdvancingStore {
+            fn put_durable(&mut self, reference: ObjectRef, encoded: &[u8]) -> Result<(), String> {
+                self.inner.put_durable(reference, encoded)
+            }
+        }
+
+        let fixture = TestFixture::new();
+        let slow_store = SlowAdvancingStore {
+            inner: fixture.store.clone(),
+            authority: fixture._authority.clone(),
+            control: fixture.control.inner.clone(),
+            grant: Arc::new(Mutex::new(fixture.grant)),
+            next_op: Arc::new(Mutex::new(100)),
+            reads: Arc::new(Mutex::new(0)),
+        };
+        let mut volume = DurableVolume::open(
+            slow_store.clone(),
+            fixture.control.clone(),
+            FileBarrierJournal::open(&fixture.barrier_dir).unwrap(),
+            branch(),
+            fixture.grant,
+            attachment(),
+            EXTENT_BYTES as usize * 4,
+        )
+        .unwrap();
+        // Write 3 distinct extents so verification performs multiple object reads.
+        for idx in 0..3_u64 {
+            volume
+                .dispatch(BlockRequest::Write {
+                    offset: idx * u64::from(EXTENT_BYTES),
+                    data: &[0xC0 + idx as u8; 4096],
+                    fua: false,
+                })
+                .unwrap();
+        }
+        let mut coordinator = CheckpointCoordinator::new(
+            FileCaptureJournal::open(&fixture.capture_dir).unwrap(),
+            CaptureConfig {
+                renewal_interval: Duration::ZERO,
+                ..CaptureConfig::default()
+            },
+        );
+        let mut producers = NoopProducerGate;
+        let mut boundary = BlockCutOnlyBoundary;
+
+        let published = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::BlockCut, 29_000),
+                &[],
+            )
+            .expect("verification must keep renewing capture preparation past 600s");
+        assert!(published.head_advanced);
+        assert!(
+            fixture._authority.now_nanos.load(Ordering::SeqCst) >= 800_000_000_000,
+            "authority clock must have advanced past the initial 600s capture preparation lease"
+        );
+        assert!(
+            fixture.control.renew_ids.lock().unwrap().len() >= 3,
+            "capture preparation must have been renewed during object verification"
+        );
+    }
+
+    #[test]
+    fn foreign_principal_capture_does_not_permanently_fence_attached_worker() {
+        let fixture = TestFixture::new();
+        // Principal A is fixture.control (PrincipalId [7; 16]).
+        // Principal B shares the same live writer grant on the branch.
+        let principal_b_control = WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([8; 16]),
+            fixture._owner,
+        );
+        let mut volume_b = DurableVolume::open(
+            fixture.store.clone(),
+            principal_b_control,
+            FileBarrierJournal::open(&fixture.barrier_dir).unwrap(),
+            branch(),
+            fixture.grant,
+            attachment(),
+            EXTENT_BYTES as usize * 2,
+        )
+        .unwrap();
+
+        // Principal A starts a capture on the branch.
+        let current = fixture.control.get_branch(branch()).unwrap();
+        fixture
+            .control
+            .begin_capture(
+                PreparationRequest {
+                    operation_id: op(190),
+                    branch_id: branch(),
+                    expected_revision: current.revision,
+                    grant: fixture.grant,
+                    attachment_id: attachment(),
+                    volume_epoch: current.volume_epoch,
+                    protection_id: ProtectionId::from_bytes([190; 16]),
+                    kind: PreparationKind::CheckpointCapture,
+                    expected_roots: None,
+                    dependencies: vec![],
+                },
+                ProvenanceBinding::Unattributed,
+            )
+            .expect("principal A begins capture");
+
+        // Principal B tries to flush dirty writes during principal A's capture:
+        // capture-scope authorization rejects it, but must NOT permanently fence volume B.
+        volume_b
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0x3D; 4096],
+                fua: false,
+            })
+            .unwrap();
+        let err = volume_b
+            .flush()
+            .expect_err("flush during foreign principal capture must be rejected");
+        assert!(matches!(err, BarrierError::Control(ControlError::Fenced)));
+        assert!(
+            !volume_b.is_fenced(),
+            "foreign-principal capture denial must not permanently fence a live attachment"
+        );
+
+        // Once principal A aborts its capture, principal B's worker can flush normally.
+        fixture.control.abort_operation(op(190)).unwrap();
+        volume_b
+            .flush()
+            .expect("worker must flush cleanly once foreign capture ends");
+    }
+
+    #[test]
+    fn expired_writer_during_publish_fences_volume_on_abort_recovery() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        let mut coordinator = fixture.coordinator();
+        let mut producers = NoopProducerGate;
+        let mut boundary = RecordingBoundary::default();
+
+        volume
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0x2E; 4096],
+                fua: false,
+            })
+            .unwrap();
+
+        // Advance the authority clock past the 60s writer lease right before publish_capture.
+        let authority = fixture._authority.clone();
+        *fixture.control.on_next_publish.lock().unwrap() = Some(Box::new(move || {
+            authority.now_nanos.store(65_000_000_000, Ordering::SeqCst);
+        }));
+
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::FilesystemFrozen, 30_000),
+                &[],
+            )
+            .expect_err("expired writer lease during publish must fence capture");
+        assert!(matches!(err, CaptureError::Fenced));
+        assert_eq!(boundary.thaw_calls, 1);
+        assert!(
+            volume.is_fenced(),
+            "expired writer lease must mark volume fenced before abort recovery reopens writes"
+        );
+        assert!(matches!(
+            volume.dispatch(BlockRequest::Write {
+                offset: 4096,
+                data: &[0x3F; 4096],
+                fua: false,
+            }),
+            Err(BlockError::Barrier(_))
+        ));
+    }
+
+    #[test]
+    fn prior_heartbeat_before_owner_restart_still_fences_volume_and_sync() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        volume
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0x71; 4096],
+                fua: false,
+            })
+            .unwrap();
+
+        // Independent heartbeat extends G1 -> G2 on incarnation 1.
+        fixture._authority.now_nanos.store(5_000, Ordering::SeqCst);
+        let _g2 = fixture
+            .control
+            .inner
+            .renew_writer(op(195), fixture.grant)
+            .expect("heartbeat extends writer grant");
+
+        // Now restart authority owner (incarnation 1 -> 2) while branch.writer still holds G2!
+        let restarted_owner = start_authority_owner(fixture._authority.as_ref(), op(196)).unwrap();
+        *fixture.control.override_inner.lock().unwrap() = Some(Arc::new(WorkspaceControl::new(
+            fixture._authority.clone(),
+            WorkspaceId::from_bytes([1; 16]),
+            ObjectStoreScopeId::from_bytes([0xC1; 16]),
+            PrincipalId::from_bytes([7; 16]),
+            restarted_owner,
+        )));
+
+        // Even though G2.expires_at > G1.expires_at, check_attachment_live detects
+        // the owner incarnation mismatch and fences immediately on both sync and flush.
+        let branch_snapshot = fixture.control.get_branch(branch()).unwrap();
+        assert!(matches!(
+            volume.sync_branch_state(&branch_snapshot),
+            Err(BarrierError::Fenced)
+        ));
+        assert!(volume.is_fenced());
+        assert!(matches!(volume.flush(), Err(BarrierError::Fenced)));
+    }
+
+    #[test]
+    fn capture_abort_recovery_does_not_abort_unrelated_ordinary_barrier() {
+        let fixture = TestFixture::new();
+        let mut volume = fixture.open_volume();
+        let mut coordinator = fixture.coordinator();
+        let mut producers = NoopProducerGate;
+        let mut boundary = BlockCutOnlyBoundary;
+
+        // Capture acquisition returns an unknown outcome without committing, and
+        // its immediate reconciliation lookup also fails transiently so capture pauses.
+        *fixture.control.drop_next_begin_reply.lock().unwrap() = Some(false);
+        *fixture
+            .control
+            .fail_next_get_operation_backend
+            .lock()
+            .unwrap() = true;
+        let err = coordinator
+            .checkpoint(
+                &mut volume,
+                &mut producers,
+                &mut boundary,
+                &CheckpointRequest::attached(CaptureMode::BlockCut, 31_000),
+                &[],
+            )
+            .expect_err("unknown begin_capture outcome");
+        assert!(is_unknown_capture_error(&err));
+
+        // Block admission is still open; an ordinary flush (capture_id: None) prepares
+        // and pauses with an unknown commit outcome.
+        volume
+            .dispatch(BlockRequest::Write {
+                offset: 0,
+                data: &[0x9A; 4096],
+                fua: false,
+            })
+            .unwrap();
+        *fixture
+            .control
+            .drop_next_commit_live_roots_reply
+            .lock()
+            .unwrap() = Some(false);
+        let flush_err = volume
+            .flush()
+            .expect_err("ordinary barrier pauses on unknown commit outcome");
+        assert!(is_unknown_barrier_error(&flush_err));
+        let ordinary_op_id = volume
+            .pending_barrier_operation_id()
+            .expect("ordinary barrier must be pending locally");
+
+        // Watchdog recovers the capture: it must NOT abort the unrelated ordinary barrier!
+        let recovered = coordinator
+            .recover_pending_capture(&mut volume, &mut producers, &mut boundary)
+            .expect("capture recovery should succeed");
+        assert!(matches!(recovered, RecoveredCapture::Aborted { .. }));
+        assert!(
+            matches!(
+                fixture.control.get_operation(ordinary_op_id),
+                Ok(OperationState::Preparing { .. })
+            ),
+            "capture abort recovery must not abort an unrelated ordinary barrier"
+        );
+        // The ordinary barrier can still finish cleanly on retry.
+        volume
+            .flush()
+            .expect("ordinary barrier must still commit cleanly");
     }
 }

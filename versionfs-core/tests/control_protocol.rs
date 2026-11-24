@@ -109,6 +109,10 @@ impl MetadataAuthority for MemoryAuthority {
             .cloned())
     }
 
+    fn now(&self) -> MonotonicTime {
+        MonotonicTime::from_nanos(self.now_nanos.load(Ordering::SeqCst))
+    }
+
     fn transact<R, F>(
         &self,
         _operation: MutationIdentity<'_>,
@@ -1097,6 +1101,84 @@ fn force_acquire_writer_aborts_preparing_capture_child_across_principals_and_own
         Ok(OperationState::Aborted)
     );
     assert!(principal_c.get_branch(branch(1)).unwrap().capture.is_none());
+}
+
+#[test]
+fn force_acquire_writer_aborts_ordinary_pending_preparations_so_replacement_can_attach() {
+    let authority = Arc::new(MemoryAuthority::default());
+    let owner = start_authority_owner(authority.as_ref(), op(250)).expect("owner");
+    let principal_a = WorkspaceControl::new(
+        authority.clone(),
+        workspace(1),
+        ObjectStoreScopeId::from_bytes([0xA5; 16]),
+        principal(1),
+        owner,
+    );
+    let principal_b = WorkspaceControl::new(
+        authority,
+        workspace(1),
+        ObjectStoreScopeId::from_bytes([0xA5; 16]),
+        principal(2),
+        owner,
+    );
+    principal_a
+        .create_workspace(op(1), branch(1), "main", 60_000, verified_seed(1))
+        .expect("create workspace");
+    let writer_a = principal_a
+        .acquire_writer(op(2), branch(1), 1, 0)
+        .expect("acquire writer A");
+    principal_a
+        .attach_volume(op(3), branch(1), 1, writer_a, attachment(1), protection(1))
+        .expect("attach A");
+    let next_roots = replace_volume_root(
+        candidate_roots(&principal_a.get_branch(branch(1)).unwrap()),
+        91,
+    );
+
+    // Start an ordinary (non-capture) volume barrier preparation under principal A.
+    principal_a
+        .begin_preparation(PreparationRequest {
+            operation_id: op(4),
+            branch_id: branch(1),
+            expected_revision: 1,
+            grant: writer_a,
+            attachment_id: attachment(1),
+            volume_epoch: 1,
+            protection_id: protection(2),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(next_roots),
+            dependencies: vec![next_roots.volume],
+        })
+        .expect("begin ordinary preparation");
+    assert_eq!(
+        principal_a
+            .get_branch(branch(1))
+            .unwrap()
+            .pending_mutation_preparations,
+        1
+    );
+
+    // Principal B forces writer handover; it must atomically abort principal A's
+    // ordinary preparation so principal B can attach immediately without hitting Busy.
+    let writer_b = principal_b
+        .force_acquire_writer(op(5), branch(1), 1, writer_a.writer_epoch)
+        .expect("forced handover clears ordinary pending preparations");
+    let after = principal_b.get_branch(branch(1)).unwrap();
+    assert_eq!(after.pending_mutation_preparations, 0);
+    assert_eq!(
+        principal_a.get_operation(op(4)),
+        Ok(OperationState::Aborted)
+    );
+    principal_b
+        .attach_volume(
+            op(6),
+            branch(1),
+            after.revision,
+            writer_b,
+            attachment(2),
+            protection(3),
+        )
+        .expect("replacement writer under different principal must be able to attach");
 }
 
 fn candidate_roots(branch: &versionfs_core::control::BranchState) -> LiveRoots {

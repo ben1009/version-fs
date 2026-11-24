@@ -173,6 +173,10 @@ impl MetadataAuthority for AdvanceAtOutcome {
         self.inner.get(key)
     }
 
+    fn now(&self) -> MonotonicTime {
+        self.inner.now()
+    }
+
     fn transact<R, F>(
         &self,
         operation: MutationIdentity<'_>,

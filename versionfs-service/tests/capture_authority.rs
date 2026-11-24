@@ -1,6 +1,8 @@
 //! End-to-end checkpoint capture coordinator tests against the real toy-kv
 //! Metadata Authority outcome gate, durable barrier journal, and capture journal.
 
+#![cfg(unix)]
+
 use std::{
     collections::HashMap,
     path::PathBuf,

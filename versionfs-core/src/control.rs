@@ -726,6 +726,40 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         Ok(branch)
     }
 
+    /// Checks whether the branch's current writer grant and writable attachment
+    /// match the caller's stable identities, belong to the current authoritative
+    /// owner incarnation, and remain unexpired on the authority's monotonic clock.
+    pub fn check_attachment_live(
+        &self,
+        branch_id: BranchId,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        grant: WriterGrant,
+    ) -> Result<WriterGrant, ControlError> {
+        let owner_bytes =
+            read_authoritative_point(self.authority.as_ref(), &owner_incarnation_key())?
+                .ok_or(ControlError::Fenced)?;
+        let current_owner = OwnerIncarnation(decode_owner(&owner_bytes)?);
+        if current_owner != self.owner_incarnation || grant.owner_incarnation != current_owner {
+            return Err(ControlError::Fenced);
+        }
+        let branch = self.get_branch(branch_id)?;
+        let current_grant = branch.writer.ok_or(ControlError::Fenced)?;
+        let attachment = branch.attachment.ok_or(ControlError::Fenced)?;
+        if !same_grant_identity(current_grant, grant)
+            || attachment.attachment_id != attachment_id
+            || attachment.volume_epoch != volume_epoch
+            || attachment.writer_epoch != current_grant.writer_epoch
+        {
+            return Err(ControlError::Fenced);
+        }
+        let now = self.authority.now();
+        if current_grant.expires_at <= now || attachment.protection_expires_at <= now {
+            return Err(ControlError::Expired);
+        }
+        Ok(current_grant)
+    }
+
     /// Resolves a branch name through its deterministic point-key index.
     pub fn branch_by_name(&self, name: &str) -> Result<BranchState, ControlError> {
         validate_name(name)?;
@@ -860,6 +894,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         &encode_operation(&capture_record).map_err(to_metadata_error)?,
                     )?;
                     branch.capture = None;
+                }
+                if branch.pending_mutation_preparations != 0 {
+                    abort_pending_preparations_for_handover(txn, self.workspace_id, &mut branch)?;
                 }
                 let had_attachment = branch.attachment.is_some();
                 fence_attachment(txn, self.workspace_id, &mut branch)?;
@@ -1868,6 +1905,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 }
                 (None, false) => {
                     self.require_unreserved_operation(txn, operation_id)?;
+                    add_branch_pending_preparation(
+                        txn,
+                        self.workspace_id,
+                        branch_id,
+                        self.principal_id,
+                        operation_id,
+                    )?;
                     branch.pending_mutation_preparations =
                         increment(branch.pending_mutation_preparations)?;
                 }
@@ -2315,6 +2359,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             }
             match (&mut branch.capture, capture_child) {
                 (None, None) => {
+                    remove_branch_pending_preparation(
+                        txn,
+                        self.workspace_id,
+                        branch.branch_id,
+                        self.principal_id,
+                        operation_id,
+                    )?;
                     branch.pending_mutation_preparations =
                         decrement(branch.pending_mutation_preparations)?;
                 }
@@ -2834,6 +2885,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                             return Err(reject("corrupt_record"));
                         }
                     } else {
+                        remove_branch_pending_preparation(
+                            txn,
+                            self.workspace_id,
+                            branch_id,
+                            self.principal_id,
+                            operation_id,
+                        )?;
                         branch.pending_mutation_preparations =
                             decrement(branch.pending_mutation_preparations)?;
                     }
@@ -2957,6 +3015,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     return Err(reject("corrupt_record"));
                 }
             } else {
+                remove_branch_pending_preparation(
+                    txn,
+                    self.workspace_id,
+                    branch_id,
+                    self.principal_id,
+                    operation_id,
+                )?;
                 branch.pending_mutation_preparations =
                     decrement(branch.pending_mutation_preparations)?;
             }
@@ -4683,6 +4748,133 @@ fn retire_unstarted_capture_child_in_scope(
     }
 }
 
+fn encode_pending_preparations(entries: &[(PrincipalId, OperationId)]) -> Vec<u8> {
+    let mut e = CanonicalEncoder::new();
+    e.u32_le(entries.len() as u32);
+    for (principal, operation) in entries {
+        e.fixed(principal.as_bytes());
+        e.fixed(operation.as_bytes());
+    }
+    e.finish()
+}
+
+fn decode_pending_preparations(
+    bytes: &[u8],
+) -> Result<Vec<(PrincipalId, OperationId)>, ControlError> {
+    let mut d = CanonicalDecoder::new(bytes);
+    let count = d.u32_le().map_err(corrupt)? as usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let principal = PrincipalId::from_bytes(d.fixed().map_err(corrupt)?);
+        let operation = OperationId::from_bytes(d.fixed().map_err(corrupt)?);
+        entries.push((principal, operation));
+    }
+    d.finish().map_err(corrupt)?;
+    Ok(entries)
+}
+
+fn add_branch_pending_preparation(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch_id: BranchId,
+    principal: PrincipalId,
+    operation_id: OperationId,
+) -> Result<(), MetadataError> {
+    let key = branch_pending_preparations_key(workspace, branch_id);
+    let mut entries = match txn.get(&key)? {
+        Some(bytes) => decode_pending_preparations(&bytes).map_err(to_metadata_error)?,
+        None => Vec::new(),
+    };
+    if !entries.contains(&(principal, operation_id)) {
+        entries.push((principal, operation_id));
+    }
+    txn.put(&key, &encode_pending_preparations(&entries))
+}
+
+fn remove_branch_pending_preparation(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch_id: BranchId,
+    principal: PrincipalId,
+    operation_id: OperationId,
+) -> Result<(), MetadataError> {
+    let key = branch_pending_preparations_key(workspace, branch_id);
+    let Some(bytes) = txn.get(&key)? else {
+        return Ok(());
+    };
+    let mut entries = decode_pending_preparations(&bytes).map_err(to_metadata_error)?;
+    entries.retain(|entry| *entry != (principal, operation_id));
+    if entries.is_empty() {
+        txn.delete(&key)
+    } else {
+        txn.put(&key, &encode_pending_preparations(&entries))
+    }
+}
+
+/// Atomically aborts all ordinary (non-capture) pending preparations on a branch
+/// during forced writer handover, retiring their protections and clearing the
+/// branch's pending-preparation count so a replacement writer can attach cleanly.
+fn abort_pending_preparations_for_handover(
+    txn: &mut dyn MetadataTxn,
+    workspace: WorkspaceId,
+    branch: &mut BranchState,
+) -> Result<(), MetadataError> {
+    let index_key = branch_pending_preparations_key(workspace, branch.branch_id);
+    let bytes = txn
+        .get(&index_key)?
+        .ok_or_else(|| reject("corrupt_record"))?;
+    let entries = decode_pending_preparations(&bytes).map_err(to_metadata_error)?;
+    if entries.len() as u64 != branch.pending_mutation_preparations {
+        return Err(reject("corrupt_record"));
+    }
+    for (principal, operation_id) in entries {
+        let op_key = scoped_operation_key(workspace, principal, operation_id);
+        let op_bytes = txn.get(&op_key)?.ok_or_else(|| reject("corrupt_record"))?;
+        let mut record = decode_operation(&op_bytes).map_err(to_metadata_error)?;
+        match record.status {
+            StoredOperationStatus::Preparing {
+                branch_id: prepared_branch,
+                protection_id,
+                grant: prepared_grant,
+                expires_at: prepared_deadline,
+                capture,
+                ..
+            } if record.kind == OP_BEGIN_PREPARATION
+                && prepared_branch == branch.branch_id
+                && !capture =>
+            {
+                let pkey = protection_key(workspace, protection_id);
+                let protection = txn.get(&pkey)?.ok_or_else(|| reject("corrupt_record"))?;
+                match decode_protection(&protection).map_err(to_metadata_error)? {
+                    ProtectionRecord::Preparation {
+                        operation_id: protected_op,
+                        branch_id: protected_branch,
+                        grant: protected_grant,
+                        owner_incarnation,
+                        expires_at: protected_deadline,
+                        ..
+                    } if protected_op == operation_id
+                        && protected_branch == branch.branch_id
+                        && protected_grant == prepared_grant
+                        && owner_incarnation == prepared_grant.owner_incarnation
+                        && protected_deadline == prepared_deadline => {}
+                    _ => return Err(reject("corrupt_record")),
+                }
+                retire_protection(txn, workspace, protection_id)?;
+                record.status = StoredOperationStatus::Aborted;
+                txn.put(
+                    &op_key,
+                    &encode_operation(&record).map_err(to_metadata_error)?,
+                )?;
+            }
+            _ => return Err(reject("corrupt_record")),
+        }
+    }
+    txn.delete(&index_key)?;
+    branch.pending_mutation_preparations = 0;
+    Ok(())
+}
+
 /// Aborts a capture child during forced handover whether it is still an
 /// unstarted reservation or an active `Preparing` volume barrier.
 /// Already-committed children have cleared `capture.pending_child` and are never
@@ -5066,6 +5258,15 @@ fn branch_name_key(workspace: WorkspaceId, name: &str) -> Vec<u8> {
     key.extend_from_slice(&(name.len() as u16).to_be_bytes());
     key.extend_from_slice(name.as_bytes());
     key
+}
+fn branch_pending_preparations_key(workspace: WorkspaceId, branch: BranchId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"branch-pending-preparations/",
+        workspace.as_bytes(),
+        branch.as_bytes(),
+    ]
+    .concat()
 }
 fn capture_child_reservation_key(
     workspace: WorkspaceId,

@@ -906,6 +906,27 @@ pub trait VolumeBarrierControl: Send + Sync {
 
     /// Reads the exact state of a barrier operation for recovery.
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
+
+    /// Verifies that the branch's writer grant and writable attachment remain
+    /// live on the current authoritative owner incarnation and monotonic clock.
+    ///
+    /// Default implementation validates stored branch identities via `get_branch`.
+    fn check_attachment_live(
+        &self,
+        branch_id: BranchId,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        grant: WriterGrant,
+    ) -> Result<WriterGrant, ControlError> {
+        let branch = self.get_branch(branch_id)?;
+        validate_attachment(&branch, branch_id, attachment_id, volume_epoch, grant).map_err(
+            |error| match error {
+                BarrierError::Fenced => ControlError::Fenced,
+                BarrierError::Control(control) => control,
+                _ => ControlError::InvalidTransition,
+            },
+        )
+    }
 }
 
 impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
@@ -919,6 +940,16 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
 
     fn get_branch(&self, branch_id: BranchId) -> Result<BranchState, ControlError> {
         WorkspaceControl::get_branch(self, branch_id)
+    }
+
+    fn check_attachment_live(
+        &self,
+        branch_id: BranchId,
+        attachment_id: AttachmentId,
+        volume_epoch: u64,
+        grant: WriterGrant,
+    ) -> Result<WriterGrant, ControlError> {
+        WorkspaceControl::check_attachment_live(self, branch_id, attachment_id, volume_epoch, grant)
     }
 
     fn begin_preparation(
@@ -1432,12 +1463,22 @@ where
             .pending
             .as_ref()
             .is_some_and(|pending| pending.capture_id.is_some());
-        if matches!(
-            &result,
-            Err(BarrierError::Fenced | BarrierError::Control(ControlError::NotFound))
-        ) || (matches!(&result, Err(BarrierError::Control(ControlError::Expired)))
-            && !is_capture_child)
-        {
+        let should_fence =
+            matches!(
+                &result,
+                Err(BarrierError::Fenced | BarrierError::Control(ControlError::NotFound))
+            ) || (matches!(&result, Err(BarrierError::Control(ControlError::Expired)))
+                && (!is_capture_child
+                    || matches!(
+                        self.control.check_attachment_live(
+                            self.branch_id,
+                            self.attachment_id,
+                            self.volume_epoch,
+                            self.writer_grant,
+                        ),
+                        Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound)
+                    )));
+        if should_fence {
             self.fenced = true;
         }
         result
@@ -1592,6 +1633,14 @@ where
         &self.control
     }
 
+    pub(crate) fn store_and_control_mut(&mut self) -> (&mut S, &C) {
+        (self.inner.store_mut(), &self.control)
+    }
+
+    pub(crate) fn pending_barrier_capture_id(&self) -> Option<OperationId> {
+        self.pending.as_ref().and_then(|pending| pending.capture_id)
+    }
+
     /// Syncs local branch metadata and base map to an authoritative branch snapshot.
     ///
     /// Never hot-switches a fenced attachment and never discards local dirty extents
@@ -1614,6 +1663,19 @@ where
             }
             Err(error) => return Err(error),
         };
+        let live_grant = match self.control.check_attachment_live(
+            self.branch_id,
+            self.attachment_id,
+            self.volume_epoch,
+            grant,
+        ) {
+            Ok(live) => live,
+            Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound) => {
+                self.fenced = true;
+                return Err(BarrierError::Fenced);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if branch.volume_root != self.live_roots.volume {
             if self.pending.is_some() || self.inner.dirty_extent_count() > 0 {
                 return Err(BarrierError::Conflict);
@@ -1623,7 +1685,7 @@ where
         }
         self.live_roots = roots(branch);
         self.revision = branch.revision;
-        self.writer_grant = grant;
+        self.writer_grant = live_grant;
         Ok(())
     }
 
@@ -1643,6 +1705,24 @@ where
                 Err(error) => Err(error),
             },
             Ok(OperationState::Aborted) => {
+                // Verify attachment liveness before unlinking the local salvage
+                // journal: a forced handover can abort a preparing child in the
+                // same transaction that revokes this attachment.
+                match self.control.check_attachment_live(
+                    self.branch_id,
+                    self.attachment_id,
+                    self.volume_epoch,
+                    self.writer_grant,
+                ) {
+                    Ok(live_grant) => {
+                        self.writer_grant = live_grant;
+                    }
+                    Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound) => {
+                        self.fenced = true;
+                        return Err(BarrierError::Fenced);
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 self.finish_pending_journal(operation_id)?;
                 self.pending = None;
                 self.pending_map = None;
@@ -2240,24 +2320,37 @@ where
     }
 
     fn classify_fenced_error(&self, used_grant: WriterGrant) -> BarrierError {
-        match self.control.get_branch(self.branch_id) {
-            Ok(branch) => match validate_attachment(
-                &branch,
-                self.branch_id,
-                self.attachment_id,
-                self.volume_epoch,
-                used_grant,
-            ) {
-                Ok(refreshed)
-                    if same_grant_identity(used_grant, refreshed)
-                        && refreshed.expires_at > used_grant.expires_at =>
+        match self.control.check_attachment_live(
+            self.branch_id,
+            self.attachment_id,
+            self.volume_epoch,
+            used_grant,
+        ) {
+            Ok(refreshed) => {
+                if same_grant_identity(used_grant, refreshed)
+                    && refreshed.expires_at > used_grant.expires_at
                 {
-                    BarrierError::Control(ControlError::Fenced)
+                    return BarrierError::Control(ControlError::Fenced);
                 }
-                Ok(_) | Err(BarrierError::Fenced) => BarrierError::Fenced,
-                Err(error) => error,
-            },
-            Err(ControlError::NotFound) => BarrierError::Fenced,
+                // A live attachment can still receive `ControlError::Fenced`
+                // from capture-scope authorization when another principal holds
+                // an active capture on the same branch; reject the flush
+                // without permanently fencing this attachment.
+                match self.control.get_branch(self.branch_id) {
+                    Ok(branch)
+                        if branch.capture.as_ref().is_some_and(|capture| {
+                            capture.principal_id != self.control.principal_id()
+                        }) =>
+                    {
+                        BarrierError::Control(ControlError::Fenced)
+                    }
+                    Ok(_) | Err(ControlError::NotFound) => BarrierError::Fenced,
+                    Err(error) => BarrierError::Control(error),
+                }
+            }
+            Err(ControlError::Fenced | ControlError::Expired | ControlError::NotFound) => {
+                BarrierError::Fenced
+            }
             Err(error) => BarrierError::Control(error),
         }
     }
