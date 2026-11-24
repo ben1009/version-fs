@@ -246,6 +246,18 @@ pub struct LiveRoots {
     pub artifacts: ObjectRef,
 }
 
+/// Recorded preparation kind and pre/post roots for a committed `commit_live_roots`
+/// operation, used by native log and artifact clients for exact idempotent replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedRootTransition {
+    /// Preparation kind (`VolumeBarrier`, `LogMutation`, or `ArtifactMutation`).
+    pub kind: PreparationKind,
+    /// Authoritative live roots immediately before this operation committed.
+    pub previous_roots: LiveRoots,
+    /// Authoritative branch state committed by this operation.
+    pub branch: BranchState,
+}
+
 /// The Generation catalog fields recorded by the authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GenerationSeed {
@@ -729,6 +741,19 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             return Err(ControlError::NotFound);
         }
         Ok(branch)
+    }
+
+    /// Reads an authoritative Generation's descriptor and view roots by ID.
+    pub fn get_generation(
+        &self,
+        generation_id: GenerationId,
+    ) -> Result<GenerationSeed, ControlError> {
+        let bytes = read_authoritative_point(
+            self.authority.as_ref(),
+            &generation_key(self.workspace_id, generation_id),
+        )?
+        .ok_or(ControlError::NotFound)?;
+        Ok(decode_generation(&bytes)?.seed)
     }
 
     /// Checks whether the branch's current writer grant and writable attachment
@@ -2398,6 +2423,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 (Some(_), _) => return Err(reject("busy")),
                 (None, Some(_)) => return Err(reject("invalid_transition")),
             }
+            let previous_roots = LiveRoots {
+                volume: branch.volume_root,
+                logs: branch.logs_root,
+                artifacts: branch.artifacts_root,
+            };
             branch.volume_root = roots.volume;
             branch.logs_root = roots.logs;
             branch.artifacts_root = roots.artifacts;
@@ -2414,6 +2444,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if let Some(protection_id) = protection_id {
                 retire_protection(txn, self.workspace_id, protection_id)?;
             }
+            let rt_key = root_transition_key(self.workspace_id, self.principal_id, operation_id);
+            txn.put(
+                &rt_key,
+                &encode_root_transition(prepared_kind, previous_roots),
+            )?;
             let encoded = encode_operation(&operation).map_err(to_metadata_error)?;
             txn.put(&key, &encoded)?;
             Ok((encoded, Some(final_deadline)))
@@ -2788,6 +2823,38 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             None => self.authority.get(&key)?.ok_or(ControlError::NotFound)?,
         };
         Ok(decode_operation(&bytes)?.public_state(operation_id))
+    }
+
+    /// Queries a committed `commit_live_roots` transition for exact replay verification.
+    ///
+    /// Returns `Ok(None)` if `operation_id` has not committed yet (`NotFound` or
+    /// `Preparing`), `Err(ControlError::Aborted)` if aborted, and
+    /// `Err(ControlError::OperationMismatch)` if `operation_id` committed as a
+    /// different kind of operation (not `commit_live_roots`).
+    pub fn get_committed_root_transition(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<CommittedRootTransition>, ControlError> {
+        match self.get_operation(operation_id) {
+            Ok(OperationState::Committed(branch_bytes)) => {
+                let rt_key =
+                    root_transition_key(self.workspace_id, self.principal_id, operation_id);
+                let Some(rt_bytes) = read_authoritative_point(self.authority.as_ref(), &rt_key)?
+                else {
+                    return Err(ControlError::OperationMismatch);
+                };
+                let (kind, previous_roots) = decode_root_transition(&rt_bytes)?;
+                let branch = decode_branch(&branch_bytes)?;
+                Ok(Some(CommittedRootTransition {
+                    kind,
+                    previous_roots,
+                    branch,
+                }))
+            }
+            Ok(OperationState::Aborted) => Err(ControlError::Aborted),
+            Ok(OperationState::Preparing { .. }) | Err(ControlError::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Aborts a preparation or tombstones an unseen ID. Committed operations are
@@ -5333,4 +5400,34 @@ fn scoped_operation_key(
         operation.as_bytes(),
     ]
     .concat()
+}
+
+fn root_transition_key(
+    workspace: WorkspaceId,
+    principal: PrincipalId,
+    operation: OperationId,
+) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"root-transition/",
+        workspace.as_bytes(),
+        principal.as_bytes(),
+        operation.as_bytes(),
+    ]
+    .concat()
+}
+
+fn encode_root_transition(kind: PreparationKind, previous_roots: LiveRoots) -> Vec<u8> {
+    let mut e = CanonicalEncoder::new();
+    e.u8(kind as u8);
+    encode_live_roots(&mut e, previous_roots);
+    e.finish()
+}
+
+fn decode_root_transition(bytes: &[u8]) -> Result<(PreparationKind, LiveRoots), ControlError> {
+    let mut d = CanonicalDecoder::new(bytes);
+    let kind = decode_preparation_kind(d.u8().map_err(corrupt)?)?;
+    let previous_roots = decode_live_roots(&mut d).map_err(corrupt)?;
+    d.finish().map_err(corrupt)?;
+    Ok((kind, previous_roots))
 }

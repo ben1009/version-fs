@@ -911,6 +911,15 @@ pub trait VolumeBarrierControl: Send + Sync {
     /// Reads the exact state of a barrier operation for recovery.
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
 
+    /// Queries a committed `commit_live_roots` transition for exact replay verification.
+    fn get_committed_root_transition(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError> {
+        let _ = operation_id;
+        Ok(None)
+    }
+
     /// Verifies that the branch's writer grant and writable attachment remain
     /// live on the current authoritative owner incarnation and monotonic clock.
     fn check_attachment_live(
@@ -1005,6 +1014,13 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
 
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         WorkspaceControl::get_operation(self, operation_id)
+    }
+
+    fn get_committed_root_transition(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError> {
+        WorkspaceControl::get_committed_root_transition(self, operation_id)
     }
 }
 

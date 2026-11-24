@@ -363,22 +363,29 @@ retention closure, and acceptance campaigns) remain pending in P9/P10/P11/P12.
 
 ### P8. Native logs and artifacts
 
-- [ ] Implement stream identities, consecutive sequences, half-open ranges, one
+- [x] Implement stream identities, consecutive sequences, half-open ranges, one
   sealed batch segment, exact append receipts, conditional tails, and explicit attachments.
-- [ ] Reuse preparation/renewal/fencing for append/create/trim/delete. Upload before
+- [x] Reuse preparation/renewal/fencing for append/create/trim/delete. Upload before
   atomic live-root replacement; matching append retries allocate no second range.
-- [ ] Implement batch-boundary trim, protected historical reads, polling tails,
+- [x] Implement batch-boundary trim, protected historical reads, polling tails,
   explicit replaced/expired cursors, and independent append after fork/reset.
-- [ ] Implement gated named-artifact staging with blob/4 MiB chunk representation.
+- [x] Implement gated named-artifact staging with blob/4 MiB chunk representation.
   Connect native admission/drain/seal hooks to P7's common-cut coordinator and
   replace its empty native roots with captured log/artifact roots. Do not introduce
   a second checkpoint-coordination protocol, parse ext4, or recopy historical segments.
 
-**Exit evidence:** native views can be read without mounting the filesystem;
-append races fall wholly on one side of capture; retained log ranges/attachments
-survive live trim. An append completing after the pre-drain snapshot invalidates
-that attempt and forces a fresh capture/drain under P7's existing protocol.
-Native artifact identity is explicit, not inferred from a path.
+**Exit evidence:** deterministic protocol tests and toy-kv authority integration
+tests (`versionfs-service/tests/native_views_authority.rs`) verify native views
+can be read without mounting the filesystem; append and staged-artifact races
+fall wholly on one side of capture; retained log ranges and explicit attachments
+survive live whole-batch-boundary trim; an append or staged-artifact flush
+completing after the pre-drain snapshot invalidates that attempt and forces a
+fresh capture/drain under P7's existing protocol; native artifact identity
+(`ArtifactId`) is explicit and never inferred from a path; inline (`<= 64 KiB`)
+and 4 MiB chunked artifacts round-trip through published `GenerationDescriptorV2`
+graphs. This qualifies the backend-neutral P8 native-view protocols against
+toy-kv and test object stores; CLI/service transport wiring and real-S3 runs
+remain pending in P9/P12.
 
 ### P9. SDK, service, and CLI lifecycle
 
