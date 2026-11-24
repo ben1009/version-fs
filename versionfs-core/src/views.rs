@@ -358,6 +358,17 @@ impl LogSegmentIndex {
         })
     }
 
+    /// Removes the segment range keyed by `first_seq`, if present.
+    pub fn remove<S: MapObjectStore>(
+        &self,
+        store: &mut S,
+        first_seq: u64,
+    ) -> Result<Self, ViewError> {
+        Ok(Self {
+            map: self.map.remove(store, &first_seq.to_be_bytes())?,
+        })
+    }
+
     /// Returns all ranges in sequence order.
     pub fn entries<S: MapObjectStore>(
         &self,
@@ -375,6 +386,39 @@ impl LogSegmentIndex {
                 Ok((first_seq, entry))
             })
             .collect()
+    }
+
+    /// Seeks to the first segment covering or following `from_seq` and returns
+    /// up to `limit` segment entries in sequence order without scanning earlier
+    /// index subtrees.
+    pub fn entries_from<S: MapObjectStore>(
+        &self,
+        store: &S,
+        from_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, SegmentIndexEntry)>, ViewError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let raw =
+            self.map
+                .range_from_floor(store, &from_seq.to_be_bytes(), limit.saturating_add(1))?;
+        let mut out = Vec::with_capacity(limit.min(raw.len()));
+        for (key, value) in raw {
+            let first_seq = decode_u64_key(&key)?;
+            let entry = SegmentIndexEntry::decode(&value)?;
+            if first_seq >= entry.end_seq {
+                return Err(FormatError::InvalidNativeView("empty segment-index range").into());
+            }
+            if entry.end_seq <= from_seq {
+                continue;
+            }
+            out.push((first_seq, entry));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -423,6 +467,23 @@ impl LogMap {
             .get(store, name.as_bytes())?
             .map(|value| LogMapEntry::decode(&value))
             .transpose()?)
+    }
+
+    /// Returns all named logs in deterministic bytewise name order.
+    pub fn entries<S: MapObjectStore>(
+        &self,
+        store: &S,
+    ) -> Result<Vec<(String, LogMapEntry)>, ViewError> {
+        self.map
+            .entries(store)?
+            .into_iter()
+            .map(|(name, value)| {
+                let name = String::from_utf8(name).map_err(|_| {
+                    FormatError::InvalidNativeView("log names must be non-empty UTF-8")
+                })?;
+                Ok((name, LogMapEntry::decode(&value)?))
+            })
+            .collect()
     }
 
     /// Returns a new map with a named log inserted or replaced.
@@ -518,6 +579,23 @@ impl ArtifactMap {
             .get(store, name.as_bytes())?
             .map(|value| ArtifactDescriptor::decode(&value))
             .transpose()?)
+    }
+
+    /// Returns all named artifacts in deterministic bytewise name order.
+    pub fn entries<S: MapObjectStore>(
+        &self,
+        store: &S,
+    ) -> Result<Vec<(String, ArtifactDescriptor)>, ViewError> {
+        self.map
+            .entries(store)?
+            .into_iter()
+            .map(|(name, value)| {
+                let name = String::from_utf8(name).map_err(|_| {
+                    FormatError::InvalidNativeView("artifact names must be non-empty UTF-8")
+                })?;
+                Ok((name, ArtifactDescriptor::decode(&value)?))
+            })
+            .collect()
     }
 
     /// Returns a new map with a named artifact inserted or replaced.
@@ -632,6 +710,21 @@ pub fn encode_artifact_blob(payload: &[u8]) -> Result<Vec<u8>, FormatError> {
     encode_object(ObjectType::ArtifactBlob, payload)
 }
 
+/// Decodes and validates one inline artifact payload object.
+pub fn decode_artifact_blob(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let object = crate::format::decode_object(bytes)?;
+    if object.object_type != ObjectType::ArtifactBlob {
+        return Err(FormatError::ObjectReferenceMismatch);
+    }
+    if object.payload.len() > MAX_ARTIFACT_BLOB_BYTES {
+        return Err(FormatError::PayloadTooLarge {
+            actual: object.payload.len(),
+            maximum: MAX_ARTIFACT_BLOB_BYTES,
+        });
+    }
+    Ok(object.payload.to_vec())
+}
+
 /// Encodes one non-empty fixed-size-or-final artifact chunk (at most 4 MiB).
 pub fn encode_artifact_chunk(payload: &[u8]) -> Result<Vec<u8>, FormatError> {
     if payload.is_empty() {
@@ -646,6 +739,26 @@ pub fn encode_artifact_chunk(payload: &[u8]) -> Result<Vec<u8>, FormatError> {
         });
     }
     encode_object(ObjectType::ArtifactChunk, payload)
+}
+
+/// Decodes and validates one non-empty artifact chunk object.
+pub fn decode_artifact_chunk(bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    let object = crate::format::decode_object(bytes)?;
+    if object.object_type != ObjectType::ArtifactChunk {
+        return Err(FormatError::ObjectReferenceMismatch);
+    }
+    if object.payload.is_empty() {
+        return Err(FormatError::InvalidNativeView(
+            "artifact chunks must not be empty",
+        ));
+    }
+    if object.payload.len() > ARTIFACT_CHUNK_BYTES {
+        return Err(FormatError::PayloadTooLarge {
+            actual: object.payload.len(),
+            maximum: ARTIFACT_CHUNK_BYTES,
+        });
+    }
+    Ok(object.payload.to_vec())
 }
 
 fn encode_ref(reference: ObjectRef) -> Result<Vec<u8>, FormatError> {

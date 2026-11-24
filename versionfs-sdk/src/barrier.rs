@@ -905,11 +905,32 @@ pub trait VolumeBarrierControl: Send + Sync {
         capture_id: Option<OperationId>,
     ) -> Result<BranchState, ControlError>;
 
+    /// Atomically advances branch live roots with optional native-view request
+    /// fingerprint, canonical receipt payload, and/or claimed `LogId`.
+    fn commit_live_roots_with_meta(
+        &self,
+        operation_id: OperationId,
+        expected_revision: u64,
+        grant: WriterGrant,
+        roots: LiveRoots,
+        capture_id: Option<OperationId>,
+        native_meta: Option<versionfs_core::control::NativeRootTransitionMeta>,
+    ) -> Result<BranchState, ControlError> {
+        let _ = native_meta;
+        self.commit_live_roots(operation_id, expected_revision, grant, roots, capture_id)
+    }
+
     /// Aborts a preparation or tombstones an operation ID that never began.
     fn abort_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
 
     /// Reads the exact state of a barrier operation for recovery.
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError>;
+
+    /// Queries a committed `commit_live_roots` transition for exact replay verification.
+    fn get_committed_root_transition(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError>;
 
     /// Verifies that the branch's writer grant and writable attachment remain
     /// live on the current authoritative owner incarnation and monotonic clock.
@@ -999,12 +1020,39 @@ impl<A: MetadataAuthority> VolumeBarrierControl for WorkspaceControl<A> {
         )
     }
 
+    fn commit_live_roots_with_meta(
+        &self,
+        operation_id: OperationId,
+        expected_revision: u64,
+        grant: WriterGrant,
+        roots: LiveRoots,
+        capture_id: Option<OperationId>,
+        native_meta: Option<versionfs_core::control::NativeRootTransitionMeta>,
+    ) -> Result<BranchState, ControlError> {
+        WorkspaceControl::commit_live_roots_with_meta(
+            self,
+            operation_id,
+            expected_revision,
+            grant,
+            roots,
+            capture_id.map(|capture_id| (capture_id, operation_id)),
+            native_meta,
+        )
+    }
+
     fn abort_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         WorkspaceControl::abort_operation(self, operation_id)
     }
 
     fn get_operation(&self, operation_id: OperationId) -> Result<OperationState, ControlError> {
         WorkspaceControl::get_operation(self, operation_id)
+    }
+
+    fn get_committed_root_transition(
+        &self,
+        operation_id: OperationId,
+    ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError> {
+        WorkspaceControl::get_committed_root_transition(self, operation_id)
     }
 }
 
@@ -3081,6 +3129,19 @@ mod tests {
                 *operation = OperationState::Aborted;
             }
             Ok(operation.clone())
+        }
+
+        fn get_committed_root_transition(
+            &self,
+            operation_id: OperationId,
+        ) -> Result<Option<versionfs_core::control::CommittedRootTransition>, ControlError>
+        {
+            let state = self.0.lock().map_err(|_| ControlError::InvalidTransition)?;
+            match state.operations.get(&operation_id) {
+                Some(OperationState::Committed(_)) => Err(ControlError::OperationMismatch),
+                Some(OperationState::Aborted) => Err(ControlError::Aborted),
+                Some(OperationState::Preparing { .. }) | None => Ok(None),
+            }
         }
     }
 

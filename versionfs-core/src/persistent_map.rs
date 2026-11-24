@@ -280,6 +280,35 @@ impl PersistentBTree {
         Ok(entries)
     }
 
+    /// Seeks to the greatest key `<= target_key` (if any, otherwise the first key
+    /// `> target_key`) and returns up to `limit` entries in strict bytewise key
+    /// order without scanning earlier subtrees.
+    pub fn range_from_floor<S: MapObjectStore>(
+        &self,
+        store: &S,
+        target_key: &[u8],
+        limit: usize,
+    ) -> Result<Vec<MapEntry>, PersistentMapError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start_key =
+            floor_key_in_subtree(store, self.root, self.node_type, None, None, target_key)?;
+        let effective_start = start_key.as_deref().unwrap_or(target_key);
+        let mut entries = Vec::new();
+        collect_from_key_limited(
+            store,
+            self.root,
+            self.node_type,
+            None,
+            None,
+            effective_start,
+            limit,
+            &mut entries,
+        )?;
+        Ok(entries)
+    }
+
     /// Returns ordered entries and every reachable map-node reference.
     pub fn entries_and_nodes<S: MapObjectStore>(
         &self,
@@ -1052,6 +1081,120 @@ fn collapse_root<S: MapObjectStore>(
             _ => return Ok(root),
         }
     }
+}
+
+fn floor_key_in_subtree<S: MapObjectStore>(
+    store: &S,
+    reference: ObjectRef,
+    node_type: ObjectType,
+    expected_level: Option<u16>,
+    expected_max: Option<Vec<u8>>,
+    target_key: &[u8],
+) -> Result<Option<Vec<u8>>, PersistentMapError> {
+    let node = load_node(store, reference, node_type)?;
+    if expected_level.is_some_and(|level| level != node.level()) {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if expected_max
+        .as_deref()
+        .is_some_and(|maximum| node.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    match node {
+        Node::Leaf(leaf) => {
+            let pos = leaf.partition_point(|(key, _)| key.as_slice() <= target_key);
+            Ok(pos.checked_sub(1).map(|idx| leaf[idx].0.clone()))
+        }
+        Node::Internal { level, children } => {
+            let idx = children.partition_point(|(maximum, _)| maximum.as_slice() < target_key);
+            if idx < children.len() {
+                let (maximum, child) = &children[idx];
+                if let Some(found) = floor_key_in_subtree(
+                    store,
+                    *child,
+                    node_type,
+                    Some(level - 1),
+                    Some(maximum.clone()),
+                    target_key,
+                )? {
+                    return Ok(Some(found));
+                }
+                return Ok(idx.checked_sub(1).map(|prev| children[prev].0.clone()));
+            }
+            Ok(children.last().map(|(maximum, _)| maximum.clone()))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_from_key_limited<S: MapObjectStore>(
+    store: &S,
+    reference: ObjectRef,
+    node_type: ObjectType,
+    expected_level: Option<u16>,
+    expected_max: Option<Vec<u8>>,
+    start_key: &[u8],
+    limit: usize,
+    entries: &mut Vec<(Vec<u8>, Vec<u8>)>,
+) -> Result<(), PersistentMapError> {
+    if entries.len() >= limit {
+        return Ok(());
+    }
+    let node = load_node(store, reference, node_type)?;
+    if expected_level.is_some_and(|level| level != node.level()) {
+        return Err(FormatError::InvalidPersistentNode("child level differs from parent").into());
+    }
+    if expected_max
+        .as_deref()
+        .is_some_and(|maximum| node.max_key() != Some(maximum))
+    {
+        return Err(FormatError::InvalidPersistentNode(
+            "child maximum differs from parent separator",
+        )
+        .into());
+    }
+    match node {
+        Node::Leaf(leaf) => {
+            let start = leaf.partition_point(|(key, _)| key.as_slice() < start_key);
+            for (key, value) in leaf.into_iter().skip(start) {
+                if let Some((prev, _)) = entries.last()
+                    && key.as_slice() <= prev.as_slice()
+                {
+                    return Err(FormatError::InvalidPersistentNode(
+                        "entries across leaves are not strictly ordered",
+                    )
+                    .into());
+                }
+                entries.push((key, value));
+                if entries.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Node::Internal { level, children } => {
+            let start = children.partition_point(|(maximum, _)| maximum.as_slice() < start_key);
+            for (maximum, child) in children.into_iter().skip(start) {
+                if entries.len() >= limit {
+                    break;
+                }
+                collect_from_key_limited(
+                    store,
+                    child,
+                    node_type,
+                    Some(level - 1),
+                    Some(maximum),
+                    start_key,
+                    limit,
+                    entries,
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn collect_subtree<S: MapObjectStore>(
