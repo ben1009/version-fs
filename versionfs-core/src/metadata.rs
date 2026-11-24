@@ -139,6 +139,9 @@ pub trait MetadataAuthority: Send + Sync {
     /// Read the latest authoritative value for a point key.
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError>;
 
+    /// Read the authority owner's current monotonic clock.
+    fn now(&self) -> MonotonicTime;
+
     /// Run one atomic, serializable point transaction.
     ///
     /// The body may be rerun after a definite conflict. Any other body error

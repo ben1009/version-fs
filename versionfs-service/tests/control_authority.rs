@@ -173,6 +173,10 @@ impl MetadataAuthority for AdvanceAtOutcome {
         self.inner.get(key)
     }
 
+    fn now(&self) -> MonotonicTime {
+        self.inner.now()
+    }
+
     fn transact<R, F>(
         &self,
         operation: MutationIdentity<'_>,
@@ -2647,4 +2651,121 @@ fn preparation_renewal_replays_and_expiry_clears_capture_admission() {
         .acquire_writer(op(12), branch(1), 1, grant.writer_epoch)
         .expect("acquire after expired capture cleanup");
     assert!(new_grant.writer_epoch > grant.writer_epoch);
+}
+
+#[test]
+fn branch_lifecycle_move_head_promote_delete_and_forced_handover_under_toy_kv() {
+    let env = TestEnv::new();
+    let mut store = TestObjectStore::default();
+    env.control
+        .register_generation(op(10), empty_generation(&mut store, generation(2), 100))
+        .expect("register G2");
+    env.control
+        .register_generation(op(11), empty_generation(&mut store, generation(3), 101))
+        .expect("register G3");
+
+    let feature = env
+        .control
+        .create_branch(op(12), branch(2), "feature", generation(2))
+        .expect("fork feature from G2");
+    assert_eq!(feature.head, generation(2));
+
+    let main_grant = env.writer_and_attachment();
+
+    // Commit-linearized lease expiry check rejects move_head when lease is expired.
+    env.clock.set(main_grant.expires_at.as_nanos());
+    assert_eq!(
+        env.control
+            .move_head(op(13), branch(1), 1, generation(2), main_grant, false),
+        Err(ControlError::Expired)
+    );
+
+    // Reacquire after expiry and promote feature -> main with a lost reply after commit.
+    let main_grant = env
+        .control
+        .acquire_writer(op(14), branch(1), 1, main_grant.writer_epoch)
+        .expect("reacquire after expiry");
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control
+            .promote(op(15), branch(2), 1, branch(1), 1, main_grant, false),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+    let promoted = env
+        .control
+        .promote(op(15), branch(2), 1, branch(1), 1, main_grant, false)
+        .expect("reconcile lost promote reply");
+    assert_eq!(promoted.head, generation(2));
+    assert_eq!(promoted.revision, 2);
+    assert!(promoted.writer.is_none());
+
+    // Forced handover fences an active writer + open capture on feature branch.
+    let feat_grant = env
+        .control
+        .acquire_writer(op(16), branch(2), 1, 0)
+        .expect("acquire feature writer");
+    env.control
+        .attach_volume(
+            op(17),
+            branch(2),
+            1,
+            feat_grant,
+            attachment(2),
+            protection(20),
+        )
+        .expect("attach feature");
+    env.control
+        .begin_preparation(PreparationRequest {
+            operation_id: op(18),
+            branch_id: branch(2),
+            expected_revision: 1,
+            grant: feat_grant,
+            attachment_id: attachment(2),
+            volume_epoch: 1,
+            protection_id: protection(21),
+            kind: PreparationKind::CheckpointCapture,
+            expected_roots: None,
+            dependencies: vec![],
+        })
+        .expect("open feature capture");
+    let takeover = env
+        .control
+        .force_acquire_writer(op(19), branch(2), 1, feat_grant.writer_epoch)
+        .expect("force handover fences open capture");
+    assert_eq!(
+        env.control.get_operation(op(18)).unwrap(),
+        OperationState::Aborted
+    );
+
+    // Delete feature branch with lost reply reconciliation, then reuse its name.
+    env.failures
+        .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+    assert!(matches!(
+        env.control
+            .delete_branch(op(20), branch(2), 1, takeover, false),
+        Err(ControlError::Metadata(MetadataError::UnknownOutcome { .. }))
+    ));
+    env.control
+        .delete_branch(op(20), branch(2), 1, takeover, false)
+        .expect("reconcile lost delete_branch reply");
+    assert_eq!(
+        env.control.branch_by_name("feature"),
+        Err(ControlError::NotFound)
+    );
+    let reused = env
+        .control
+        .create_branch(op(21), branch(3), "feature", generation(3))
+        .expect("reuse deleted branch name");
+    assert_eq!(reused.branch_id, branch(3));
+    assert_eq!(reused.head, generation(3));
+
+    // Replaying old delete_branch must not disturb the recreated branch.
+    env.control
+        .delete_branch(op(20), branch(2), 1, takeover, false)
+        .expect("replay old delete safely");
+    assert_eq!(
+        env.control.branch_by_name("feature").unwrap().branch_id,
+        branch(3)
+    );
 }

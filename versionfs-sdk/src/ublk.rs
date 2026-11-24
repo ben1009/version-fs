@@ -301,9 +301,10 @@ fn error_to_errno(error: BlockError) -> i32 {
             eprintln!("ublk durable barrier failed: {error}");
             -libc::EIO
         }
-        BlockError::View(_) | BlockError::InvalidDirtyCapacity | BlockError::BarrierUnresolved => {
-            -libc::EIO
-        }
+        BlockError::View(_)
+        | BlockError::InvalidDirtyCapacity
+        | BlockError::BarrierUnresolved
+        | BlockError::MutationAdmissionClosed => -libc::EIO,
     }
 }
 

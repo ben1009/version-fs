@@ -154,6 +154,29 @@ pub enum CaptureMode {
     FilesystemCleanUnmount = 3,
 }
 
+impl CaptureMode {
+    /// Returns the canonical RFC-002 mode name persisted by capture tooling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BlockCut => "block_cut",
+            Self::FilesystemFrozen => "filesystem_frozen",
+            Self::FilesystemCleanUnmount => "filesystem_clean_unmount",
+        }
+    }
+
+    /// Parses one of the three declared RFC-002 capture mode names.
+    pub fn from_name(name: &str) -> Result<Self, FormatError> {
+        match name {
+            "block_cut" => Ok(Self::BlockCut),
+            "filesystem_frozen" => Ok(Self::FilesystemFrozen),
+            "filesystem_clean_unmount" => Ok(Self::FilesystemCleanUnmount),
+            _ => Err(FormatError::InvalidGenerationDescriptor(
+                "unknown capture mode",
+            )),
+        }
+    }
+}
+
 impl TryFrom<u8> for CaptureMode {
     type Error = FormatError;
 

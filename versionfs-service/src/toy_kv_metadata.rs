@@ -410,6 +410,10 @@ impl MetadataAuthority for ToyKvMetadataAuthority {
         read_domain_value(&engine, key)
     }
 
+    fn now(&self) -> versionfs_core::time::MonotonicTime {
+        self.clock.now()
+    }
+
     fn transact<R, F>(
         &self,
         operation: MutationIdentity<'_>,
