@@ -1616,6 +1616,9 @@ mod tests {
             .unwrap_or_else(|| exe.parent().unwrap());
         let bin = target_dir.join("versionfsd");
         let status = Command::new(env!("CARGO"))
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env("CARGO_TARGET_DIR", target_dir.parent().unwrap())
             .args([
                 "build",
                 "--offline",

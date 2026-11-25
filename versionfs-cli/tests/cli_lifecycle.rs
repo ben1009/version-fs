@@ -68,8 +68,12 @@ fn cli_bin() -> PathBuf {
 
 fn ensure_versionfsd_bin() -> PathBuf {
     let cli = cli_bin();
-    let candidate = cli.parent().unwrap().join("versionfsd");
+    let target_debug = cli.parent().unwrap();
+    let candidate = target_debug.join("versionfsd");
     let status = Command::new(env!("CARGO"))
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("CARGO_TARGET_DIR", target_debug.parent().unwrap())
         .args([
             "build",
             "--offline",
