@@ -801,7 +801,15 @@ fn run(cli: Cli) -> Result<Value, String> {
                 discard_dirty,
             } => {
                 if let Some(sock) = control_socket {
-                    let resp = send_worker_command(&sock, &WorkerRequest::Detach)?;
+                    if let Some(ref br_hex) = branch_id {
+                        let _ = decode_hex_16(br_hex)?;
+                    }
+                    let resp = send_worker_command(
+                        &sock,
+                        &WorkerRequest::Detach {
+                            expected_branch_id: branch_id,
+                        },
+                    )?;
                     return worker_resp_json(resp);
                 }
                 if !discard_dirty {
@@ -1607,21 +1615,19 @@ mod tests {
             .find(|p| p.file_name().is_some_and(|n| n == "debug"))
             .unwrap_or_else(|| exe.parent().unwrap());
         let bin = target_dir.join("versionfsd");
-        if !bin.exists() {
-            let status = Command::new(env!("CARGO"))
-                .args([
-                    "build",
-                    "--offline",
-                    "--locked",
-                    "-p",
-                    "versionfs-service",
-                    "--bin",
-                    "versionfsd",
-                ])
-                .status()
-                .unwrap();
-            assert!(status.success());
-        }
+        let status = Command::new(env!("CARGO"))
+            .args([
+                "build",
+                "--offline",
+                "--locked",
+                "-p",
+                "versionfs-service",
+                "--bin",
+                "versionfsd",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
         assert!(bin.exists(), "missing {}", bin.display());
         bin
     }
@@ -1676,11 +1682,18 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut ready = String::new();
-        BufReader::new(svc.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
+        let stdout = svc.stdout.take().unwrap();
         let _svc_guard = ChildGuard(Some(svc));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ready = String::new();
+            let res = BufReader::new(stdout).read_line(&mut ready).map(|_| ready);
+            let _ = tx.send(res);
+        });
+        let ready = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("timed out waiting for versionfsd READY")
+            .expect("failed reading versionfsd READY");
         let ep = ready.trim().strip_prefix("READY ").unwrap().to_owned();
 
         let ws = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

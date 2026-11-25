@@ -69,9 +69,6 @@ fn cli_bin() -> PathBuf {
 fn ensure_versionfsd_bin() -> PathBuf {
     let cli = cli_bin();
     let candidate = cli.parent().unwrap().join("versionfsd");
-    if candidate.exists() {
-        return candidate;
-    }
     let status = Command::new(env!("CARGO"))
         .args([
             "build",

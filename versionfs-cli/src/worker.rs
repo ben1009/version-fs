@@ -121,7 +121,10 @@ pub enum WorkerRequest {
     /// Returns live worker status.
     Status,
     /// Cleanly detaches the volume, releases the writer grant, and stops the worker.
-    Detach,
+    Detach {
+        /// Optional expected branch ID hex to guard against targeting the wrong worker socket.
+        expected_branch_id: Option<String>,
+    },
 }
 
 /// Responses returned by the worker block-server control socket.
@@ -307,16 +310,29 @@ pub fn run_worker_server(config: WorkerConfig) -> Result<(), String> {
     }
     if let Some(parent) = config.control_socket.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create socket parent: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("set private permissions on {}: {e}", parent.display()))?;
+        }
     }
     let listener = UnixListener::bind(&config.control_socket)
         .map_err(|e| format!("bind {}: {e}", config.control_socket.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
+        std::fs::set_permissions(
             &config.control_socket,
             std::fs::Permissions::from_mode(0o600),
-        );
+        )
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&config.control_socket);
+            format!(
+                "set 0600 permissions on {}: {e}",
+                config.control_socket.display()
+            )
+        })?;
     }
     listener
         .set_nonblocking(true)
@@ -325,6 +341,7 @@ pub fn run_worker_server(config: WorkerConfig) -> Result<(), String> {
     println!("READY {}", config.control_socket.display());
 
     let done = Arc::new(AtomicBool::new(false));
+    let mut detached_volume = false;
     while !done.load(Ordering::Acquire) {
         if stop_rx.try_recv().is_ok() {
             break;
@@ -359,6 +376,7 @@ pub fn run_worker_server(config: WorkerConfig) -> Result<(), String> {
                     &mut volume,
                     &mut producer_gate,
                     &mut coordinator,
+                    &mut detached_volume,
                     &mut should_exit,
                 );
                 let _ = send_worker_response(&mut stream, &resp);
@@ -398,11 +416,28 @@ fn handle_worker_request(
         impl FnMut() -> (OperationId, ProtectionId),
     >,
     coordinator: &mut CheckpointCoordinator<FileCaptureJournal>,
+    detached_volume: &mut bool,
     should_exit: &mut bool,
 ) -> WorkerResponse {
     let current_grant = heartbeat.current_grant();
     volume.set_writer_grant(current_grant);
     producer_gate.set_writer_grant(current_grant);
+    if heartbeat.is_fenced()
+        && matches!(
+            req,
+            WorkerRequest::Write { .. }
+                | WorkerRequest::Flush
+                | WorkerRequest::StageArtifact { .. }
+                | WorkerRequest::StageRemoveArtifact { .. }
+                | WorkerRequest::Checkpoint { .. }
+                | WorkerRequest::RecoverCapture
+                | WorkerRequest::ReconcileBarrier
+        )
+    {
+        return WorkerResponse::Error {
+            message: "worker writer grant or attachment has been fenced".to_owned(),
+        };
+    }
     match req {
         WorkerRequest::Write { offset, data_hex } => {
             let data = match decode_hex_bytes(&data_hex) {
@@ -448,17 +483,15 @@ fn handle_worker_request(
             }
         }
         WorkerRequest::Flush => match volume.dispatch(BlockRequest::Flush) {
-            Ok(_) => match client.get_branch(config.branch_id) {
-                Ok(branch) => WorkerResponse::FlushAck {
-                    branch_id: branch.branch_id.to_string(),
-                    revision: branch.revision,
-                    volume_root: branch.volume_root.object_id.to_string(),
+            Ok(_) => {
+                let (revision, volume_root) = volume.durable_live_boundary();
+                WorkerResponse::FlushAck {
+                    branch_id: config.branch_id.to_string(),
+                    revision,
+                    volume_root: volume_root.object_id.to_string(),
                     durable_live_volume: true,
-                },
-                Err(e) => WorkerResponse::Error {
-                    message: e.to_string(),
-                },
-            },
+                }
+            }
             Err(e) => WorkerResponse::Error {
                 message: e.to_string(),
             },
@@ -587,25 +620,42 @@ fn handle_worker_request(
                 volume_epoch: att.volume_epoch,
             }
         }
-        WorkerRequest::Detach => {
-            if let Err(e) = volume.flush() {
-                return WorkerResponse::Error {
-                    message: format!("flush before detach failed: {e}"),
+        WorkerRequest::Detach { expected_branch_id } => {
+            if let Some(expected_hex) = expected_branch_id {
+                let expected = match decode_hex_16(&expected_hex) {
+                    Ok(arr) => BranchId::from_bytes(arr),
+                    Err(message) => return WorkerResponse::Error { message },
                 };
+                if expected != config.branch_id {
+                    return WorkerResponse::Error {
+                        message: format!(
+                            "worker serves branch {}, not requested {expected}",
+                            config.branch_id
+                        ),
+                    };
+                }
             }
             let cur_grant = heartbeat.current_grant();
-            let cur_att = heartbeat.current_attachment();
-            if let Err(e) = client.detach_volume(
-                alloc_op_id(),
-                config.branch_id,
-                cur_att.attachment_id,
-                cur_att.volume_epoch,
-                cur_att.protection_id,
-                cur_grant,
-            ) {
-                return WorkerResponse::Error {
-                    message: e.to_string(),
-                };
+            if !*detached_volume {
+                if let Err(e) = volume.flush() {
+                    return WorkerResponse::Error {
+                        message: format!("flush before detach failed: {e}"),
+                    };
+                }
+                let cur_att = heartbeat.current_attachment();
+                if let Err(e) = client.detach_volume(
+                    alloc_op_id(),
+                    config.branch_id,
+                    cur_att.attachment_id,
+                    cur_att.volume_epoch,
+                    cur_att.protection_id,
+                    cur_grant,
+                ) {
+                    return WorkerResponse::Error {
+                        message: e.to_string(),
+                    };
+                }
+                *detached_volume = true;
             }
             if let Err(e) = client.release_writer(alloc_op_id(), cur_grant) {
                 return WorkerResponse::Error {
@@ -644,6 +694,17 @@ fn build_and_upload_provenance(
     optional_links.sort();
     optional_links.dedup();
 
+    let required_logs_root = match input.required_logs_root.as_deref() {
+        Some(raw) => parse_object_ref_hex(raw, versionfs_core::format::ObjectType::LogMapRoot)?,
+        None => branch.logs_root,
+    };
+    let required_artifacts_root = match input.required_artifacts_root.as_deref() {
+        Some(raw) => {
+            parse_object_ref_hex(raw, versionfs_core::format::ObjectType::ArtifactMapRoot)?
+        }
+        None => branch.artifacts_root,
+    };
+
     let ctx = ProvenanceContext {
         recording_principal: client.auth().principal_id,
         actor: sanitize_opt(input.actor.as_deref())?,
@@ -656,8 +717,8 @@ fn build_and_upload_provenance(
         trace_id: sanitize_opt(input.trace_id.as_deref())?,
         span_id: sanitize_opt(input.span_id.as_deref())?,
         parent_span_id: sanitize_opt(input.parent_span_id.as_deref())?,
-        required_logs_root: branch.logs_root,
-        required_artifacts_root: branch.artifacts_root,
+        required_logs_root,
+        required_artifacts_root,
         optional_links,
     };
     let encoded = ctx.encode().map_err(|e| e.to_string())?;
@@ -666,6 +727,36 @@ fn build_and_upload_provenance(
         .map_err(|e| e.to_string())?;
     Ok(ProvenanceBinding::Recorded {
         context_root: ctx_ref,
+    })
+}
+
+fn parse_object_ref_hex(
+    raw: &str,
+    expected_type: versionfs_core::format::ObjectType,
+) -> Result<versionfs_core::format::ObjectRef, String> {
+    let bytes = decode_hex_bytes(raw)?;
+    if bytes.len() != 42 {
+        return Err(format!(
+            "expected 42-byte ObjectRef hex (84 chars), got {} bytes",
+            bytes.len()
+        ));
+    }
+    let obj_type =
+        versionfs_core::format::ObjectType::try_from(u16::from_le_bytes([bytes[0], bytes[1]]))
+            .map_err(|e| format!("invalid ObjectType: {e}"))?;
+    if obj_type != expected_type {
+        return Err(format!(
+            "expected {expected_type:?} ObjectRef, got {obj_type:?}"
+        ));
+    }
+    let encoded_len = u64::from_le_bytes(bytes[34..42].try_into().unwrap());
+    if encoded_len == 0 {
+        return Err("ObjectRef encoded_len must be nonzero".to_owned());
+    }
+    Ok(versionfs_core::format::ObjectRef {
+        object_type: obj_type,
+        object_id: versionfs_core::identity::ObjectId::from_bytes(bytes[2..34].try_into().unwrap()),
+        encoded_len,
     })
 }
 
@@ -707,14 +798,28 @@ fn write_worker_frame<W: Write>(writer: &mut W, payload: &[u8]) -> Result<(), St
 }
 
 fn read_worker_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut len_buf = [0_u8; 4];
     reader.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
+    if std::time::Instant::now() > deadline {
+        return Err("worker frame header read deadline exceeded".to_owned());
+    }
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > MAX_WORKER_FRAME {
         return Err("worker frame exceeds maximum".to_owned());
     }
     let mut payload = vec![0_u8; len];
-    reader.read_exact(&mut payload).map_err(|e| e.to_string())?;
+    let mut offset = 0;
+    while offset < len {
+        if std::time::Instant::now() > deadline {
+            return Err("worker frame payload read deadline exceeded".to_owned());
+        }
+        match reader.read(&mut payload[offset..]) {
+            Ok(0) => return Err("unexpected EOF reading worker frame".to_owned()),
+            Ok(n) => offset += n,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
     Ok(payload)
 }
 

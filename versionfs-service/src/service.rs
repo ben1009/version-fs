@@ -877,6 +877,7 @@ where
                     });
                 }
                 // Frame 0: LogMapEntry metadata
+                finish_protected_read(&control, protection_id, read_deadline)?;
                 sink(RpcResponseFrame::Data(entry.encode()?))?;
                 if max_batches > 0 && from_seq < entry.end_seq {
                     let seg_index = LogSegmentIndex::from_root(entry.segment_index_root)
@@ -1006,6 +1007,7 @@ where
                     offset,
                     length,
                 )?;
+                finish_protected_read(&control, protection_id, read_deadline)?;
                 sink(RpcResponseFrame::Data(descriptor.encode()?))?;
                 for chunk in bytes.chunks(STREAM_CHUNK_BYTES) {
                     finish_protected_read(&control, protection_id, read_deadline)?;

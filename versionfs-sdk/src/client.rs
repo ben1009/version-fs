@@ -224,6 +224,29 @@ impl ServiceClient {
     }
 
     fn call_stream(&self, request: RpcRequest) -> Result<Vec<Vec<u8>>, ServiceError> {
+        const MAX_BUFFERED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+        let mut out = Vec::new();
+        let mut total_bytes = 0_usize;
+        self.call_stream_with(request, |chunk| {
+            total_bytes = total_bytes.checked_add(chunk.len()).ok_or_else(|| {
+                ServiceError::new(ServiceErrorCode::LimitExceeded, "response size overflow")
+            })?;
+            if total_bytes > MAX_BUFFERED_RESPONSE_BYTES {
+                return Err(ServiceError::new(
+                    ServiceErrorCode::LimitExceeded,
+                    "buffered RPC response exceeds 32 MiB limit",
+                ));
+            }
+            out.push(chunk);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    fn call_stream_with<F>(&self, request: RpcRequest, mut on_data: F) -> Result<(), ServiceError>
+    where
+        F: FnMut(Vec<u8>) -> Result<(), ServiceError>,
+    {
         let env = RpcEnvelope {
             auth: self.auth.clone(),
             request,
@@ -237,7 +260,7 @@ impl ServiceClient {
                         format!("connect {addr}: {e}"),
                     )
                 })?;
-                exchange_frames(&mut stream, &encoded)
+                exchange_frames_with(&mut stream, &encoded, &mut on_data)
             }
             ServiceEndpoint::Unix(path) => {
                 #[cfg(unix)]
@@ -248,7 +271,7 @@ impl ServiceClient {
                             format!("connect {}: {e}", path.display()),
                         )
                     })?;
-                    exchange_frames(&mut stream, &encoded)
+                    exchange_frames_with(&mut stream, &encoded, &mut on_data)
                 }
                 #[cfg(not(unix))]
                 {
@@ -643,20 +666,23 @@ impl ServiceClient {
         right_protection_id: ProtectionId,
         right_generation_id: GenerationId,
     ) -> Result<GenerationDiff, ServiceError> {
-        let frames = self.call_stream(RpcRequest::DiffGenerations {
-            left_protection_id,
-            left_generation_id,
-            right_protection_id,
-            right_generation_id,
-        })?;
         let mut diff = GenerationDiff::default();
-        for frame in frames {
-            match decode_rpc_diff_chunk(&frame)? {
-                DiffStreamChunk::Extents(ranges) => diff.extents.extend(ranges),
-                DiffStreamChunk::Logs(changes) => diff.logs.extend(changes),
-                DiffStreamChunk::Artifacts(changes) => diff.artifacts.extend(changes),
-            }
-        }
+        self.call_stream_with(
+            RpcRequest::DiffGenerations {
+                left_protection_id,
+                left_generation_id,
+                right_protection_id,
+                right_generation_id,
+            },
+            |frame| {
+                match decode_rpc_diff_chunk(&frame)? {
+                    DiffStreamChunk::Extents(ranges) => diff.extents.extend(ranges),
+                    DiffStreamChunk::Logs(changes) => diff.logs.extend(changes),
+                    DiffStreamChunk::Artifacts(changes) => diff.artifacts.extend(changes),
+                }
+                Ok(())
+            },
+        )?;
         Ok(diff)
     }
 
@@ -668,30 +694,38 @@ impl ServiceClient {
         from_seq: u64,
         max_batches: usize,
     ) -> Result<(LogView, Vec<LogBatchView>), ServiceError> {
-        let frames = self.call_stream(RpcRequest::ReadLogAt {
-            protection_id,
-            name: name.to_owned(),
-            from_seq,
-            max_batches,
-        })?;
-        let Some((first, rest)) = frames.split_first() else {
-            return Err(ServiceError::new(
+        let mut entry: Option<LogMapEntry> = None;
+        let mut batches = Vec::new();
+        self.call_stream_with(
+            RpcRequest::ReadLogAt {
+                protection_id,
+                name: name.to_owned(),
+                from_seq,
+                max_batches,
+            },
+            |frame| {
+                if entry.is_none() {
+                    entry = Some(LogMapEntry::decode(&frame)?);
+                } else {
+                    let (log_id, first_seq, end_seq, records, attachments) =
+                        decode_rpc_log_batch(&frame)?;
+                    batches.push(LogBatchView {
+                        log_id,
+                        first_seq,
+                        end_seq,
+                        records,
+                        attachments,
+                    });
+                }
+                Ok(())
+            },
+        )?;
+        let entry = entry.ok_or_else(|| {
+            ServiceError::new(
                 ServiceErrorCode::IntegrityError,
                 "missing LogMapEntry frame from ReadLogAt",
-            ));
-        };
-        let entry = LogMapEntry::decode(first)?;
-        let mut batches = Vec::with_capacity(rest.len());
-        for frame in rest {
-            let (log_id, first_seq, end_seq, records, attachments) = decode_rpc_log_batch(frame)?;
-            batches.push(LogBatchView {
-                log_id,
-                first_seq,
-                end_seq,
-                records,
-                attachments,
-            });
-        }
+            )
+        })?;
         Ok((LogView::from_entry(name, entry), batches))
     }
 
@@ -1342,6 +1376,7 @@ impl AttachmentHeartbeat {
         let att_bg = Arc::clone(&attachment);
 
         let thread = std::thread::spawn(move || {
+            let mut pending_writer_op: Option<OperationId> = None;
             loop {
                 match stop_rx.recv_timeout(interval) {
                     Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1354,8 +1389,12 @@ impl AttachmentHeartbeat {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-                match client.renew_writer(next_op_id(), cur_grant) {
+                // Reuse the same operation ID across transient/ambiguous errors so a
+                // committed renewal whose reply was lost replays idempotently.
+                let writer_op = *pending_writer_op.get_or_insert_with(&mut next_op_id);
+                match client.renew_writer(writer_op, cur_grant) {
                     Ok(new_grant) => {
+                        pending_writer_op = None;
                         *grant_bg
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = new_grant;
@@ -1476,20 +1515,23 @@ impl Drop for AttachmentHeartbeat {
     }
 }
 
-fn exchange_frames<S: std::io::Read + std::io::Write>(
+fn exchange_frames_with<S: std::io::Read + std::io::Write, F>(
     stream: &mut S,
     encoded_req: &[u8],
-) -> Result<Vec<Vec<u8>>, ServiceError> {
+    on_data: &mut F,
+) -> Result<(), ServiceError>
+where
+    F: FnMut(Vec<u8>) -> Result<(), ServiceError>,
+{
     {
         let mut writer = BufWriter::new(&mut *stream);
         write_frame(&mut writer, encoded_req)?;
     }
-    let mut out = Vec::new();
     loop {
         let raw = read_frame(stream)?;
         match RpcResponseFrame::decode(&raw)? {
-            RpcResponseFrame::Data(chunk) => out.push(chunk),
-            RpcResponseFrame::End => return Ok(out),
+            RpcResponseFrame::Data(chunk) => on_data(chunk)?,
+            RpcResponseFrame::End => return Ok(()),
             RpcResponseFrame::Error(err) => return Err(err),
         }
     }
