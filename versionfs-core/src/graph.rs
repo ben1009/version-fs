@@ -2,12 +2,14 @@
 
 use crate::format::{
     ARTIFACT_CHUNK_BYTES, ArtifactChunkEntry, ArtifactDescriptor, ArtifactMapRoot, CaptureMode,
-    DecodedGenerationDescriptor, EXTENT_BYTES, FormatError, LogMapEntry, LogMapRoot, LogSegment,
-    MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType, ProvenanceContext, SegmentIndexEntry,
-    VolumeRoot, decode_generation_descriptor, decode_object,
+    DecodedGenerationDescriptor, EXTENT_BYTES, FormatError, GenerationDescriptorFormat,
+    LogMapEntry, LogMapRoot, LogSegment, MAX_ARTIFACT_BLOB_BYTES, ObjectRef, ObjectType,
+    ProvenanceContext, ProvenanceCoverage, ProvenanceStatus, SegmentIndexEntry, VolumeRoot,
+    decode_generation_descriptor, decode_object,
 };
-use crate::identity::{LogId, ObjectId, ObjectStoreScopeId, PrincipalId};
+use crate::identity::{GenerationId, LogId, ObjectId, ObjectStoreScopeId, PrincipalId};
 use crate::persistent_map::{MapObjectStore, Node as MapNode, PersistentMapError, load_node};
+use crate::views::{ArtifactMap, LogMap, ViewError};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, Weak};
 use thiserror::Error;
@@ -449,6 +451,189 @@ pub fn verify_generation_with_reuse<S: MapObjectStore>(
         store_scope,
         object_refs: Arc::new(OnceLock::new()),
     })
+}
+
+/// Structured result of inspecting a protected Generation's provenance binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProvenanceInspection {
+    /// Stable Generation identity.
+    pub generation_id: GenerationId,
+    /// Original descriptor format (`V1` legacy or `V2` provenance-capable).
+    pub source_format: GenerationDescriptorFormat,
+    /// Explicit attribution status (`Recorded` or `Unattributed`).
+    pub status: ProvenanceStatus,
+    /// Explicit provenance coverage (`None` or `GenerationContext`).
+    pub coverage: ProvenanceCoverage,
+    /// Strong reference to the canonical [`ProvenanceContext`] object, if recorded.
+    pub context_root: Option<ObjectRef>,
+    /// Decoded authorized [`ProvenanceContext`], if recorded and authorized.
+    pub context: Option<ProvenanceContext>,
+}
+
+/// Errors returned while inspecting a Generation's provenance binding.
+#[derive(Debug, Error)]
+pub enum ProvenanceInspectError {
+    /// Caller is not authorized to read the recorded provenance context.
+    #[error("caller is not authorized to inspect provenance context")]
+    Unauthorized,
+    /// Required descriptor, context, or evidence object is missing or corrupt.
+    #[error("provenance integrity error: {0}")]
+    Integrity(String),
+    /// The immutable object repository failed.
+    #[error("object repository error: {0}")]
+    Store(String),
+}
+
+impl From<FormatError> for ProvenanceInspectError {
+    fn from(error: FormatError) -> Self {
+        Self::Integrity(error.to_string())
+    }
+}
+
+impl From<ViewError> for ProvenanceInspectError {
+    fn from(error: ViewError) -> Self {
+        match error {
+            ViewError::Store(msg) => Self::Store(msg),
+            other => Self::Integrity(other.to_string()),
+        }
+    }
+}
+
+/// Inspects a protected Generation's provenance binding without rewriting legacy
+/// descriptors or silently relabeling recorded provenance as unattributed.
+///
+/// External links in `optional_links` are returned as explicit descriptive strings
+/// and are never fetched.
+pub fn inspect_generation_provenance<S: MapObjectStore>(
+    store: &S,
+    generation_id: GenerationId,
+    descriptor_ref: ObjectRef,
+    caller_authorized: bool,
+    expected_recording_principal: Option<PrincipalId>,
+) -> Result<ProvenanceInspection, ProvenanceInspectError> {
+    if descriptor_ref.object_type != ObjectType::GenerationDescriptor {
+        return Err(FormatError::ObjectReferenceMismatch.into());
+    }
+    let descriptor_bytes = store
+        .get_ref(descriptor_ref)
+        .map_err(ProvenanceInspectError::Store)?
+        .ok_or_else(|| {
+            ProvenanceInspectError::Integrity(format!(
+                "missing Generation descriptor {}",
+                descriptor_ref.object_id
+            ))
+        })?;
+    descriptor_ref.verify(&descriptor_bytes)?;
+    let decoded = decode_generation_descriptor(&descriptor_bytes)?;
+    if decoded.generation_id() != generation_id {
+        return Err(ProvenanceInspectError::Integrity(
+            "Generation descriptor ID does not match requested Generation".to_owned(),
+        ));
+    }
+
+    let source_format = decoded.source_format();
+    let status = decoded.provenance_status();
+    let coverage = decoded.provenance_coverage();
+    let context_root = decoded.context_root();
+
+    let Some(context_ref) = context_root else {
+        return Ok(ProvenanceInspection {
+            generation_id,
+            source_format,
+            status,
+            coverage,
+            context_root: None,
+            context: None,
+        });
+    };
+
+    if !caller_authorized {
+        return Err(ProvenanceInspectError::Unauthorized);
+    }
+
+    let context_bytes = store
+        .get_ref(context_ref)
+        .map_err(ProvenanceInspectError::Store)?
+        .ok_or_else(|| {
+            ProvenanceInspectError::Integrity(format!(
+                "missing provenance context {}",
+                context_ref.object_id
+            ))
+        })?;
+    context_ref.verify(&context_bytes)?;
+    let context = ProvenanceContext::decode(&context_bytes)?;
+    if let Some(expected_principal) = expected_recording_principal
+        && context.recording_principal != expected_principal
+    {
+        return Err(ProvenanceInspectError::Integrity(
+            "provenance context recording principal disagrees with authoritative binding"
+                .to_owned(),
+        ));
+    }
+
+    // Verify required evidence roots exist and are valid typed maps (without
+    // fetching external `optional_links`).
+    LogMap::open(store, context.required_logs_root)?;
+    ArtifactMap::open(store, context.required_artifacts_root)?;
+
+    Ok(ProvenanceInspection {
+        generation_id,
+        source_format,
+        status,
+        coverage,
+        context_root: Some(context_ref),
+        context: Some(context),
+    })
+}
+
+/// Sanitizes caller-supplied provenance text before ingestion into [`ProvenanceContext`]:
+/// strips ASCII control characters (replacing newlines/tabs with spaces), redacts
+/// common credential prefixes (`Bearer `, `sk-`, `AKIA`), trims whitespace, and
+/// rejects empty or oversized values.
+pub fn sanitize_provenance_text(input: &str, max_bytes: usize) -> Result<String, FormatError> {
+    let mut cleaned = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if ch == '\n' || ch == '\r' || ch == '\t' {
+            cleaned.push(' ');
+        } else if !ch.is_control() {
+            cleaned.push(ch);
+        }
+    }
+    let redacted = redact_secret_tokens(cleaned.trim());
+    if redacted.is_empty() || redacted.len() > max_bytes {
+        return Err(FormatError::InvalidProvenance(
+            "sanitized provenance text must be non-empty and within length bounds",
+        ));
+    }
+    Ok(redacted)
+}
+
+fn redact_secret_tokens(text: &str) -> String {
+    let mut out = Vec::new();
+    let mut redact_next = false;
+    for token in text.split_whitespace() {
+        if redact_next {
+            out.push("[REDACTED]");
+            redact_next = false;
+            continue;
+        }
+        if token.eq_ignore_ascii_case("bearer") {
+            out.push(token);
+            redact_next = true;
+            continue;
+        }
+        if token.starts_with("sk-")
+            || token.starts_with("AKIA")
+            || token.starts_with("ASIA")
+            || token.starts_with("ghp_")
+            || token.starts_with("gho_")
+        {
+            out.push("[REDACTED]");
+        } else {
+            out.push(token);
+        }
+    }
+    out.join(" ")
 }
 
 struct Verifier<'a, S> {

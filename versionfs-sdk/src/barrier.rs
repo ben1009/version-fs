@@ -1489,6 +1489,11 @@ where
         Ok(volume)
     }
 
+    /// Updates the writer grant held by this volume after a background heartbeat renewal.
+    pub const fn set_writer_grant(&mut self, grant: WriterGrant) {
+        self.writer_grant = grant;
+    }
+
     /// Persists all currently dirty writes and advances the authoritative live root.
     ///
     /// Once attachment fencing or terminal lease expiry is observed, this worker

@@ -21,8 +21,12 @@ capture preparation. P6 adds a durable barrier coordinator, local recovery
 journal, and S3-backed live-root path; this implementation has not yet been
 qualified against real S3, ublk, or ext4. `DirtyVolume` remains volatile, while
 the generic ublk adapter derives FLUSH/FUA capability from its supplied
-`BlockDevice`. The service and SDK lifecycle that uses these protocols remains
-in progress.
+`BlockDevice`. P8 adds persistent native ordered logs, named artifacts, and their service/SDK
+lifecycle. P9 adds the typed, authorized, bounded `versionfsd` RPC service,
+`ServiceClient`, `AttachmentHeartbeat`, `ProtectedReadHandle`, `ReadOnlyVolume`,
+`LinuxFilesystemBoundary`, and the `versionfs` CLI; see
+[CLI, Service, and SDK Lifecycle](cli-and-service.md) for acknowledgement levels,
+OS permissions, external dependencies, and capture-boundary non-guarantees.
 
 Workspace cache directories have one owner at a time; drop the prior cache
 handle before reopening its directory. An exclusive file lock also prevents

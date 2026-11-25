@@ -8,6 +8,7 @@ pub mod identity;
 pub mod metadata;
 pub mod metrics;
 pub mod persistent_map;
+pub mod rpc;
 pub mod time;
 pub mod views;
 

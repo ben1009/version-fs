@@ -144,6 +144,9 @@ pub struct InventoryPage {
 /// callers cannot choose a key or claim a digest.
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    /// Returns the deterministic object-store namespace scope for `workspace_id`.
+    fn scope_id(&self, workspace_id: WorkspaceId) -> ObjectStoreScopeId;
+
     /// Conditionally creates an encoded object or verifies identical reuse.
     async fn put(
         &self,
@@ -234,6 +237,171 @@ pub struct S3ObjectStore {
     deployment_prefix: String,
     backend_namespace: String,
     transfer_budget: TransferBudget,
+}
+
+/// Durable local-directory immutable object store for standalone `versionfsd`
+/// development and multi-process testing without an S3 endpoint.
+///
+/// Objects are written atomically via temp file + `sync_all` + `rename` and
+/// verified on read; no delete or overwrite operation is exposed.
+pub struct DirectoryObjectStore {
+    root: std::path::PathBuf,
+    namespace: String,
+    next_tmp: std::sync::atomic::AtomicU64,
+}
+
+impl DirectoryObjectStore {
+    /// Opens or creates a durable directory object store rooted at `root`.
+    pub fn open(root: impl AsRef<std::path::Path>) -> Result<Self, ObjectStoreError> {
+        let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root).map_err(|e| {
+            ObjectStoreError::Backend(format!("create object store root {}: {e}", root.display()))
+        })?;
+        let canonical = std::fs::canonicalize(&root).map_err(|e| {
+            ObjectStoreError::Backend(format!(
+                "canonicalize object store root {}: {e}",
+                root.display()
+            ))
+        })?;
+        Ok(Self {
+            namespace: format!("dir://{}", canonical.display()),
+            root: canonical,
+            next_tmp: std::sync::atomic::AtomicU64::new(1),
+        })
+    }
+
+    fn object_path(&self, workspace_id: WorkspaceId, reference: ObjectRef) -> std::path::PathBuf {
+        self.root
+            .join(workspace_id.to_string())
+            .join(format!("{:04x}", reference.object_type as u16))
+            .join(format!("{}.obj", reference.object_id))
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DirectoryObjectStore {
+    fn scope_id(&self, workspace_id: WorkspaceId) -> ObjectStoreScopeId {
+        let mut scope_input =
+            Vec::with_capacity(self.namespace.len() + workspace_id.as_bytes().len());
+        scope_input.extend_from_slice(self.namespace.as_bytes());
+        scope_input.extend_from_slice(workspace_id.as_bytes());
+        let digest = Sha256::digest(&scope_input);
+        ObjectStoreScopeId::from_bytes(
+            digest[..16]
+                .try_into()
+                .expect("SHA-256 digest has at least 16 bytes"),
+        )
+    }
+
+    async fn put(
+        &self,
+        workspace_id: WorkspaceId,
+        encoded_object: &[u8],
+    ) -> Result<StoredObject, ObjectStoreError> {
+        use std::io::Write;
+        if encoded_object.len() > MAX_ENCODED_OBJECT_BYTES {
+            return Err(ObjectStoreError::LimitExceeded(
+                "encoded object exceeds the canonical format maximum",
+            ));
+        }
+        let object_ref = ObjectRef::from_encoded(encoded_object)?;
+        let path = self.object_path(workspace_id, object_ref);
+        if path.exists() {
+            let existing = std::fs::read(&path)
+                .map_err(|e| ObjectStoreError::Backend(format!("read existing object: {e}")))?;
+            if existing != encoded_object {
+                return Err(ObjectStoreError::IntegrityMismatch {
+                    workspace_id,
+                    object_id: object_ref.object_id,
+                });
+            }
+            return Ok(StoredObject {
+                object_ref,
+                disposition: PutDisposition::Reused,
+            });
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| ObjectStoreError::Backend("missing parent directory".to_owned()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ObjectStoreError::Backend(format!("create object dir: {e}")))?;
+        let tmp_id = self
+            .next_tmp
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!(".tmp-{}-{tmp_id}", std::process::id()));
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .map_err(|e| ObjectStoreError::Backend(format!("open temp object: {e}")))?;
+            file.write_all(encoded_object)
+                .map_err(|e| ObjectStoreError::Backend(format!("write temp object: {e}")))?;
+            file.sync_all()
+                .map_err(|e| ObjectStoreError::Backend(format!("sync temp object: {e}")))?;
+        }
+        if path.exists() {
+            let _ = std::fs::remove_file(&tmp_path);
+            let existing = std::fs::read(&path)
+                .map_err(|e| ObjectStoreError::Backend(format!("read existing object: {e}")))?;
+            if existing != encoded_object {
+                return Err(ObjectStoreError::IntegrityMismatch {
+                    workspace_id,
+                    object_id: object_ref.object_id,
+                });
+            }
+            return Ok(StoredObject {
+                object_ref,
+                disposition: PutDisposition::Reused,
+            });
+        }
+        std::fs::rename(&tmp_path, &path)
+            .map_err(|e| ObjectStoreError::Backend(format!("rename object: {e}")))?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(StoredObject {
+            object_ref,
+            disposition: PutDisposition::Created,
+        })
+    }
+
+    async fn get(
+        &self,
+        workspace_id: WorkspaceId,
+        expected: ObjectRef,
+    ) -> Result<Vec<u8>, ObjectStoreError> {
+        let path = self.object_path(workspace_id, expected);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ObjectStoreError::NotFound {
+                    workspace_id,
+                    object_id: expected.object_id,
+                });
+            }
+            Err(e) => return Err(ObjectStoreError::Backend(format!("read object: {e}"))),
+        };
+        expected
+            .verify(&bytes)
+            .map_err(|_| ObjectStoreError::IntegrityMismatch {
+                workspace_id,
+                object_id: expected.object_id,
+            })?;
+        Ok(bytes)
+    }
+
+    async fn inventory_page(
+        &self,
+        _workspace_id: WorkspaceId,
+        _cursor: Option<&InventoryCursor>,
+        _limit: usize,
+    ) -> Result<InventoryPage, ObjectStoreError> {
+        Ok(InventoryPage {
+            entries: Vec::new(),
+            next_cursor: None,
+        })
+    }
 }
 
 /// Synchronous typed map-store bridge for block workers using an S3 client.
@@ -540,6 +708,19 @@ impl S3ObjectStore {
 
 #[async_trait]
 impl ObjectStore for S3ObjectStore {
+    fn scope_id(&self, workspace_id: WorkspaceId) -> ObjectStoreScopeId {
+        let mut scope_input =
+            Vec::with_capacity(self.backend_namespace.len() + workspace_id.as_bytes().len());
+        scope_input.extend_from_slice(self.backend_namespace.as_bytes());
+        scope_input.extend_from_slice(workspace_id.as_bytes());
+        let digest = Sha256::digest(&scope_input);
+        ObjectStoreScopeId::from_bytes(
+            digest[..16]
+                .try_into()
+                .expect("SHA-256 digest has at least 16 bytes"),
+        )
+    }
+
     async fn put(
         &self,
         workspace_id: WorkspaceId,

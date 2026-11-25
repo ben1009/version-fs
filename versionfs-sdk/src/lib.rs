@@ -3,6 +3,8 @@
 pub mod artifacts;
 pub mod barrier;
 pub mod capture;
+pub mod client;
+pub mod linux_fs;
 pub mod logs;
 pub mod object_cache;
 pub mod volume;
