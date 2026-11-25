@@ -759,6 +759,11 @@ where
         }
     }
 
+    /// Updates the writer grant held by this producer gate after a heartbeat renewal.
+    pub const fn set_writer_grant(&mut self, grant: versionfs_core::control::WriterGrant) {
+        self.ctx.grant = grant;
+    }
+
     /// Returns a handle to the shared [`NativeAdmissionGate`] so [`crate::logs::LogClient`]
     /// and [`ArtifactClient`] share the exact same capture admission gate.
     pub fn admission(&self) -> NativeAdmissionGate {

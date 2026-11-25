@@ -33,6 +33,8 @@ pub const WRITER_LEASE_NANOS: u64 = 30_000_000_000;
 pub const ATTACHMENT_PROTECTION_NANOS: u64 = 300_000_000_000;
 /// Historical/live reader protection lifetime (five minutes).
 pub const READER_PROTECTION_NANOS: u64 = 300_000_000_000;
+/// Maximum bounded deadline for one remote object-store read (30 seconds).
+pub const REMOTE_READ_DEADLINE_NANOS: u64 = 30_000_000_000;
 /// Protected preparation inactivity lifetime (ten minutes).
 pub const PREPARATION_LEASE_NANOS: u64 = 600_000_000_000;
 
@@ -276,6 +278,53 @@ pub struct CommittedRootTransition {
     pub branch: BranchState,
     /// Optional logical native request fingerprint and receipt metadata.
     pub native_meta: Option<NativeRootTransitionMeta>,
+}
+
+/// Authoritative scope and expiry of an active, unretired protection handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProtectionScope {
+    /// Bounded read handle over a retained Generation.
+    GenerationRead {
+        /// Protected Generation identity.
+        generation_id: GenerationId,
+        /// Expiry deadline on the authority monotonic clock.
+        expires_at: MonotonicTime,
+    },
+    /// Bounded read handle over a branch's live log root.
+    LiveLogRead {
+        /// Protected branch identity.
+        branch_id: BranchId,
+        /// Branch revision when opened.
+        revision: u64,
+        /// Protected `LogMapRoot`.
+        root: ObjectRef,
+        /// Expiry deadline on the authority monotonic clock.
+        expires_at: MonotonicTime,
+    },
+    /// Active writable attachment base protection.
+    AttachmentBase {
+        /// Attached branch identity.
+        branch_id: BranchId,
+        /// Exact attachment identity.
+        attachment_id: AttachmentId,
+        /// Base Generation protected by the attachment.
+        generation_id: GenerationId,
+        /// Base live roots protected by the attachment.
+        roots: LiveRoots,
+        /// Expiry deadline on the authority monotonic clock.
+        expires_at: MonotonicTime,
+    },
+    /// Active operation preparation protection.
+    Preparation {
+        /// Preparing operation identity.
+        operation_id: OperationId,
+        /// Target branch identity.
+        branch_id: BranchId,
+        /// Expiry deadline on the authority monotonic clock.
+        expires_at: MonotonicTime,
+        /// Protected dependency closure for this preparation.
+        dependencies: Vec<ObjectRef>,
+    },
 }
 
 /// The Generation catalog fields recorded by the authority.
@@ -2894,6 +2943,133 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     /// Returns the authority's current monotonic clock reading.
     pub fn now(&self) -> MonotonicTime {
         self.authority.now()
+    }
+
+    /// Reads the authoritative recording principal recorded for a provenance
+    /// context object in this workspace, if any.
+    pub fn get_provenance_context_principal(
+        &self,
+        context_object_id: ObjectId,
+    ) -> Result<Option<PrincipalId>, ControlError> {
+        let key = provenance_context_principal_key(self.workspace_id, context_object_id);
+        let Some(bytes) = read_authoritative_point(self.authority.as_ref(), &key)? else {
+            return Ok(None);
+        };
+        let (_root, principal) = decode_provenance_context_principal(&bytes)?;
+        Ok(Some(principal))
+    }
+
+    /// Validates that `protection_id` is currently active, owned by the current
+    /// authority incarnation, and unexpired on the authority monotonic clock.
+    pub fn inspect_active_protection(
+        &self,
+        protection_id: ProtectionId,
+    ) -> Result<ProtectionScope, ControlError> {
+        let now = self.authority.now();
+        let owner_bytes =
+            read_authoritative_point(self.authority.as_ref(), &owner_incarnation_key())?
+                .ok_or(ControlError::Fenced)?;
+        let current_owner = OwnerIncarnation(decode_owner(&owner_bytes)?);
+        if current_owner != self.owner_incarnation {
+            return Err(ControlError::Fenced);
+        }
+        let pkey = protection_key(self.workspace_id, protection_id);
+        let bytes = read_authoritative_point(self.authority.as_ref(), &pkey)?
+            .ok_or(ControlError::NotFound)?;
+        match decode_protection(&bytes)? {
+            ProtectionRecord::Retired { .. } => Err(ControlError::NotFound),
+            ProtectionRecord::GenerationRead {
+                generation_id,
+                owner_incarnation,
+                expires_at,
+                ..
+            } => {
+                if owner_incarnation != self.owner_incarnation {
+                    return Err(ControlError::Fenced);
+                }
+                if expires_at <= now {
+                    return Err(ControlError::Expired);
+                }
+                let gbytes = read_authoritative_point(
+                    self.authority.as_ref(),
+                    &generation_key(self.workspace_id, generation_id),
+                )?
+                .ok_or(ControlError::NotFound)?;
+                let generation = decode_generation(&gbytes)?;
+                if !generation.eligible() {
+                    return Err(ControlError::GenerationExpired);
+                }
+                Ok(ProtectionScope::GenerationRead {
+                    generation_id,
+                    expires_at,
+                })
+            }
+            ProtectionRecord::LiveLogRead {
+                branch_id,
+                revision,
+                root,
+                owner_incarnation,
+                expires_at,
+                ..
+            } => {
+                if owner_incarnation != self.owner_incarnation {
+                    return Err(ControlError::Fenced);
+                }
+                if expires_at <= now {
+                    return Err(ControlError::Expired);
+                }
+                Ok(ProtectionScope::LiveLogRead {
+                    branch_id,
+                    revision,
+                    root,
+                    expires_at,
+                })
+            }
+            ProtectionRecord::AttachmentBase {
+                branch_id,
+                attachment_id,
+                generation_id,
+                roots,
+                owner_incarnation,
+                expires_at,
+                ..
+            } => {
+                if owner_incarnation != self.owner_incarnation {
+                    return Err(ControlError::Fenced);
+                }
+                if expires_at <= now {
+                    return Err(ControlError::Expired);
+                }
+                Ok(ProtectionScope::AttachmentBase {
+                    branch_id,
+                    attachment_id,
+                    generation_id,
+                    roots,
+                    expires_at,
+                })
+            }
+            ProtectionRecord::Preparation {
+                operation_id,
+                branch_id,
+                owner_incarnation,
+                expires_at,
+                dependencies,
+                ..
+            } => {
+                if owner_incarnation != self.owner_incarnation {
+                    return Err(ControlError::Fenced);
+                }
+                if expires_at <= now {
+                    return Err(ControlError::Expired);
+                }
+                Ok(ProtectionScope::Preparation {
+                    operation_id,
+                    branch_id,
+                    expires_at,
+                    dependencies,
+                })
+            }
+        }
     }
 
     /// Reads or reconciles an operation outcome after an uncertain response.

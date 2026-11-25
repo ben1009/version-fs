@@ -389,23 +389,29 @@ remain pending in P9/P12.
 
 ### P9. SDK, service, and CLI lifecycle
 
-- [ ] Complete typed, authorized, bounded streaming requests and structured errors
+- [x] Complete typed, authorized, bounded streaming requests and structured errors
   from RFC-002 Section 12. Keep arbitrary digest access private.
-- [ ] Complete attachment/read-handle renew/close, pending barrier/capture recovery,
+- [x] Complete attachment/read-handle renew/close, pending barrier/capture recovery,
   and freeze-independent heartbeats/outcome queries. Read deadlines honor protection.
-- [ ] Compose device attach/detach, explicit ext4 format/mount/unmount helpers,
+- [x] Compose device attach/detach, explicit ext4 format/mount/unmount helpers,
   checkpoint modes, fork/promote/rollback, native logs/artifacts, pins, diff, and
-  operation status/abort. Add report commands when P10 is available.
-- [ ] Add protected Generation provenance inspection to SDK/CLI, including
+  operation status/abort. Report commands (`report collect`, `report get`) return
+  explicit `UnsupportedOperation` until P10 is implemented.
+- [x] Add protected Generation provenance inspection to SDK/CLI, including
   explicit legacy/unattributed status and fresh-worker authorized evidence reads.
   Keep raw conversational payload capture opt-in and sanitize before ingestion.
-- [ ] Distinguish local WRITE, durable FLUSH/FUA, durable append, and published
-  Generation acknowledgements. Document OS permissions, external dependencies,
-  and the absence of application/database/process-memory capture guarantees.
+- [x] Distinguish local WRITE, durable FLUSH/FUA, durable append, and published
+  Generation acknowledgements. Document OS permissions, external dependencies
+  (`docs/cli-and-service.md`), and the absence of application/database/process-memory
+  capture guarantees.
 
-**Exit evidence:** the full two-worker workflow runs through the CLI and separate
-service/block-server processes, with clean-cache lazy attach and no hidden dependency
-on the old worker. Formatting never happens implicitly during restore.
+**Exit evidence:** `versionfs-service/tests/service_lifecycle.rs` and
+`versionfs-cli/tests/cli_lifecycle.rs` exercise separate `versionfsd` and
+`versionfs volume serve` processes against `ToyKvMetadataAuthority` and
+`DirectoryObjectStore` with clean-cache lazy attach on Worker B, no hidden
+dependency on Worker A, explicit unconfirmed format rejection, and protected
+provenance inspection. Real Linux `ublk`, real `mkfs.ext4`/`mount`/`fsfreeze`,
+and real S3 qualification remain pending in P12 / ignored tests.
 
 ### P10. Retention and mark-only reports
 

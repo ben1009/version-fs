@@ -532,6 +532,62 @@ impl LogMap {
             .encode()?,
         )
     }
+
+    /// Structurally diffs two named-log maps, skipping identical subtrees.
+    pub fn diff_logs<S: MapObjectStore>(
+        &self,
+        newer: &Self,
+        store: &S,
+    ) -> Result<Vec<LogViewChange>, ViewError> {
+        let changes = self.map.diff(&newer.map, store)?;
+        let mut out = Vec::with_capacity(changes.len());
+        for change in changes {
+            match change {
+                MapChange::Added { key, value } => out.push(LogViewChange::Added {
+                    name: decode_non_empty_utf8(&key, "log names must be non-empty UTF-8")?,
+                    entry: LogMapEntry::decode(&value)?,
+                }),
+                MapChange::Removed { key, value } => out.push(LogViewChange::Removed {
+                    name: decode_non_empty_utf8(&key, "log names must be non-empty UTF-8")?,
+                    entry: LogMapEntry::decode(&value)?,
+                }),
+                MapChange::Updated { key, before, after } => out.push(LogViewChange::Updated {
+                    name: decode_non_empty_utf8(&key, "log names must be non-empty UTF-8")?,
+                    before: LogMapEntry::decode(&before)?,
+                    after: LogMapEntry::decode(&after)?,
+                }),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Structural change to one named log between two [`LogMap`] versions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LogViewChange {
+    /// A named log was added.
+    Added {
+        /// UTF-8 log name.
+        name: String,
+        /// Added log entry.
+        entry: LogMapEntry,
+    },
+    /// A named log was removed.
+    Removed {
+        /// UTF-8 log name.
+        name: String,
+        /// Removed log entry.
+        entry: LogMapEntry,
+    },
+    /// A named log's range or segment index changed.
+    Updated {
+        /// UTF-8 log name.
+        name: String,
+        /// Entry in the left map.
+        before: LogMapEntry,
+        /// Entry in the right map.
+        after: LogMapEntry,
+    },
 }
 
 /// Persistent map from UTF-8 artifact names to immutable artifact descriptors.
@@ -644,6 +700,70 @@ impl ArtifactMap {
             .encode()?,
         )
     }
+
+    /// Structurally diffs two named-artifact maps, skipping identical subtrees.
+    pub fn diff_artifacts<S: MapObjectStore>(
+        &self,
+        newer: &Self,
+        store: &S,
+    ) -> Result<Vec<ArtifactChange>, ViewError> {
+        let changes = self.map.diff(&newer.map, store)?;
+        let mut out = Vec::with_capacity(changes.len());
+        for change in changes {
+            match change {
+                MapChange::Added { key, value } => out.push(ArtifactChange::Added {
+                    name: decode_non_empty_utf8(&key, "artifact names must be non-empty UTF-8")?,
+                    descriptor: ArtifactDescriptor::decode(&value)?,
+                }),
+                MapChange::Removed { key, value } => out.push(ArtifactChange::Removed {
+                    name: decode_non_empty_utf8(&key, "artifact names must be non-empty UTF-8")?,
+                    descriptor: ArtifactDescriptor::decode(&value)?,
+                }),
+                MapChange::Updated { key, before, after } => out.push(ArtifactChange::Updated {
+                    name: decode_non_empty_utf8(&key, "artifact names must be non-empty UTF-8")?,
+                    before: ArtifactDescriptor::decode(&before)?,
+                    after: ArtifactDescriptor::decode(&after)?,
+                }),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Structural change to one named artifact between two [`ArtifactMap`] versions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArtifactChange {
+    /// A named artifact was added.
+    Added {
+        /// UTF-8 artifact name.
+        name: String,
+        /// Added artifact descriptor.
+        descriptor: ArtifactDescriptor,
+    },
+    /// A named artifact was removed.
+    Removed {
+        /// UTF-8 artifact name.
+        name: String,
+        /// Removed artifact descriptor.
+        descriptor: ArtifactDescriptor,
+    },
+    /// A named artifact's descriptor changed.
+    Updated {
+        /// UTF-8 artifact name.
+        name: String,
+        /// Descriptor in the left map.
+        before: ArtifactDescriptor,
+        /// Descriptor in the right map.
+        after: ArtifactDescriptor,
+    },
+}
+
+fn decode_non_empty_utf8(bytes: &[u8], err_msg: &'static str) -> Result<String, ViewError> {
+    let name = std::str::from_utf8(bytes).map_err(|_| FormatError::InvalidNativeView(err_msg))?;
+    if name.is_empty() {
+        return Err(FormatError::InvalidNativeView(err_msg).into());
+    }
+    Ok(name.to_owned())
 }
 
 /// Persistent map from logical artifact chunk number to chunk object and length.

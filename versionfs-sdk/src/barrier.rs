@@ -1489,6 +1489,16 @@ where
         Ok(volume)
     }
 
+    /// Returns the durable live `(revision, volume_root)` committed on the branch.
+    pub const fn durable_live_boundary(&self) -> (u64, ObjectRef) {
+        (self.revision, self.live_roots.volume)
+    }
+
+    /// Updates the writer grant held by this volume after a background heartbeat renewal.
+    pub const fn set_writer_grant(&mut self, grant: WriterGrant) {
+        self.writer_grant = grant;
+    }
+
     /// Persists all currently dirty writes and advances the authoritative live root.
     ///
     /// Once attachment fencing or terminal lease expiry is observed, this worker
