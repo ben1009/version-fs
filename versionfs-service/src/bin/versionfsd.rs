@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut metadata_dir: Option<PathBuf> = None;
     let mut object_dir: Option<PathBuf> = None;
     let mut listen: Option<String> = None;
-    let mut auth_token = String::from("versionfs-dev-token");
+    let mut auth_token = std::env::var("VERSIONFS_AUTH_TOKEN").ok();
     let mut owner_op_id: Option<OperationId> = None;
     let mut deny_provenance = HashSet::new();
 
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--auth-token" => {
                 i += 1;
-                auth_token = args.get(i).ok_or("missing value for --auth-token")?.clone();
+                auth_token = Some(args.get(i).ok_or("missing value for --auth-token")?.clone());
             }
             "--owner-op-id" => {
                 i += 1;
@@ -70,6 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let metadata_dir = metadata_dir.ok_or("--metadata-dir is required")?;
     let object_dir = object_dir.ok_or("--object-dir is required")?;
     let listen = listen.ok_or("--listen is required (unix:///path or tcp://addr:port)")?;
+    let auth_token = auth_token
+        .filter(|t| !t.is_empty())
+        .ok_or("--auth-token or VERSIONFS_AUTH_TOKEN is required")?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -99,10 +102,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(path) = listen.strip_prefix("unix://") {
         #[cfg(unix)]
         {
-            if PathBuf::from(path).exists() {
-                let _ = std::fs::remove_file(path);
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+            let sock_path = PathBuf::from(path);
+            if let Ok(meta) = std::fs::symlink_metadata(&sock_path) {
+                if !meta.file_type().is_socket() {
+                    return Err(format!(
+                        "refusing to remove non-socket path {}",
+                        sock_path.display()
+                    )
+                    .into());
+                }
+                match std::os::unix::net::UnixStream::connect(&sock_path) {
+                    Ok(_) => {
+                        return Err(format!(
+                            "socket {} is already in use by an active listener",
+                            sock_path.display()
+                        )
+                        .into());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                        std::fs::remove_file(&sock_path)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
-            let listener = UnixListener::bind(path)?;
+            let listener = UnixListener::bind(&sock_path)?;
+            let _ = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600));
             println!("READY unix://{path}");
             serve_unix(service, listener, Arc::clone(&shutdown))?;
         }

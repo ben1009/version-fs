@@ -280,14 +280,44 @@ pub fn run_worker_server(config: WorkerConfig) -> Result<(), String> {
         alloc_op_id,
     );
 
-    if config.control_socket.exists() {
-        let _ = std::fs::remove_file(&config.control_socket);
+    if let Ok(meta) = std::fs::symlink_metadata(&config.control_socket) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileTypeExt;
+            if !meta.file_type().is_socket() {
+                return Err(format!(
+                    "refusing to remove non-socket path {}",
+                    config.control_socket.display()
+                ));
+            }
+            match UnixStream::connect(&config.control_socket) {
+                Ok(_) => {
+                    return Err(format!(
+                        "control socket {} is already in use by an active worker",
+                        config.control_socket.display()
+                    ));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(&config.control_socket)
+                        .map_err(|err| format!("remove stale socket: {err}"))?;
+                }
+                Err(e) => return Err(format!("check existing socket: {e}")),
+            }
+        }
     }
     if let Some(parent) = config.control_socket.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create socket parent: {e}"))?;
     }
     let listener = UnixListener::bind(&config.control_socket)
         .map_err(|e| format!("bind {}: {e}", config.control_socket.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &config.control_socket,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {e}"))?;
@@ -397,6 +427,14 @@ fn handle_worker_request(
             }
         }
         WorkerRequest::Read { offset, length } => {
+            const MAX_WORKER_READ_BYTES: u64 = 4 * 1024 * 1024;
+            if length > MAX_WORKER_READ_BYTES {
+                return WorkerResponse::Error {
+                    message: format!(
+                        "read length {length} exceeds worker control-socket limit {MAX_WORKER_READ_BYTES}"
+                    ),
+                };
+            }
             match volume.dispatch(BlockRequest::Read { offset, length }) {
                 Ok(BlockResponse::Read(bytes)) => WorkerResponse::ReadData {
                     data_hex: encode_hex_bytes(&bytes),
@@ -462,7 +500,15 @@ fn handle_worker_request(
             provenance,
         } => {
             let capture_mode = match CaptureMode::from_name(&mode) {
-                Ok(m) => m,
+                Ok(CaptureMode::BlockCut) => CaptureMode::BlockCut,
+                Ok(other) => {
+                    return WorkerResponse::Error {
+                        message: format!(
+                            "checkpoint mode '{}' requires a mounted Linux filesystem boundary; only 'block_cut' is supported on this worker",
+                            other.as_str()
+                        ),
+                    };
+                }
                 Err(e) => {
                     return WorkerResponse::Error {
                         message: e.to_string(),
@@ -700,13 +746,13 @@ pub fn alloc_prot_id() -> ProtectionId {
 /// Decodes a hex-encoded 16-byte ID.
 pub fn decode_hex_16(hex: &str) -> Result<[u8; 16], String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() != 32 {
-        return Err(format!("expected 32 hex chars, got {}", hex.len()));
+    if !hex.is_ascii() || hex.len() != 32 {
+        return Err(format!("expected 32 ASCII hex chars, got {}", hex.len()));
     }
     let mut out = [0_u8; 16];
-    for i in 0..16 {
-        out[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .map_err(|e| format!("invalid hex byte: {e}"))?;
+    for (slot, pair) in out.iter_mut().zip(hex.as_bytes().as_chunks::<2>().0) {
+        let s = std::str::from_utf8(pair).map_err(|e| format!("invalid hex byte: {e}"))?;
+        *slot = u8::from_str_radix(s, 16).map_err(|e| format!("invalid hex byte: {e}"))?;
     }
     Ok(out)
 }
@@ -714,15 +760,13 @@ pub fn decode_hex_16(hex: &str) -> Result<[u8; 16], String> {
 /// Decodes arbitrary hex bytes.
 pub fn decode_hex_bytes(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if !hex.len().is_multiple_of(2) {
-        return Err("hex string must have even length".to_owned());
+    if !hex.is_ascii() || !hex.len().is_multiple_of(2) {
+        return Err("hex string must be even-length ASCII".to_owned());
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
-    for i in 0..(hex.len() / 2) {
-        out.push(
-            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-                .map_err(|e| format!("invalid hex byte: {e}"))?,
-        );
+    for pair in hex.as_bytes().as_chunks::<2>().0 {
+        let s = std::str::from_utf8(pair).map_err(|e| format!("invalid hex byte: {e}"))?;
+        out.push(u8::from_str_radix(s, 16).map_err(|e| format!("invalid hex byte: {e}"))?);
     }
     Ok(out)
 }

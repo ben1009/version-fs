@@ -33,8 +33,8 @@ struct Cli {
     workspace_id: String,
     #[arg(long)]
     principal_id: String,
-    #[arg(long, default_value = "versionfs-dev-token")]
-    auth_token: String,
+    #[arg(long)]
+    auth_token: Option<String>,
     #[arg(long, default_value_t = false)]
     json: bool,
     #[command(subcommand)]
@@ -198,6 +198,8 @@ enum VolumeCmd {
         control_socket: Option<PathBuf>,
         #[arg(long)]
         branch_id: Option<String>,
+        #[arg(long, default_value_t = false)]
+        discard_dirty: bool,
     },
     Serve {
         #[arg(long)]
@@ -538,10 +540,14 @@ fn run(cli: Cli) -> Result<Value, String> {
     let workspace_id = parse_workspace_id(&cli.workspace_id)?;
     let principal_id = parse_principal_id(&cli.principal_id)?;
     let endpoint = ServiceEndpoint::parse(&cli.endpoint).map_err(|e| e.to_string())?;
+    let auth_token = cli
+        .auth_token
+        .or_else(|| std::env::var("VERSIONFS_AUTH_TOKEN").ok())
+        .unwrap_or_else(|| "versionfs-dev-token".to_owned());
     let auth = RpcAuth {
         workspace_id,
         principal_id,
-        auth_token: cli.auth_token.into_bytes(),
+        auth_token: auth_token.into_bytes(),
     };
 
     // Offline local helpers (e.g. fs format/mount/unmount) do not require service connection.
@@ -792,10 +798,17 @@ fn run(cli: Cli) -> Result<Value, String> {
             VolumeCmd::Detach {
                 control_socket,
                 branch_id,
+                discard_dirty,
             } => {
                 if let Some(sock) = control_socket {
                     let resp = send_worker_command(&sock, &WorkerRequest::Detach)?;
                     return worker_resp_json(resp);
+                }
+                if !discard_dirty {
+                    return Err(
+                        "detaching without --control-socket cannot flush worker-local dirty blocks; pass --control-socket or --discard-dirty"
+                            .to_owned(),
+                    );
                 }
                 let br_id = BranchId::from_bytes(decode_hex_16(
                     branch_id
@@ -1920,6 +1933,60 @@ mod tests {
         )
         .unwrap();
 
+        // Write unflushed dirty bytes before checkpointing (verifies dirty-volume checkpoint).
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "volume",
+                "write",
+                "--control-socket",
+                sock_s,
+                "--offset",
+                "4096",
+                "--data-hex",
+                &"55667788".repeat(1024),
+            ],
+        )
+        .unwrap();
+        assert!(
+            cli_call(
+                &ep,
+                ws,
+                pr,
+                &[
+                    "volume",
+                    "read",
+                    "--control-socket",
+                    sock_s,
+                    "--offset",
+                    "0",
+                    "--length",
+                    "8388608",
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            cli_call(
+                &ep,
+                ws,
+                pr,
+                &[
+                    "checkpoint",
+                    "create",
+                    "--control-socket",
+                    sock_s,
+                    "--mode",
+                    "filesystem_frozen",
+                ],
+            )
+            .is_err()
+        );
+        assert!(decode_hex_16("🔥000000000000000000000000000000").is_err());
+        assert!(decode_hex_bytes("🔥0").is_err());
+
         // Checkpoint with provenance + optional link + raw payload opt-in
         let g1_res = cli_call(
             &ep,
@@ -1939,7 +2006,7 @@ mod tests {
                 "--session-id",
                 "sess-1",
                 "--thread-id",
-                "thr-1",
+                "thread-1",
                 "--task-id",
                 "task-1",
                 "--workflow-operation-id",
@@ -2106,7 +2173,6 @@ mod tests {
             &["volume", "renew-base", "--branch-id", &main_br],
         )
         .unwrap();
-        cli_call(&ep, ws, pr, &["writer", "renew", "--branch-id", &main_br]).unwrap();
         cli_call(
             &ep,
             ws,
@@ -2125,6 +2191,23 @@ mod tests {
 
         let br_after = cli_call(&ep, ws, pr, &["branch", "get", "--branch-id", &main_br]).unwrap();
         let rev_after = br_after["revision"].as_u64().unwrap();
+        let epoch_after = br_after["writer_epoch"].as_u64().unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "writer",
+                "acquire",
+                "--branch-id",
+                &main_br,
+                "--expected-revision",
+                &rev_after.to_string(),
+                "--expected-writer-epoch",
+                &epoch_after.to_string(),
+            ],
+        )
+        .unwrap();
         cli_call(
             &ep,
             ws,
@@ -2169,6 +2252,7 @@ mod tests {
             ],
         )
         .unwrap();
+        cli_call(&ep, ws, pr, &["writer", "renew", "--branch-id", &cand_id]).unwrap();
         cli_call(&ep, ws, pr, &["writer", "release", "--branch-id", &cand_id]).unwrap();
         let cand2 = cli_call(&ep, ws, pr, &["branch", "get", "--branch-id", &cand_id]).unwrap();
         cli_call(

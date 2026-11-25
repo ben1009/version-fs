@@ -642,8 +642,18 @@ where
                 protection_id,
                 reference,
             } => {
+                let allow_provenance = !self
+                    .config
+                    .provenance_deny_principals
+                    .contains(&auth.principal_id);
+                if !allow_provenance && reference.object_type == ObjectType::ProvenanceContext {
+                    return Err(ServiceError::new(
+                        ServiceErrorCode::Unauthorized,
+                        "caller is not authorized to read provenance context",
+                    ));
+                }
                 let (scope, read_deadline) = begin_protected_read(&control, protection_id)?;
-                if !is_object_reachable(&bridge, &control, &scope, reference)? {
+                if !is_object_reachable(&bridge, &control, &scope, reference, allow_provenance)? {
                     return Err(ServiceError::new(
                         ServiceErrorCode::Unauthorized,
                         "requested object is not reachable under the active protection handle",
@@ -1033,6 +1043,36 @@ where
     }
 }
 
+const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+
+struct ActiveConnectionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_connection(
+    active: &Arc<std::sync::atomic::AtomicUsize>,
+) -> Option<ActiveConnectionGuard> {
+    let mut current = active.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_CONCURRENT_CONNECTIONS {
+            return None;
+        }
+        match active.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(ActiveConnectionGuard(Arc::clone(active))),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Serves [`WorkspaceService`] over a bound [`TcpListener`] until `shutdown` is set.
 pub fn serve_tcp<A, O>(
     service: Arc<WorkspaceService<A, O>>,
@@ -1044,12 +1084,20 @@ where
     O: ObjectStore + Send + Sync + 'static,
 {
     listener.set_nonblocking(true)?;
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let Some(guard) = try_acquire_connection(&active) else {
+                    drop(stream);
+                    continue;
+                };
                 let _ = stream.set_nonblocking(false);
                 let svc = Arc::clone(&service);
-                std::thread::spawn(move || handle_tcp_connection(svc, stream));
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    handle_tcp_connection(svc, stream);
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1101,12 +1149,20 @@ where
     O: ObjectStore + Send + Sync + 'static,
 {
     listener.set_nonblocking(true)?;
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let Some(guard) = try_acquire_connection(&active) else {
+                    drop(stream);
+                    continue;
+                };
                 let _ = stream.set_nonblocking(false);
                 let svc = Arc::clone(&service);
-                std::thread::spawn(move || handle_unix_connection(svc, stream));
+                std::thread::spawn(move || {
+                    let _guard = guard;
+                    handle_unix_connection(svc, stream);
+                });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1242,6 +1298,7 @@ fn is_object_reachable<A: MetadataAuthority, O: ObjectStore>(
     control: &WorkspaceControl<A>,
     scope: &ProtectionScope,
     target: ObjectRef,
+    allow_provenance: bool,
 ) -> Result<bool, ServiceError> {
     let mut roots: Vec<ObjectRef> = Vec::new();
     match scope {
@@ -1299,13 +1356,13 @@ fn is_object_reachable<A: MetadataAuthority, O: ObjectStore>(
                     stack.push(desc.volume_root());
                     stack.push(desc.logs_root());
                     stack.push(desc.artifacts_root());
-                    if let Some(ctx) = desc.context_root() {
+                    if allow_provenance && let Some(ctx) = desc.context_root() {
                         stack.push(ctx);
                     }
                 }
             }
             ObjectType::ProvenanceContext => {
-                if let Ok(ctx) = ProvenanceContext::decode(&bytes) {
+                if allow_provenance && let Ok(ctx) = ProvenanceContext::decode(&bytes) {
                     stack.push(ctx.required_logs_root);
                     stack.push(ctx.required_artifacts_root);
                 }

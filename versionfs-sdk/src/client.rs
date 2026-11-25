@@ -149,6 +149,7 @@ pub struct RemoteInitializedWorkspace {
 #[derive(Default)]
 struct ClientSessionState {
     active_protection: Option<ProtectionId>,
+    active_capture_protection: Option<ProtectionId>,
     active_preparation: Option<OperationId>,
     recent_uploads: std::collections::HashMap<ObjectId, Vec<u8>>,
 }
@@ -833,6 +834,7 @@ impl VolumeBarrierControl for ServiceClient {
                 grant,
             })
             .map_err(|e| e.to_control_error())?;
+        self.set_active_preparation(Some(prepared_id));
         decode_rpc_time(single_frame(&frames).map_err(|e| e.to_control_error())?)
             .map_err(|e| e.to_control_error())
     }
@@ -874,7 +876,7 @@ impl VolumeBarrierControl for ServiceClient {
                 native_meta,
             })
             .map_err(|e| e.to_control_error())?;
-        self.set_active_preparation(None);
+        self.set_active_preparation(capture_id);
         decode_rpc_branch(single_frame(&frames).map_err(|e| e.to_control_error())?)
             .map_err(|e| e.to_control_error())
     }
@@ -914,6 +916,9 @@ impl CaptureControl for ServiceClient {
         request: PreparationRequest,
         provenance: ProvenanceBinding,
     ) -> Result<OperationState, ControlError> {
+        let capture_prot = (request.kind
+            == versionfs_core::control::PreparationKind::CheckpointCapture)
+            .then_some(request.protection_id);
         let frames = self
             .call_stream(RpcRequest::BeginPreparation {
                 request,
@@ -925,6 +930,11 @@ impl CaptureControl for ServiceClient {
                 .map_err(|e| e.to_control_error())?;
         if let OperationState::Preparing { operation_id, .. } = state {
             self.set_active_preparation(Some(operation_id));
+            if let Some(prot_id) = capture_prot
+                && let Ok(mut guard) = self.session.lock()
+            {
+                guard.active_capture_protection = Some(prot_id);
+            }
         }
         Ok(state)
     }
@@ -1092,7 +1102,7 @@ impl MapObjectStore for RemoteObjectStore {
     }
 
     fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
-        let protection_id = {
+        let (protection_id, capture_protection) = {
             let guard = self
                 .client
                 .session
@@ -1103,9 +1113,11 @@ impl MapObjectStore for RemoteObjectStore {
             {
                 return Ok(Some(bytes.clone()));
             }
-            guard
+            let primary = guard
                 .active_protection
-                .ok_or_else(|| "no active protection handle for remote object read".to_owned())?
+                .or(guard.active_capture_protection)
+                .ok_or_else(|| "no active protection handle for remote object read".to_owned())?;
+            (primary, guard.active_capture_protection)
         };
         match self.client.call_stream(RpcRequest::FetchProtectedObject {
             protection_id,
@@ -1115,6 +1127,24 @@ impl MapObjectStore for RemoteObjectStore {
                 let bytes = single_frame(&frames).map_err(|e| e.to_string())?;
                 reference.verify(bytes).map_err(|e| e.to_string())?;
                 Ok(Some(bytes.to_vec()))
+            }
+            Err(err)
+                if err.code == ServiceErrorCode::Unauthorized
+                    && capture_protection.is_some()
+                    && capture_protection != Some(protection_id) =>
+            {
+                match self.client.call_stream(RpcRequest::FetchProtectedObject {
+                    protection_id: capture_protection.unwrap(),
+                    reference,
+                }) {
+                    Ok(frames) => {
+                        let bytes = single_frame(&frames).map_err(|e| e.to_string())?;
+                        reference.verify(bytes).map_err(|e| e.to_string())?;
+                        Ok(Some(bytes.to_vec()))
+                    }
+                    Err(err2) if err2.code == ServiceErrorCode::NotFound => Ok(None),
+                    Err(err2) => Err(err2.to_string()),
+                }
             }
             Err(err) if err.code == ServiceErrorCode::NotFound => Ok(None),
             Err(err) => Err(err.to_string()),

@@ -250,6 +250,14 @@ pub struct DirectoryObjectStore {
     next_tmp: std::sync::atomic::AtomicU64,
 }
 
+fn sync_dir(path: &std::path::Path) -> Result<(), ObjectStoreError> {
+    let dir = std::fs::File::open(path)
+        .map_err(|e| ObjectStoreError::Backend(format!("open dir {}: {e}", path.display())))?;
+    dir.sync_all()
+        .map_err(|e| ObjectStoreError::Backend(format!("sync dir {}: {e}", path.display())))?;
+    Ok(())
+}
+
 impl DirectoryObjectStore {
     /// Opens or creates a durable directory object store rooted at `root`.
     pub fn open(root: impl AsRef<std::path::Path>) -> Result<Self, ObjectStoreError> {
@@ -323,8 +331,16 @@ impl ObjectStore for DirectoryObjectStore {
         let parent = path
             .parent()
             .ok_or_else(|| ObjectStoreError::Backend("missing parent directory".to_owned()))?;
+        let type_dir_missing = !parent.exists();
+        let ws_dir_missing = parent.parent().is_some_and(|p| !p.exists());
         std::fs::create_dir_all(parent)
             .map_err(|e| ObjectStoreError::Backend(format!("create object dir: {e}")))?;
+        if ws_dir_missing && let Some(root_parent) = parent.parent().and_then(|p| p.parent()) {
+            sync_dir(root_parent)?;
+        }
+        if type_dir_missing && let Some(ws_dir) = parent.parent() {
+            sync_dir(ws_dir)?;
+        }
         let tmp_id = self
             .next_tmp
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -357,9 +373,7 @@ impl ObjectStore for DirectoryObjectStore {
         }
         std::fs::rename(&tmp_path, &path)
             .map_err(|e| ObjectStoreError::Backend(format!("rename object: {e}")))?;
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        sync_dir(parent)?;
         Ok(StoredObject {
             object_ref,
             disposition: PutDisposition::Created,

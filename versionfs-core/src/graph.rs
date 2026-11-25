@@ -612,21 +612,29 @@ fn redact_secret_tokens(text: &str) -> String {
     let mut out = Vec::new();
     let mut redact_next = false;
     for token in text.split_whitespace() {
+        let trimmed = token.trim_matches(|c: char| {
+            matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | ',' | ';')
+        });
         if redact_next {
             out.push("[REDACTED]");
             redact_next = false;
             continue;
         }
-        if token.eq_ignore_ascii_case("bearer") {
+        if trimmed.eq_ignore_ascii_case("bearer") {
             out.push(token);
             redact_next = true;
             continue;
         }
-        if token.starts_with("sk-")
-            || token.starts_with("AKIA")
-            || token.starts_with("ASIA")
-            || token.starts_with("ghp_")
-            || token.starts_with("gho_")
+        let value = trimmed
+            .split_once('=')
+            .map(|(_, v)| v.trim_matches(|c: char| matches!(c, '"' | '\'' | '`')))
+            .unwrap_or(trimmed);
+        if value.starts_with("sk-")
+            || value.starts_with("AKIA")
+            || value.starts_with("ASIA")
+            || value.starts_with("ghp_")
+            || value.starts_with("gho_")
+            || value.starts_with("glpat-")
         {
             out.push("[REDACTED]");
         } else {

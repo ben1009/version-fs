@@ -541,7 +541,18 @@ fn provenance_inspection_v2_v1_denied_corrupt_and_sanitized() {
         .read_provenance(prot_denied, g1_id)
         .expect_err("denied principal must receive Unauthorized");
     assert_eq!(denied_err.code, ServiceErrorCode::Unauthorized);
+    denied_reader.set_active_protection(Some(prot_denied));
+    let raw_ctx_err = denied_reader
+        .remote_object_store()
+        .get_ref(ctx_ref)
+        .expect_err("denied principal must not fetch ProvenanceContext via FetchProtectedObject");
+    assert!(raw_ctx_err.contains("Unauthorized") || raw_ctx_err.contains("not authorized"));
     h_denied.close(OperationId::from_bytes(id16(43))).unwrap();
+
+    let quoted_sanitized =
+        sanitize_provenance_text("token=\"sk-quoted123456\" ('Bearer' 'ghp_abc123')", 256).unwrap();
+    assert!(!quoted_sanitized.contains("sk-quoted123456"));
+    assert!(!quoted_sanitized.contains("ghp_abc123"));
 
     // 2. Legacy V1 descriptor -> Unattributed, Coverage::None, never synthesized.
     let v1_id = GenerationId::from_bytes(id16(44));
