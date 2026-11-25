@@ -835,3 +835,204 @@ fn diff_generations_streams_extents_logs_and_artifacts_and_rejects_unconfirmed_f
         Err(LinuxFsError::ConfirmationRequired(_))
     ));
 }
+
+#[test]
+fn unix_listener_and_full_branch_writer_pin_lifecycle() {
+    let dir = TempDir::new();
+    let meta_dir = dir.0.join("meta");
+    let obj_dir = dir.0.join("objects");
+    let sock_path = dir.0.join("svc.sock");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let clock = Arc::new(TestClock::new(2_000_000_000));
+    let authority = Arc::new(
+        ToyKvMetadataAuthority::open_with(
+            &meta_dir,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::new(NoFailures),
+        )
+        .unwrap(),
+    );
+    let incarnation =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(90))).unwrap();
+    let object_store = Arc::new(DirectoryObjectStore::open(&obj_dir).unwrap());
+    let service = Arc::new(WorkspaceService::new(
+        authority,
+        incarnation,
+        object_store,
+        rt.handle().clone(),
+        ServiceConfig::new(b"unix-token".to_vec()),
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_bg = Arc::clone(&shutdown);
+    let handle = std::thread::spawn(move || {
+        let _ = versionfs_service::service::serve_unix(service, listener, shutdown_bg);
+    });
+
+    let ws = WorkspaceId::from_bytes(id16(91));
+    let principal = PrincipalId::from_bytes(id16(92));
+    let client = ServiceClient::connect(
+        ServiceEndpoint::Unix(sock_path),
+        RpcAuth {
+            workspace_id: ws,
+            principal_id: principal,
+            auth_token: b"unix-token".to_vec(),
+        },
+    )
+    .unwrap();
+
+    let main_id = BranchId::from_bytes(id16(93));
+    let g0_id = GenerationId::from_bytes(id16(94));
+    let init = client
+        .create_empty_workspace(
+            OperationId::from_bytes(id16(95)),
+            g0_id,
+            VolumeBoundaryId::from_bytes(id16(96)),
+            VolumeGeometry::new(64 * 1024).unwrap(),
+            1_700_000_010_000,
+            main_id,
+            "main",
+            60_000,
+            OperationId::from_bytes(id16(97)),
+            OperationId::from_bytes(id16(98)),
+            AttachmentId::from_bytes(id16(99)),
+            ProtectionId::from_bytes(id16(100)),
+        )
+        .unwrap();
+
+    // Branch/Generation queries & pins
+    assert_eq!(client.branch_by_name("main").unwrap().branch_id, main_id);
+    assert_eq!(client.get_generation(g0_id).unwrap().generation_id, g0_id);
+    let pin_id = versionfs_core::identity::PinId::from_bytes(id16(101));
+    client
+        .pin_generation(OperationId::from_bytes(id16(102)), g0_id, pin_id)
+        .unwrap();
+    client
+        .unpin_generation(OperationId::from_bytes(id16(103)), pin_id)
+        .unwrap();
+
+    // Detach, release, re-acquire (and force-acquire), re-attach
+    client
+        .detach_volume(
+            OperationId::from_bytes(id16(104)),
+            main_id,
+            init.attachment.attachment_id,
+            init.attachment.volume_epoch,
+            init.attachment.protection_id,
+            init.writer_grant,
+        )
+        .unwrap();
+    client
+        .release_writer(OperationId::from_bytes(id16(121)), init.writer_grant)
+        .unwrap();
+    let main_br = client.get_branch(main_id).unwrap();
+    let grant2 = client
+        .acquire_writer(
+            OperationId::from_bytes(id16(105)),
+            main_id,
+            main_br.revision,
+            main_br.writer_epoch,
+        )
+        .unwrap();
+    let grant3 = client
+        .force_acquire_writer(
+            OperationId::from_bytes(id16(106)),
+            main_id,
+            main_br.revision,
+            grant2.writer_epoch,
+        )
+        .unwrap();
+    let att2 = client
+        .attach_volume(
+            OperationId::from_bytes(id16(107)),
+            main_id,
+            main_br.revision,
+            grant3,
+            AttachmentId::from_bytes(id16(108)),
+            ProtectionId::from_bytes(id16(109)),
+        )
+        .unwrap();
+    client
+        .detach_volume(
+            OperationId::from_bytes(id16(110)),
+            main_id,
+            att2.attachment_id,
+            att2.volume_epoch,
+            att2.protection_id,
+            grant3,
+        )
+        .unwrap();
+
+    // Fork candidate, move_head, promote, delete
+    let cand_id = BranchId::from_bytes(id16(111));
+    let cand = client
+        .create_branch(OperationId::from_bytes(id16(112)), cand_id, "cand", g0_id)
+        .unwrap();
+    let main_br2 = client.get_branch(main_id).unwrap();
+    client
+        .move_head(
+            OperationId::from_bytes(id16(114)),
+            main_id,
+            main_br2.revision,
+            g0_id,
+            grant3,
+            true,
+        )
+        .unwrap();
+    let main_br3 = client.get_branch(main_id).unwrap();
+    let grant4 = client
+        .acquire_writer(
+            OperationId::from_bytes(id16(122)),
+            main_id,
+            main_br3.revision,
+            main_br3.writer_epoch,
+        )
+        .unwrap();
+    client
+        .promote(
+            OperationId::from_bytes(id16(115)),
+            cand_id,
+            cand.revision,
+            main_id,
+            main_br3.revision,
+            grant4,
+            true,
+        )
+        .unwrap();
+    let cand_grant = client
+        .acquire_writer(
+            OperationId::from_bytes(id16(116)),
+            cand_id,
+            cand.revision,
+            cand.writer_epoch,
+        )
+        .unwrap();
+    client
+        .delete_branch(
+            OperationId::from_bytes(id16(117)),
+            cand_id,
+            cand.revision,
+            cand_grant,
+            true,
+        )
+        .unwrap();
+
+    // Protected list_logs / list_artifacts on G0
+    let p_read = ProtectionId::from_bytes(id16(118));
+    let h_read = ProtectedReadHandle::open(
+        client.clone(),
+        OperationId::from_bytes(id16(119)),
+        g0_id,
+        p_read,
+    )
+    .unwrap();
+    assert!(client.list_logs(p_read).unwrap().is_empty());
+    assert!(client.list_artifacts(p_read).unwrap().is_empty());
+    h_read.close(OperationId::from_bytes(id16(120))).unwrap();
+
+    shutdown.store(true, Ordering::Release);
+    let _ = handle.join();
+}

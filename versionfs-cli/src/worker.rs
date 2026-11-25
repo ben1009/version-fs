@@ -752,3 +752,43 @@ pub fn parse_principal_id(hex: &str) -> Result<PrincipalId, String> {
 pub fn parse_scope_id(hex: &str) -> Result<ObjectStoreScopeId, String> {
     Ok(ObjectStoreScopeId::from_bytes(decode_hex_16(hex)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_and_id_parsing_and_worker_framing_round_trip() {
+        let raw = [0xAB_u8; 16];
+        let hex = encode_hex_bytes(&raw);
+        assert_eq!(decode_hex_16(&hex).unwrap(), raw);
+        assert_eq!(decode_hex_bytes(&hex).unwrap(), raw);
+        assert!(decode_hex_16("abcd").is_err());
+        assert!(decode_hex_bytes("abc").is_err());
+        assert!(decode_hex_bytes("zzzz").is_err());
+
+        let ws = parse_workspace_id(&hex).unwrap();
+        assert_eq!(ws, WorkspaceId::from_bytes(raw));
+        let principal = parse_principal_id(&hex).unwrap();
+        assert_eq!(principal, PrincipalId::from_bytes(raw));
+        assert_eq!(
+            parse_scope_id(&hex).unwrap(),
+            ObjectStoreScopeId::from_bytes(raw)
+        );
+
+        assert_eq!(sanitize_opt(None).unwrap(), None);
+        assert!(sanitize_opt(Some("  ")).is_err());
+        let sanitized = sanitize_opt(Some("Bearer sk-secret123456\x07"))
+            .unwrap()
+            .unwrap();
+        assert!(!sanitized.contains("sk-secret123456"));
+
+        let mut buf = Vec::new();
+        let req = WorkerRequest::Status;
+        write_worker_frame(&mut buf, &serde_json::to_vec(&req).unwrap()).unwrap();
+        let mut cursor = std::io::Cursor::new(buf);
+        let read_req: WorkerRequest =
+            serde_json::from_slice(&read_worker_frame(&mut cursor).unwrap()).unwrap();
+        assert!(matches!(read_req, WorkerRequest::Status));
+    }
+}

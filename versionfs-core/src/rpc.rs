@@ -2497,3 +2497,555 @@ pub fn decode_rpc_log_batch(bytes: &[u8]) -> Result<RpcLogBatch, ServiceError> {
     d.finish()?;
     Ok((log_id, first_seq, end_seq, records, attachments))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::OwnerIncarnation;
+    use crate::format::ObjectType;
+    use crate::identity::{ArtifactId, ObjectId};
+    use crate::metadata::MetadataError;
+    use crate::time::MonotonicTime;
+    use crate::views::{ExtentRange, LogViewChange};
+
+    fn sample_ref(object_type: ObjectType, seed: u8) -> ObjectRef {
+        ObjectRef {
+            object_type,
+            object_id: ObjectId::from_bytes([seed; 32]),
+            encoded_len: 128,
+        }
+    }
+
+    fn sample_grant(branch_id: BranchId) -> WriterGrant {
+        WriterGrant {
+            branch_id,
+            writer_epoch: 3,
+            owner_incarnation: OwnerIncarnation::from_u64(7),
+            grant_id: OperationId::from_bytes([4; 16]),
+            expires_at: MonotonicTime::from_nanos(9_000_000_000),
+        }
+    }
+
+    fn sample_roots() -> LiveRoots {
+        LiveRoots {
+            volume: sample_ref(ObjectType::VolumeRoot, 1),
+            logs: sample_ref(ObjectType::LogMapRoot, 2),
+            artifacts: sample_ref(ObjectType::ArtifactMapRoot, 3),
+        }
+    }
+
+    #[test]
+    fn rpc_envelope_round_trips_all_request_variants() {
+        let ws = WorkspaceId::from_bytes([1; 16]);
+        let principal = PrincipalId::from_bytes([2; 16]);
+        let br = BranchId::from_bytes([3; 16]);
+        let gen_id = GenerationId::from_bytes([4; 16]);
+        let att_id = AttachmentId::from_bytes([5; 16]);
+        let prot_id = ProtectionId::from_bytes([6; 16]);
+        let op_id = OperationId::from_bytes([7; 16]);
+        let pin_id = PinId::from_bytes([8; 16]);
+        let boundary_id = VolumeBoundaryId::from_bytes([9; 16]);
+        let grant = sample_grant(br);
+        let roots = sample_roots();
+        let geometry = VolumeGeometry::new(64 * 1024).unwrap();
+
+        let requests = vec![
+            RpcRequest::GetScope,
+            RpcRequest::Now,
+            RpcRequest::CreateEmptyWorkspace {
+                create_op_id: op_id,
+                generation_id: gen_id,
+                boundary_id,
+                geometry,
+                created_at_unix_ms: 1234,
+                branch_id: br,
+                name: "main".to_owned(),
+                retention_period_ms: 60_000,
+                acquire_op_id: op_id,
+                attach_op_id: op_id,
+                attachment_id: att_id,
+                attachment_protection_id: prot_id,
+            },
+            RpcRequest::CreateBranch {
+                operation_id: op_id,
+                branch_id: br,
+                name: "dev".to_owned(),
+                base: gen_id,
+            },
+            RpcRequest::GetBranch { branch_id: br },
+            RpcRequest::BranchByName {
+                name: "dev".to_owned(),
+            },
+            RpcRequest::GetGeneration {
+                generation_id: gen_id,
+            },
+            RpcRequest::AcquireWriter {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 1,
+                expected_writer_epoch: 0,
+            },
+            RpcRequest::ForceAcquireWriter {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 1,
+                expected_writer_epoch: 0,
+            },
+            RpcRequest::RenewWriter {
+                operation_id: op_id,
+                grant,
+            },
+            RpcRequest::ReleaseWriter {
+                operation_id: op_id,
+                grant,
+            },
+            RpcRequest::AttachVolume {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 1,
+                attachment_id: att_id,
+                protection_id: prot_id,
+                grant,
+            },
+            RpcRequest::RenewAttachmentBase {
+                operation_id: op_id,
+                branch_id: br,
+                attachment_id: att_id,
+                volume_epoch: 1,
+                protection_id: prot_id,
+                grant,
+            },
+            RpcRequest::DetachVolume {
+                operation_id: op_id,
+                branch_id: br,
+                attachment_id: att_id,
+                volume_epoch: 1,
+                protection_id: prot_id,
+                grant,
+            },
+            RpcRequest::CheckAttachmentLive {
+                branch_id: br,
+                attachment_id: att_id,
+                volume_epoch: 1,
+                grant,
+            },
+            RpcRequest::MoveHead {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 2,
+                target_generation: gen_id,
+                grant,
+                discard_live_state: true,
+            },
+            RpcRequest::Promote {
+                operation_id: op_id,
+                source_branch_id: br,
+                expected_source_revision: 2,
+                destination_branch_id: br,
+                expected_destination_revision: 1,
+                destination_grant: grant,
+                discard_live_state: false,
+            },
+            RpcRequest::DeleteBranch {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 2,
+                grant,
+                discard_live_state: true,
+            },
+            RpcRequest::BeginPreparation {
+                request: PreparationRequest {
+                    operation_id: op_id,
+                    branch_id: br,
+                    expected_revision: 2,
+                    grant,
+                    attachment_id: att_id,
+                    volume_epoch: 1,
+                    protection_id: prot_id,
+                    kind: PreparationKind::CheckpointCapture,
+                    expected_roots: Some(roots),
+                    dependencies: vec![sample_ref(ObjectType::Extent, 10)],
+                },
+                provenance: ProvenanceBinding::Recorded {
+                    context_root: sample_ref(ObjectType::ProvenanceContext, 11),
+                },
+            },
+            RpcRequest::RenewPreparation {
+                renewal_id: op_id,
+                prepared_id: op_id,
+                grant,
+            },
+            RpcRequest::AuthorizeCaptureChild {
+                authorization_id: op_id,
+                capture_id: op_id,
+                child_id: op_id,
+                grant,
+            },
+            RpcRequest::CommitLiveRoots {
+                operation_id: op_id,
+                expected_revision: 2,
+                grant,
+                roots,
+                capture_child: Some((op_id, op_id)),
+                native_meta: Some(NativeRootTransitionMeta {
+                    request_fingerprint: [0x11; 32],
+                    receipt_bytes: vec![1, 2, 3],
+                    claim_log_id: Some(LogId::from_bytes([12; 16])),
+                }),
+            },
+            RpcRequest::SealCapture {
+                operation_id: op_id,
+                capture_id: op_id,
+                expected_revision: 3,
+                grant,
+            },
+            RpcRequest::PublishCapture {
+                capture_id: op_id,
+                expected_revision: 3,
+                expected_parent: gen_id,
+                grant,
+                attachment_id: att_id,
+                volume_epoch: 1,
+                descriptor_ref: sample_ref(ObjectType::GenerationDescriptor, 13),
+                advance_head: true,
+            },
+            RpcRequest::UploadPreparedObject {
+                operation_id: op_id,
+                reference: sample_ref(ObjectType::Extent, 14),
+                encoded_bytes: vec![1, 2, 3, 4],
+            },
+            RpcRequest::UploadProvenanceContext {
+                branch_id: br,
+                grant,
+                encoded_context: vec![5, 6, 7],
+            },
+            RpcRequest::GetOperation {
+                operation_id: op_id,
+            },
+            RpcRequest::GetCommittedRootTransition {
+                operation_id: op_id,
+            },
+            RpcRequest::AbortOperation {
+                operation_id: op_id,
+            },
+            RpcRequest::ExpirePreparation {
+                operation_id: op_id,
+            },
+            RpcRequest::PinGeneration {
+                operation_id: op_id,
+                generation_id: gen_id,
+                pin_id,
+            },
+            RpcRequest::UnpinGeneration {
+                operation_id: op_id,
+                pin_id,
+            },
+            RpcRequest::OpenGeneration {
+                operation_id: op_id,
+                generation_id: gen_id,
+                protection_id: prot_id,
+            },
+            RpcRequest::OpenLiveLog {
+                operation_id: op_id,
+                branch_id: br,
+                expected_revision: 3,
+                expected_root: roots.logs,
+                protection_id: prot_id,
+            },
+            RpcRequest::RenewProtection {
+                operation_id: op_id,
+                protection_id: prot_id,
+            },
+            RpcRequest::CloseProtection {
+                operation_id: op_id,
+                protection_id: prot_id,
+            },
+            RpcRequest::FetchProtectedObject {
+                protection_id: prot_id,
+                reference: sample_ref(ObjectType::Extent, 15),
+            },
+            RpcRequest::ReadBlocksAt {
+                protection_id: prot_id,
+                offset: 4096,
+                length: 8192,
+            },
+            RpcRequest::ReadProvenance {
+                protection_id: prot_id,
+                generation_id: gen_id,
+            },
+            RpcRequest::DiffGenerations {
+                left_protection_id: prot_id,
+                left_generation_id: gen_id,
+                right_protection_id: prot_id,
+                right_generation_id: gen_id,
+            },
+            RpcRequest::ReadLogAt {
+                protection_id: prot_id,
+                name: "events".to_owned(),
+                from_seq: 0,
+                max_batches: 16,
+            },
+            RpcRequest::ListLogs {
+                protection_id: prot_id,
+            },
+            RpcRequest::ReadArtifact {
+                protection_id: prot_id,
+                name: "plan.txt".to_owned(),
+                offset: 0,
+                length: 4096,
+            },
+            RpcRequest::ListArtifacts {
+                protection_id: prot_id,
+            },
+            RpcRequest::CollectReport,
+            RpcRequest::GetGcReport,
+        ];
+
+        for req in requests {
+            let env = RpcEnvelope {
+                auth: RpcAuth {
+                    workspace_id: ws,
+                    principal_id: principal,
+                    auth_token: b"tok".to_vec(),
+                },
+                request: req.clone(),
+            };
+            let encoded = env.encode().unwrap();
+            let decoded = RpcEnvelope::decode(&encoded).unwrap();
+            assert_eq!(decoded, env);
+        }
+    }
+
+    #[test]
+    fn rpc_frames_codecs_and_errors_round_trip() {
+        let mut buf = Vec::new();
+        let frame_data = RpcResponseFrame::Data(b"hello".to_vec());
+        let frame_end = RpcResponseFrame::End;
+        let frame_err =
+            RpcResponseFrame::Error(ServiceError::new(ServiceErrorCode::Unauthorized, "denied"));
+        for frame in [&frame_data, &frame_end, &frame_err] {
+            let enc = frame.encode().unwrap();
+            write_frame(&mut buf, &enc).unwrap();
+        }
+        let mut cursor = std::io::Cursor::new(buf);
+        for expected in [frame_data, frame_end, frame_err] {
+            let raw = read_frame(&mut cursor).unwrap();
+            assert_eq!(RpcResponseFrame::decode(&raw).unwrap(), expected);
+        }
+
+        let br = BranchId::from_bytes([1; 16]);
+        let gen_id = GenerationId::from_bytes([2; 16]);
+        let att_id = AttachmentId::from_bytes([3; 16]);
+        let prot_id = ProtectionId::from_bytes([4; 16]);
+        let op_id = OperationId::from_bytes([5; 16]);
+        let roots = sample_roots();
+        let grant = sample_grant(br);
+        let att = AttachmentState {
+            attachment_id: att_id,
+            protection_id: prot_id,
+            base_generation: gen_id,
+            writer_epoch: 1,
+            volume_epoch: 1,
+            protection_expires_at: MonotonicTime::from_nanos(5000),
+        };
+        assert_eq!(
+            decode_rpc_attachment(&encode_rpc_attachment(att)).unwrap(),
+            att
+        );
+
+        let branch = BranchState {
+            workspace_id: WorkspaceId::from_bytes([9; 16]),
+            branch_id: br,
+            name: "main".to_owned(),
+            head: gen_id,
+            revision: 2,
+            pending_mutation_preparations: 0,
+            writer_epoch: 1,
+            volume_epoch: 1,
+            stream_epoch: 1,
+            volume_root: roots.volume,
+            logs_root: roots.logs,
+            artifacts_root: roots.artifacts,
+            writer: Some(grant),
+            attachment: Some(att),
+            capture: None,
+            deleted: false,
+        };
+        assert_eq!(
+            decode_rpc_branch(&encode_rpc_branch(&branch).unwrap()).unwrap(),
+            branch
+        );
+
+        let seed = GenerationSeed {
+            generation_id: gen_id,
+            descriptor: sample_ref(ObjectType::GenerationDescriptor, 1),
+            roots,
+        };
+        assert_eq!(
+            decode_rpc_generation_seed(&encode_rpc_generation_seed(seed)).unwrap(),
+            seed
+        );
+
+        let cap = CaptureState {
+            operation_id: op_id,
+            principal_id: PrincipalId::from_bytes([8; 16]),
+            protection_id: prot_id,
+            provenance: ProvenanceBinding::Unattributed,
+            expected_revision: 2,
+            sealed: true,
+            pending_child: None,
+            sealed_revision: Some(2),
+            sealed_roots: Some(roots),
+        };
+        assert_eq!(decode_rpc_capture(&encode_rpc_capture(&cap)).unwrap(), cap);
+
+        let pub_gen = PublishedGeneration {
+            generation_id: gen_id,
+            branch: branch.clone(),
+            head_advanced: true,
+        };
+        assert_eq!(
+            decode_rpc_published_generation(&encode_rpc_published_generation(&pub_gen).unwrap())
+                .unwrap(),
+            pub_gen
+        );
+
+        let transition = CommittedRootTransition {
+            kind: PreparationKind::ArtifactMutation,
+            previous_roots: roots,
+            branch: branch.clone(),
+            native_meta: None,
+        };
+        assert_eq!(
+            decode_rpc_root_transition(&encode_rpc_root_transition(Some(&transition)).unwrap())
+                .unwrap(),
+            Some(transition)
+        );
+
+        let op_state = OperationState::Preparing {
+            operation_id: op_id,
+            expires_at: MonotonicTime::from_nanos(7000),
+            branch_id: br,
+        };
+        assert_eq!(
+            decode_rpc_operation_state(&encode_rpc_operation_state(&op_state).unwrap()).unwrap(),
+            op_state
+        );
+
+        let insp = ProvenanceInspection {
+            generation_id: gen_id,
+            source_format: GenerationDescriptorFormat::V2,
+            status: ProvenanceStatus::Recorded,
+            coverage: ProvenanceCoverage::GenerationContext,
+            context_root: Some(sample_ref(ObjectType::ProvenanceContext, 2)),
+            context: Some(ProvenanceContext {
+                recording_principal: PrincipalId::from_bytes([1; 16]),
+                actor: Some("worker".to_owned()),
+                execution_id: None,
+                session_id: None,
+                thread_id: None,
+                task_id: None,
+                workflow_operation_id: None,
+                reason: Some("ok".to_owned()),
+                trace_id: None,
+                span_id: None,
+                parent_span_id: None,
+                required_logs_root: roots.logs,
+                required_artifacts_root: roots.artifacts,
+                optional_links: vec!["https://example.invalid".to_owned()],
+            }),
+        };
+        assert_eq!(
+            decode_rpc_provenance_inspection(&encode_rpc_provenance_inspection(&insp).unwrap())
+                .unwrap(),
+            insp
+        );
+
+        let diff_chunk = DiffStreamChunk::Extents(vec![ExtentRange {
+            start_extent: 0,
+            extent_count: 1,
+        }]);
+        assert_eq!(
+            decode_rpc_diff_chunk(&encode_rpc_diff_chunk(&diff_chunk).unwrap()).unwrap(),
+            diff_chunk
+        );
+        let log_diff = DiffStreamChunk::Logs(vec![LogViewChange::Added {
+            name: "events".to_owned(),
+            entry: LogMapEntry {
+                log_id: LogId::from_bytes([1; 16]),
+                first_seq: 0,
+                end_seq: 1,
+                segment_index_root: sample_ref(ObjectType::LogSegmentIndexNode, 2),
+            },
+        }]);
+        assert_eq!(
+            decode_rpc_diff_chunk(&encode_rpc_diff_chunk(&log_diff).unwrap()).unwrap(),
+            log_diff
+        );
+
+        let logs = vec![(
+            "events".to_owned(),
+            LogMapEntry {
+                log_id: LogId::from_bytes([1; 16]),
+                first_seq: 0,
+                end_seq: 1,
+                segment_index_root: sample_ref(ObjectType::LogSegmentIndexNode, 2),
+            },
+        )];
+        assert_eq!(
+            decode_rpc_log_list(&encode_rpc_log_list(&logs).unwrap()).unwrap(),
+            logs
+        );
+
+        let blob = crate::views::encode_artifact_blob(&[1, 2, 3, 4]).unwrap();
+        let blob_ref = ObjectRef::from_encoded(&blob).unwrap();
+        let arts = vec![(
+            "a.txt".to_owned(),
+            ArtifactDescriptor {
+                artifact_id: ArtifactId::from_bytes([2; 16]),
+                logical_len: 4,
+                content_root: blob_ref,
+                dependencies: vec![],
+            },
+        )];
+        assert_eq!(
+            decode_rpc_artifact_list(&encode_rpc_artifact_list(&arts).unwrap()).unwrap(),
+            arts
+        );
+
+        let batch = encode_rpc_log_batch(
+            LogId::from_bytes([1; 16]),
+            0,
+            1,
+            &[b"rec".to_vec()],
+            &[sample_ref(ObjectType::ArtifactBlob, 9)],
+        )
+        .unwrap();
+        let (lid, first, end, recs, atts) = decode_rpc_log_batch(&batch).unwrap();
+        assert_eq!(lid, LogId::from_bytes([1; 16]));
+        assert_eq!((first, end), (0, 1));
+        assert_eq!(recs, vec![b"rec".to_vec()]);
+        assert_eq!(atts.len(), 1);
+
+        // Error mappings
+        for err in [
+            ControlError::Fenced,
+            ControlError::Expired,
+            ControlError::GenerationExpired,
+            ControlError::NotFound,
+            ControlError::Conflict,
+            ControlError::OperationMismatch,
+            ControlError::Aborted,
+            ControlError::InProgress,
+            ControlError::InvalidRequest("bad"),
+            ControlError::InvalidTransition,
+            ControlError::CorruptRecord("bad".to_owned()),
+            ControlError::Metadata(MetadataError::Backend("io".to_owned())),
+        ] {
+            let svc_err = ServiceError::from(err);
+            let _ = svc_err.to_control_error();
+        }
+        let fmt_err = ServiceError::from(FormatError::InvalidEnvelope("bad"));
+        assert_eq!(fmt_err.code, ServiceErrorCode::IntegrityError);
+    }
+}

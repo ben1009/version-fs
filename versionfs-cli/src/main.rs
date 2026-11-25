@@ -1547,3 +1547,669 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::path::Path;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Instant;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "versionfs-cli-unit-{}-{}",
+                std::process::id(),
+                now_unix_ms()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct ChildGuard(Option<Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut c) = self.0.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+
+    fn ensure_versionfsd() -> PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        let target_dir = exe
+            .ancestors()
+            .find(|p| p.file_name().is_some_and(|n| n == "debug"))
+            .unwrap_or_else(|| exe.parent().unwrap());
+        let bin = target_dir.join("versionfsd");
+        if !bin.exists() {
+            let status = Command::new(env!("CARGO"))
+                .args([
+                    "build",
+                    "--offline",
+                    "--locked",
+                    "-p",
+                    "versionfs-service",
+                    "--bin",
+                    "versionfsd",
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        assert!(bin.exists(), "missing {}", bin.display());
+        bin
+    }
+
+    fn cli_call(ep: &str, ws: &str, pr: &str, args: &[&str]) -> Result<Value, String> {
+        let mut full = vec![
+            "versionfs",
+            "--endpoint",
+            ep,
+            "--workspace-id",
+            ws,
+            "--principal-id",
+            pr,
+            "--auth-token",
+            "unit-tok",
+            "--json",
+        ];
+        full.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full).map_err(|e| e.to_string())?;
+        run(cli)
+    }
+
+    fn wait_sock(path: &Path) {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(10) {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("socket {} did not appear", path.display());
+    }
+
+    #[test]
+    fn in_process_cli_and_worker_exercise_all_commands() {
+        let dir = TempDir::new();
+        let meta_dir = dir.0.join("meta");
+        let obj_dir = dir.0.join("obj");
+
+        let mut svc = Command::new(ensure_versionfsd())
+            .args([
+                "--metadata-dir",
+                meta_dir.to_str().unwrap(),
+                "--object-dir",
+                obj_dir.to_str().unwrap(),
+                "--listen",
+                "tcp://127.0.0.1:0",
+                "--auth-token",
+                "unit-tok",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(svc.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let _svc_guard = ChildGuard(Some(svc));
+        let ep = ready.trim().strip_prefix("READY ").unwrap().to_owned();
+
+        let ws = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let pr = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        // Offline fs format without --confirm-destructive fails.
+        assert!(cli_call(&ep, ws, pr, &["fs", "format", "--device", "/tmp/no-dev"]).is_err());
+
+        let created = cli_call(
+            &ep,
+            ws,
+            pr,
+            &["workspace", "create", "--capacity-bytes", "131072"],
+        )
+        .unwrap();
+        let main_br = created["branch"]["branch_id"].as_str().unwrap().to_owned();
+        let g0 = created["branch"]["head"].as_str().unwrap().to_owned();
+        let stream_epoch = created["branch"]["stream_epoch"].as_u64().unwrap();
+
+        let sock = dir.0.join("worker.sock");
+        let ep_bg = ep.clone();
+        let br_bg = main_br.clone();
+        let dir_bg = dir.0.clone();
+        let sock_bg = sock.clone();
+        let worker_thread = std::thread::spawn(move || {
+            let cli = Cli::try_parse_from([
+                "versionfs",
+                "--endpoint",
+                &ep_bg,
+                "--workspace-id",
+                ws,
+                "--principal-id",
+                pr,
+                "--auth-token",
+                "unit-tok",
+                "volume",
+                "serve",
+                "--branch-id",
+                &br_bg,
+                "--cache-dir",
+                dir_bg.join("cache").to_str().unwrap(),
+                "--journal-dir",
+                dir_bg.join("journal").to_str().unwrap(),
+                "--capture-dir",
+                dir_bg.join("capture").to_str().unwrap(),
+                "--control-socket",
+                sock_bg.to_str().unwrap(),
+            ])
+            .unwrap();
+            run(cli).unwrap();
+        });
+        wait_sock(&sock);
+        let sock_s = sock.to_str().unwrap();
+
+        // Volume write/read/flush/status/reconcile-barrier
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "volume",
+                "write",
+                "--control-socket",
+                sock_s,
+                "--offset",
+                "0",
+                "--data-hex",
+                &"11223344".repeat(1024),
+            ],
+        )
+        .unwrap();
+        let rd = cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "volume",
+                "read",
+                "--control-socket",
+                sock_s,
+                "--offset",
+                "0",
+                "--length",
+                "4096",
+            ],
+        )
+        .unwrap();
+        assert_eq!(rd["data_hex"], Value::String("11223344".repeat(1024)));
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["volume", "flush", "--control-socket", sock_s],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["volume", "status", "--control-socket", sock_s],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["volume", "reconcile-barrier", "--control-socket", sock_s],
+        )
+        .unwrap();
+
+        // Artifact stage-put / stage-remove / put / remove / list / get
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "artifact",
+                "stage-put",
+                "--control-socket",
+                sock_s,
+                "--name",
+                "temp.txt",
+                "--payload-hex",
+                "616263",
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "artifact",
+                "stage-remove",
+                "--control-socket",
+                sock_s,
+                "--name",
+                "temp.txt",
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "artifact",
+                "put",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "note.txt",
+                "--payload-hex",
+                "6e6f7465",
+            ],
+        )
+        .unwrap();
+
+        // Log create / append / tail / trim / delete
+        let log_res = cli_call(
+            &ep,
+            ws,
+            pr,
+            &["log", "create", "--branch-id", &main_br, "--name", "events"],
+        )
+        .unwrap();
+        let log_id = log_res["stream_id"]["log_id"].as_str().unwrap().to_owned();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "append",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "events",
+                "--stream-epoch",
+                &stream_epoch.to_string(),
+                "--log-id",
+                &log_id,
+                "--match-seq",
+                "0",
+                "--record",
+                "r0",
+                "--record",
+                "r1",
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "append",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "events",
+                "--stream-epoch",
+                &stream_epoch.to_string(),
+                "--log-id",
+                &log_id,
+                "--match-seq",
+                "2",
+                "--record",
+                "r2",
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "tail",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "events",
+                "--stream-epoch",
+                &stream_epoch.to_string(),
+                "--log-id",
+                &log_id,
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "trim",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "events",
+                "--stream-epoch",
+                &stream_epoch.to_string(),
+                "--log-id",
+                &log_id,
+                "--trim-to-seq",
+                "2",
+            ],
+        )
+        .unwrap();
+
+        // Checkpoint with provenance + optional link + raw payload opt-in
+        let g1_res = cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "checkpoint",
+                "create",
+                "--control-socket",
+                sock_s,
+                "--mode",
+                "block_cut",
+                "--actor",
+                "unit-agent",
+                "--execution-id",
+                "exec-1",
+                "--session-id",
+                "sess-1",
+                "--thread-id",
+                "thr-1",
+                "--task-id",
+                "task-1",
+                "--workflow-operation-id",
+                "wf-1",
+                "--reason",
+                "unit test",
+                "--trace-id",
+                "tr-1",
+                "--span-id",
+                "sp-1",
+                "--parent-span-id",
+                "psp-1",
+                "--optional-link",
+                "https://example.invalid/doc",
+                "--include-raw-payload",
+                "--raw-payload",
+                "hello",
+            ],
+        )
+        .unwrap();
+        let g1 = g1_res["generation_id"].as_str().unwrap().to_owned();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["checkpoint", "recover", "--control-socket", sock_s],
+        )
+        .unwrap();
+
+        // Generation open / renew / pin / unpin / inspect-provenance / diff / close / read-blocks /
+        // logs / artifacts
+        let open_res =
+            cli_call(&ep, ws, pr, &["generation", "open", "--generation-id", &g1]).unwrap();
+        let prot_id = open_res["protection_id"].as_str().unwrap().to_owned();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["generation", "renew", "--protection-id", &prot_id],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["generation", "close", "--protection-id", &prot_id],
+        )
+        .unwrap();
+        let pin_res =
+            cli_call(&ep, ws, pr, &["generation", "pin", "--generation-id", &g1]).unwrap();
+        let pin_id = pin_res["pin_id"].as_str().unwrap().to_owned();
+        cli_call(&ep, ws, pr, &["generation", "unpin", "--pin-id", &pin_id]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["generation", "inspect-provenance", "--generation-id", &g1],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "generation",
+                "diff",
+                "--left-generation-id",
+                &g0,
+                "--right-generation-id",
+                &g1,
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "volume",
+                "read-blocks",
+                "--generation-id",
+                &g1,
+                "--offset",
+                "0",
+                "--length",
+                "4096",
+            ],
+        )
+        .unwrap();
+        cli_call(&ep, ws, pr, &["log", "list", "--generation-id", &g1]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "read",
+                "--generation-id",
+                &g1,
+                "--name",
+                "events",
+                "--from-seq",
+                "2",
+            ],
+        )
+        .unwrap();
+        cli_call(&ep, ws, pr, &["artifact", "list", "--generation-id", &g1]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "artifact",
+                "get",
+                "--generation-id",
+                &g1,
+                "--name",
+                "note.txt",
+            ],
+        )
+        .unwrap();
+
+        // Log delete + Artifact remove
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "log",
+                "delete",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "events",
+                "--stream-epoch",
+                &stream_epoch.to_string(),
+                "--log-id",
+                &log_id,
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "artifact",
+                "remove",
+                "--branch-id",
+                &main_br,
+                "--name",
+                "note.txt",
+            ],
+        )
+        .unwrap();
+
+        // Branch by-name / renew-base / detach / writer renew+release+acquire / branch
+        // create+move-head+promote+delete
+        cli_call(&ep, ws, pr, &["branch", "by-name", "--name", "main"]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &["volume", "renew-base", "--branch-id", &main_br],
+        )
+        .unwrap();
+        cli_call(&ep, ws, pr, &["writer", "renew", "--branch-id", &main_br]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "volume",
+                "detach",
+                "--control-socket",
+                sock_s,
+                "--branch-id",
+                &main_br,
+            ],
+        )
+        .unwrap();
+        worker_thread.join().unwrap();
+
+        let br_after = cli_call(&ep, ws, pr, &["branch", "get", "--branch-id", &main_br]).unwrap();
+        let rev_after = br_after["revision"].as_u64().unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "branch",
+                "move-head",
+                "--branch-id",
+                &main_br,
+                "--expected-revision",
+                &rev_after.to_string(),
+                "--target-generation",
+                &g0,
+                "--discard-live-state",
+            ],
+        )
+        .unwrap();
+
+        let cand = cli_call(
+            &ep,
+            ws,
+            pr,
+            &["branch", "create", "--name", "c1", "--base-generation", &g1],
+        )
+        .unwrap();
+        let cand_id = cand["branch_id"].as_str().unwrap().to_owned();
+        let cand_rev = cand["revision"].as_u64().unwrap();
+        let cand_epoch = cand["writer_epoch"].as_u64().unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "writer",
+                "acquire",
+                "--branch-id",
+                &cand_id,
+                "--expected-revision",
+                &cand_rev.to_string(),
+                "--expected-writer-epoch",
+                &cand_epoch.to_string(),
+            ],
+        )
+        .unwrap();
+        cli_call(&ep, ws, pr, &["writer", "release", "--branch-id", &cand_id]).unwrap();
+        let cand2 = cli_call(&ep, ws, pr, &["branch", "get", "--branch-id", &cand_id]).unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "writer",
+                "acquire",
+                "--branch-id",
+                &cand_id,
+                "--expected-revision",
+                &cand2["revision"].as_u64().unwrap().to_string(),
+                "--expected-writer-epoch",
+                &cand2["writer_epoch"].as_u64().unwrap().to_string(),
+                "--force",
+            ],
+        )
+        .unwrap();
+        cli_call(
+            &ep,
+            ws,
+            pr,
+            &[
+                "branch",
+                "delete",
+                "--branch-id",
+                &cand_id,
+                "--expected-revision",
+                &cand2["revision"].as_u64().unwrap().to_string(),
+                "--discard-live-state",
+            ],
+        )
+        .unwrap();
+
+        // Op & report commands
+        assert!(cli_call(&ep, ws, pr, &["report", "collect"]).is_err());
+        assert!(cli_call(&ep, ws, pr, &["report", "get"]).is_err());
+        let op_hex = "cccccccccccccccccccccccccccccccc";
+        let _ = cli_call(&ep, ws, pr, &["op", "abort", "--operation-id", op_hex]);
+        let _ = cli_call(&ep, ws, pr, &["op", "status", "--operation-id", op_hex]);
+        let _ = cli_call(&ep, ws, pr, &["op", "expire", "--operation-id", op_hex]);
+    }
+}
