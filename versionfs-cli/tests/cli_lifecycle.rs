@@ -596,12 +596,22 @@ fn two_worker_cli_lifecycle_with_lazy_clean_cache_and_provenance() {
         Value::String("706c616e2d7631".to_owned())
     );
 
-    // P10 report command returns UnsupportedOperation cleanly.
-    let report_err = run_cli_expect_err(&endpoint, ws_id, principal_id, &["report", "collect"]);
-    assert!(
-        report_err.contains("unsupported") || report_err.contains("Unsupported"),
-        "unexpected report error: {report_err}"
+    // P10 mark-only report collect and get succeed via CLI.
+    let report_op_hex = "09".repeat(16);
+    let report_collected = run_cli(
+        &endpoint,
+        ws_id,
+        principal_id,
+        &["report", "collect", "--operation-id", &report_op_hex],
     );
+    assert_eq!(report_collected["completeness"]["status"], "complete");
+    let report_fetched = run_cli(
+        &endpoint,
+        ws_id,
+        principal_id,
+        &["report", "get", "--report-id", &report_op_hex],
+    );
+    assert_eq!(report_fetched["report_id"], report_collected["report_id"]);
 
     // Explicit destructive format refuses without --confirm-destructive.
     let fmt_err = run_cli_expect_err(

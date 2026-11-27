@@ -610,15 +610,14 @@ fn freeze_independent_heartbeat_and_unsupported_p10_reports() {
         versionfs_core::control::OperationState::Committed { .. }
     ));
 
-    // P10 report RPCs return explicit UnsupportedOperation.
-    assert_eq!(
-        client.collect_report().unwrap_err().code,
-        ServiceErrorCode::UnsupportedOperation
-    );
-    assert_eq!(
-        client.get_gc_report().unwrap_err().code,
-        ServiceErrorCode::UnsupportedOperation
-    );
+    // P10 mark-only report collection and retrieval succeed and remain idempotent.
+    let report_op = OperationId::from_bytes(id16(79));
+    let summary = client.collect_report(report_op, None).unwrap();
+    assert_eq!(summary.report_id, report_op);
+    assert!(summary.completeness.is_complete());
+    let (fetched, page) = client.get_gc_report(report_op, None).unwrap();
+    assert_eq!(fetched, summary);
+    assert!(page.is_none());
 }
 
 #[test]

@@ -13,6 +13,7 @@ use versionfs_cli::worker::{
 };
 use versionfs_core::control::{AttachmentState, WriterGrant};
 use versionfs_core::format::{GenerationDescriptorFormat, ProvenanceStatus, VolumeGeometry};
+use versionfs_core::gc::{GcReportBudget, GcReportCompleteness};
 use versionfs_core::identity::{
     ArtifactId, AttachmentId, BranchId, GenerationId, LogId, OperationId, PinId, ProtectionId,
     VolumeBoundaryId,
@@ -514,8 +515,28 @@ enum OpCmd {
 
 #[derive(Subcommand)]
 enum ReportCmd {
-    Collect,
-    Get,
+    Collect {
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long)]
+        max_in_memory_visited: Option<usize>,
+        #[arg(long)]
+        max_candidate_pages: Option<u32>,
+        #[arg(long)]
+        max_candidates_per_page: Option<usize>,
+        #[arg(long)]
+        max_report_bytes: Option<usize>,
+        #[arg(long)]
+        detail_ttl_nanos: Option<u64>,
+        #[arg(long)]
+        scan_page_size: Option<usize>,
+    },
+    Get {
+        #[arg(long)]
+        report_id: String,
+        #[arg(long)]
+        page_index: Option<u32>,
+    },
 }
 
 fn main() {
@@ -1486,13 +1507,71 @@ fn run(cli: Cli) -> Result<Value, String> {
             }
         },
         Commands::Report { sub } => match sub {
-            ReportCmd::Collect => {
-                client.collect_report().map_err(|e| e.to_string())?;
-                Ok(json!({}))
+            ReportCmd::Collect {
+                operation_id,
+                max_in_memory_visited,
+                max_candidate_pages,
+                max_candidates_per_page,
+                max_report_bytes,
+                detail_ttl_nanos,
+                scan_page_size,
+            } => {
+                let op_id = match operation_id {
+                    Some(raw) => OperationId::from_bytes(decode_hex_16(&raw)?),
+                    None => alloc_op_id(),
+                };
+                let mut budget = GcReportBudget::default();
+                if let Some(v) = max_in_memory_visited {
+                    budget.max_in_memory_visited = v;
+                }
+                if let Some(v) = max_candidate_pages {
+                    budget.max_candidate_pages = v;
+                }
+                if let Some(v) = max_candidates_per_page {
+                    budget.max_candidates_per_page = v;
+                }
+                if let Some(v) = max_report_bytes {
+                    budget.max_report_bytes = v;
+                }
+                if let Some(v) = detail_ttl_nanos {
+                    budget.detail_ttl_nanos = v;
+                }
+                if let Some(v) = scan_page_size {
+                    budget.scan_page_size = v;
+                }
+                let summary = client
+                    .collect_report(op_id, Some(budget))
+                    .map_err(|e| e.to_string())?;
+                Ok(gc_summary_json(&summary))
             }
-            ReportCmd::Get => {
-                client.get_gc_report().map_err(|e| e.to_string())?;
-                Ok(json!({}))
+            ReportCmd::Get {
+                report_id,
+                page_index,
+            } => {
+                let id = OperationId::from_bytes(decode_hex_16(&report_id)?);
+                let (summary, page) = client
+                    .get_gc_report(id, page_index)
+                    .map_err(|e| e.to_string())?;
+                let mut value = gc_summary_json(&summary);
+                if let Some(page) = page {
+                    let entries: Vec<Value> = page
+                        .entries
+                        .iter()
+                        .map(|entry| {
+                            json!({
+                                "object_type": format!("{:?}", entry.object_ref.object_type),
+                                "object_id": entry.object_ref.object_id.to_string(),
+                                "encoded_len": entry.object_ref.encoded_len,
+                            })
+                        })
+                        .collect();
+                    value["page"] = json!({
+                        "page_index": page.page_index,
+                        "next_page": page.next_page,
+                        "entries": entries,
+                    });
+                }
+                Ok(value)
             }
         },
     }
@@ -1567,6 +1646,39 @@ fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn gc_summary_json(summary: &versionfs_core::gc::GcReportSummary) -> Value {
+    let completeness = match summary.completeness {
+        GcReportCompleteness::Complete => json!({ "status": "complete" }),
+        GcReportCompleteness::Incomplete {
+            missing_or_corrupt_objects,
+            uncertain_preparations,
+            budget_exhausted,
+            missing_metadata,
+        } => json!({
+            "status": "incomplete",
+            "missing_or_corrupt_objects": missing_or_corrupt_objects,
+            "uncertain_preparations": uncertain_preparations,
+            "budget_exhausted": budget_exhausted,
+            "missing_metadata": missing_metadata,
+        }),
+    };
+    json!({
+        "report_id": summary.report_id.to_string(),
+        "boundary_time_nanos": summary.boundary_time.as_nanos(),
+        "sealed_root_count": summary.sealed_root_count,
+        "marked_objects": summary.marked_objects,
+        "observed_objects": summary.observed_objects,
+        "observed_bytes": summary.observed_bytes,
+        "unreachable_objects": summary.unreachable_objects,
+        "unreachable_bytes": summary.unreachable_bytes,
+        "candidate_page_count": summary.candidate_page_count,
+        "inventory_started_unix_ms": summary.inventory_started_unix_ms,
+        "inventory_finished_unix_ms": summary.inventory_finished_unix_ms,
+        "detail_expires_at_nanos": summary.detail_expires_at.as_nanos(),
+        "completeness": completeness,
+    })
 }
 
 #[cfg(test)]
@@ -2305,8 +2417,23 @@ mod tests {
         .unwrap();
 
         // Op & report commands
-        assert!(cli_call(&ep, ws, pr, &["report", "collect"]).is_err());
-        assert!(cli_call(&ep, ws, pr, &["report", "get"]).is_err());
+        let report_op_hex = "dddddddddddddddddddddddddddddddd";
+        let collected = cli_call(
+            &ep,
+            ws,
+            pr,
+            &["report", "collect", "--operation-id", report_op_hex],
+        )
+        .unwrap();
+        assert_eq!(collected["completeness"]["status"], "complete");
+        let fetched = cli_call(
+            &ep,
+            ws,
+            pr,
+            &["report", "get", "--report-id", report_op_hex],
+        )
+        .unwrap();
+        assert_eq!(fetched["report_id"], collected["report_id"]);
         let op_hex = "cccccccccccccccccccccccccccccccc";
         let _ = cli_call(&ep, ws, pr, &["op", "abort", "--operation-id", op_hex]);
         let _ = cli_call(&ep, ws, pr, &["op", "status", "--operation-id", op_hex]);

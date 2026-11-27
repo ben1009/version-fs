@@ -16,13 +16,15 @@ use crate::{
         MAX_PROVENANCE_CONTEXT_BYTES, MetadataRecordType, ObjectRef, ObjectType, ProvenanceBinding,
         decode_metadata_record, encode_metadata_record,
     },
+    gc::{GcCandidatePage, GcReportSummary, SealedRootSet},
     graph::DependencyProof,
     identity::{
         AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
         PrincipalId, ProtectionId, WorkspaceId,
     },
     metadata::{
-        MetadataAuthority, MetadataError, MetadataTxn, MutationIdentity, ReconciledOutcome,
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataTxn, MutationIdentity,
+        ReconciledOutcome,
     },
     time::MonotonicTime,
 };
@@ -124,6 +126,9 @@ pub enum ControlError {
     /// A Generation is no longer eligible for new protection.
     #[error("Generation is not retained")]
     GenerationExpired,
+    /// Mark-only GC report candidate details have expired.
+    #[error("GC report candidate details expired")]
+    ReportExpired,
     /// Durable live roots differ from the branch head and explicit discard was not set.
     #[error("durable live state differs from branch head; explicit discard_live_state is required")]
     LiveStateDiscardRequired,
@@ -3378,6 +3383,260 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
     }
 
+    /// Enumerates retained/protected roots and uncertain preparations from one
+    /// read-only authority snapshot, seals them for `report_id`, and drops the
+    /// snapshot before any object-store I/O.
+    pub fn seal_gc_report_roots(
+        &self,
+        report_id: OperationId,
+        scan_page_size: usize,
+    ) -> Result<SealedRootSet, ControlError> {
+        let roots_key = gc_report_roots_key(self.workspace_id, report_id);
+        if let Some(existing) = self.authority.get(&roots_key)? {
+            return SealedRootSet::decode(&existing)
+                .map_err(|e| ControlError::CorruptRecord(e.to_string()));
+        }
+
+        let page_limit = std::num::NonZeroUsize::new(scan_page_size.max(1)).ok_or(
+            ControlError::InvalidRequest("scan_page_size must be nonzero"),
+        )?;
+        let snapshot = self.authority.snapshot()?;
+        let boundary_time = self.authority.now();
+        let mut roots = Vec::new();
+        let mut uncertain_preparations = 0_u64;
+        let mut missing_metadata = 0_u64;
+
+        // 1. Retained/eligible Generations.
+        let gen_prefix = generations_prefix(self.workspace_id);
+        let mut cursor: Option<MetadataCursor> = None;
+        loop {
+            let page =
+                self.authority
+                    .scan_prefix(&snapshot, &gen_prefix, cursor.as_ref(), page_limit)?;
+            for (_, val) in page.entries {
+                match decode_generation(&val) {
+                    Ok(gen_rec) => {
+                        if gen_rec.eligible() {
+                            roots.push(gen_rec.seed.descriptor);
+                        }
+                    }
+                    Err(_) => missing_metadata = missing_metadata.saturating_add(1),
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        // 2. Non-deleted branches (live volume/log/artifact roots + active capture roots).
+        let br_prefix = branches_prefix(self.workspace_id);
+        let mut cursor: Option<MetadataCursor> = None;
+        loop {
+            let page =
+                self.authority
+                    .scan_prefix(&snapshot, &br_prefix, cursor.as_ref(), page_limit)?;
+            for (_, val) in page.entries {
+                match decode_branch(&val) {
+                    Ok(branch) => {
+                        if !branch.deleted {
+                            roots.push(branch.volume_root);
+                            roots.push(branch.logs_root);
+                            roots.push(branch.artifacts_root);
+                            if let Some(cap) = branch.capture {
+                                if let Some(ctx) = cap.provenance.context_root() {
+                                    roots.push(ctx);
+                                }
+                                if let Some(sealed_roots) = cap.sealed_roots {
+                                    roots.push(sealed_roots.volume);
+                                    roots.push(sealed_roots.logs);
+                                    roots.push(sealed_roots.artifacts);
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => missing_metadata = missing_metadata.saturating_add(1),
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        // 3. Active protections (LiveLogRead, AttachmentBase, Preparation dependencies).
+        let prot_prefix = protections_prefix(self.workspace_id);
+        let mut cursor: Option<MetadataCursor> = None;
+        loop {
+            let page =
+                self.authority
+                    .scan_prefix(&snapshot, &prot_prefix, cursor.as_ref(), page_limit)?;
+            for (_, val) in page.entries {
+                match decode_protection(&val) {
+                    Ok(ProtectionRecord::LiveLogRead {
+                        root, expires_at, ..
+                    }) if expires_at > boundary_time => {
+                        roots.push(root);
+                    }
+                    Ok(ProtectionRecord::AttachmentBase {
+                        roots: att_roots,
+                        expires_at,
+                        ..
+                    }) if expires_at > boundary_time => {
+                        roots.push(att_roots.volume);
+                        roots.push(att_roots.logs);
+                        roots.push(att_roots.artifacts);
+                    }
+                    Ok(ProtectionRecord::Preparation {
+                        dependencies,
+                        expires_at,
+                        ..
+                    }) if expires_at > boundary_time => {
+                        roots.extend_from_slice(&dependencies);
+                    }
+                    Ok(ProtectionRecord::GenerationRead { .. })
+                    | Ok(ProtectionRecord::LiveLogRead { .. })
+                    | Ok(ProtectionRecord::AttachmentBase { .. })
+                    | Ok(ProtectionRecord::Preparation { .. })
+                    | Ok(ProtectionRecord::Retired { .. }) => {}
+                    Err(_) => missing_metadata = missing_metadata.saturating_add(1),
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        // 4. In-progress preparations across principals in this workspace.
+        let op_prefix = workspace_operations_prefix(self.workspace_id);
+        let op_record_key_len = op_prefix.len() + 16 + 16;
+        let mut cursor: Option<MetadataCursor> = None;
+        loop {
+            let page =
+                self.authority
+                    .scan_prefix(&snapshot, &op_prefix, cursor.as_ref(), page_limit)?;
+            for (key, val) in page.entries {
+                if key.len() != op_record_key_len {
+                    continue;
+                }
+                match decode_operation(&val) {
+                    Ok(op) => {
+                        if matches!(op.status, StoredOperationStatus::Preparing { .. }) {
+                            uncertain_preparations = uncertain_preparations.saturating_add(1);
+                        }
+                    }
+                    Err(_) => missing_metadata = missing_metadata.saturating_add(1),
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        // Release the read-only snapshot explicitly before any report persistence or object I/O.
+        drop(snapshot);
+
+        roots.sort_by(|a, b| {
+            a.object_id
+                .as_bytes()
+                .cmp(b.object_id.as_bytes())
+                .then_with(|| (a.object_type as u16).cmp(&(b.object_type as u16)))
+        });
+        roots.dedup();
+
+        let sealed = SealedRootSet {
+            report_id,
+            boundary_time,
+            roots,
+            uncertain_preparations,
+            missing_metadata,
+        };
+        let encoded = sealed.encode()?;
+        let outcome_key = gc_report_roots_outcome_key(self.workspace_id, report_id);
+        let mut op_id_bytes = Vec::from(b"gc-seal:".as_slice());
+        op_id_bytes.extend_from_slice(report_id.as_bytes());
+        let identity = MutationIdentity {
+            operation_id: &op_id_bytes,
+            outcome_key: &outcome_key,
+        };
+        let persisted = self.authority.transact(identity, |txn| {
+            if let Some(existing) = txn.get(&roots_key)? {
+                txn.put(&outcome_key, &existing)?;
+                return Ok(existing);
+            }
+            txn.put(&roots_key, &encoded)?;
+            txn.put(&outcome_key, &encoded)?;
+            Ok(encoded.clone())
+        })?;
+        SealedRootSet::decode(&persisted).map_err(|e| ControlError::CorruptRecord(e.to_string()))
+    }
+
+    /// Persists the terminal summary and bounded candidate pages for a mark-only GC report.
+    pub fn persist_gc_report(
+        &self,
+        summary: &GcReportSummary,
+        pages: &[GcCandidatePage],
+    ) -> Result<(), ControlError> {
+        let sum_key = gc_report_summary_key(self.workspace_id, summary.report_id);
+        let sum_bytes = summary.encode();
+        let outcome_key = gc_report_persist_outcome_key(self.workspace_id, summary.report_id);
+        let mut op_id_bytes = Vec::from(b"gc-persist:".as_slice());
+        op_id_bytes.extend_from_slice(summary.report_id.as_bytes());
+        let identity = MutationIdentity {
+            operation_id: &op_id_bytes,
+            outcome_key: &outcome_key,
+        };
+        let mut encoded_pages = Vec::with_capacity(pages.len());
+        for page in pages {
+            encoded_pages.push((page.page_index, page.encode()?));
+        }
+        self.authority.transact(identity, |txn| {
+            if let Some(existing) = txn.get(&sum_key)? {
+                txn.put(&outcome_key, &existing)?;
+                return Ok(existing);
+            }
+            txn.put(&sum_key, &sum_bytes)?;
+            for (idx, bytes) in &encoded_pages {
+                let pkey = gc_report_page_key(self.workspace_id, summary.report_id, *idx);
+                txn.put(&pkey, bytes)?;
+            }
+            txn.put(&outcome_key, &sum_bytes)?;
+            Ok(sum_bytes.clone())
+        })?;
+        Ok(())
+    }
+
+    /// Reads a persisted mark-only GC report summary and optional candidate page.
+    ///
+    /// Terminal summary metadata remains readable after detail expiry; requesting a
+    /// candidate page past `detail_expires_at` returns [`ControlError::ReportExpired`].
+    pub fn get_gc_report(
+        &self,
+        report_id: OperationId,
+        page_index: Option<u32>,
+    ) -> Result<(GcReportSummary, Option<GcCandidatePage>), ControlError> {
+        let sum_key = gc_report_summary_key(self.workspace_id, report_id);
+        let sum_bytes = self
+            .authority
+            .get(&sum_key)?
+            .ok_or(ControlError::NotFound)?;
+        let summary = GcReportSummary::decode(&sum_bytes)
+            .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
+        let Some(idx) = page_index else {
+            return Ok((summary, None));
+        };
+        if self.authority.now() >= summary.detail_expires_at {
+            return Err(ControlError::ReportExpired);
+        }
+        let pkey = gc_report_page_key(self.workspace_id, report_id, idx);
+        let page_bytes = self.authority.get(&pkey)?.ok_or(ControlError::NotFound)?;
+        let page = GcCandidatePage::decode(&page_bytes)
+            .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
+        Ok((summary, Some(page)))
+    }
+
     fn operation_key(&self, id: OperationId) -> Vec<u8> {
         scoped_operation_key(self.workspace_id, self.principal_id, id)
     }
@@ -5505,6 +5764,7 @@ fn to_metadata_error(error: impl Into<ControlError>) -> MetadataError {
         ControlError::Expired => reject("expired"),
         ControlError::Busy => reject("busy"),
         ControlError::GenerationExpired => reject("generation_expired"),
+        ControlError::ReportExpired => reject("report_expired"),
         ControlError::LiveStateDiscardRequired => reject("live_state_discard_required"),
         ControlError::InvalidTransition => reject("invalid_transition"),
         ControlError::InvalidRequest(_) => reject("invalid_request"),
@@ -5586,6 +5846,9 @@ fn branch_key(workspace: WorkspaceId, branch: BranchId) -> Vec<u8> {
     ]
     .concat()
 }
+fn branches_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    [KEY_PREFIX, b"branch/", workspace.as_bytes()].concat()
+}
 fn branch_name_key(workspace: WorkspaceId, name: &str) -> Vec<u8> {
     let mut key = [KEY_PREFIX, b"branch-name/", workspace.as_bytes()].concat();
     key.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -5624,6 +5887,9 @@ fn generation_key(workspace: WorkspaceId, generation: GenerationId) -> Vec<u8> {
     ]
     .concat()
 }
+fn generations_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    [KEY_PREFIX, b"generation/", workspace.as_bytes()].concat()
+}
 fn provenance_context_principal_key(workspace: WorkspaceId, object_id: ObjectId) -> Vec<u8> {
     [
         KEY_PREFIX,
@@ -5642,6 +5908,58 @@ fn protection_key(workspace: WorkspaceId, protection: ProtectionId) -> Vec<u8> {
         b"protection/",
         workspace.as_bytes(),
         protection.as_bytes(),
+    ]
+    .concat()
+}
+fn protections_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    [KEY_PREFIX, b"protection/", workspace.as_bytes()].concat()
+}
+fn workspace_operations_prefix(workspace: WorkspaceId) -> Vec<u8> {
+    [KEY_PREFIX, b"operation/", workspace.as_bytes()].concat()
+}
+fn gc_report_roots_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/roots/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_roots_outcome_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/roots-outcome/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_summary_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/summary/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_persist_outcome_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/persist-outcome/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_page_key(workspace: WorkspaceId, report_id: OperationId, page_index: u32) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/page/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+        &page_index.to_be_bytes(),
     ]
     .concat()
 }

@@ -16,6 +16,7 @@ use crate::format::{
     MAX_PROVENANCE_CONTEXT_BYTES, ObjectRef, ProvenanceBinding, ProvenanceContext,
     ProvenanceCoverage, ProvenanceStatus, VolumeGeometry,
 };
+use crate::gc::{GcCandidatePage, GcReportBudget, GcReportSummary};
 use crate::graph::{ProvenanceInspectError, ProvenanceInspection};
 use crate::identity::{
     AttachmentId, BranchId, GenerationId, LogId, OperationId, PinId, PrincipalId, ProtectionId,
@@ -210,6 +211,7 @@ impl From<ControlError> for ServiceError {
             }
             ControlError::Metadata(MetadataError::Conflict) => ServiceErrorCode::Conflict,
             ControlError::Metadata(_) => ServiceErrorCode::BackendError,
+            ControlError::ReportExpired => ServiceErrorCode::ReportExpired,
         };
         Self::new(code, error.to_string())
     }
@@ -690,10 +692,20 @@ pub enum RpcRequest {
         /// Active Generation read protection handle.
         protection_id: ProtectionId,
     },
-    /// P10 mark-only collection placeholder (returns `UnsupportedOperation`).
-    CollectReport,
-    /// P10 report lookup placeholder (returns `UnsupportedOperation`).
-    GetGcReport,
+    /// Collect a bounded mark-only retention/GC report (P10).
+    CollectReport {
+        /// Stable operation identity for idempotent report collection.
+        operation_id: OperationId,
+        /// Optional budget/TTL overrides (`None` uses [`GcReportBudget::default`]).
+        budget: Option<GcReportBudget>,
+    },
+    /// Look up a persisted mark-only GC report summary and optional candidate page (P10).
+    GetGcReport {
+        /// Stable report operation identity.
+        report_id: OperationId,
+        /// Optional zero-based candidate page index to fetch alongside the summary.
+        page_index: Option<u32>,
+    },
 }
 
 /// One streamed chunk returned by [`RpcRequest::DiffGenerations`].
@@ -1411,8 +1423,59 @@ fn encode_request(e: &mut CanonicalEncoder, req: &RpcRequest) -> Result<(), Serv
             e.u16_le(44);
             e.fixed(protection_id.as_bytes());
         }
-        RpcRequest::CollectReport => e.u16_le(45),
-        RpcRequest::GetGcReport => e.u16_le(46),
+        RpcRequest::CollectReport {
+            operation_id,
+            budget,
+        } => {
+            e.u16_le(45);
+            e.fixed(operation_id.as_bytes());
+            match budget {
+                Some(b) => {
+                    e.u8(1);
+                    e.u64_le(u64::try_from(b.max_in_memory_visited).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_in_memory_visited exceeds u64",
+                        )
+                    })?);
+                    e.u32_le(b.max_candidate_pages);
+                    e.u64_le(u64::try_from(b.max_candidates_per_page).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_candidates_per_page exceeds u64",
+                        )
+                    })?);
+                    e.u64_le(u64::try_from(b.max_report_bytes).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_report_bytes exceeds u64",
+                        )
+                    })?);
+                    e.u64_le(b.detail_ttl_nanos);
+                    e.u64_le(u64::try_from(b.scan_page_size).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "scan_page_size exceeds u64",
+                        )
+                    })?);
+                }
+                None => e.u8(0),
+            }
+        }
+        RpcRequest::GetGcReport {
+            report_id,
+            page_index,
+        } => {
+            e.u16_le(46);
+            e.fixed(report_id.as_bytes());
+            match page_index {
+                Some(idx) => {
+                    e.u8(1);
+                    e.u32_le(*idx);
+                }
+                None => e.u8(0),
+            }
+        }
     }
     Ok(())
 }
@@ -1752,8 +1815,57 @@ fn decode_request(d: &mut CanonicalDecoder<'_>) -> Result<RpcRequest, ServiceErr
         44 => Ok(RpcRequest::ListArtifacts {
             protection_id: ProtectionId::from_bytes(d.fixed()?),
         }),
-        45 => Ok(RpcRequest::CollectReport),
-        46 => Ok(RpcRequest::GetGcReport),
+        45 => {
+            let operation_id = OperationId::from_bytes(d.fixed()?);
+            let budget = match d.u8()? {
+                0 => None,
+                1 => Some(GcReportBudget {
+                    max_in_memory_visited: usize::try_from(d.u64_le()?).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_in_memory_visited overflow",
+                        )
+                    })?,
+                    max_candidate_pages: d.u32_le()?,
+                    max_candidates_per_page: usize::try_from(d.u64_le()?).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_candidates_per_page overflow",
+                        )
+                    })?,
+                    max_report_bytes: usize::try_from(d.u64_le()?).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "max_report_bytes overflow",
+                        )
+                    })?,
+                    detail_ttl_nanos: d.u64_le()?,
+                    scan_page_size: usize::try_from(d.u64_le()?).map_err(|_| {
+                        ServiceError::new(
+                            ServiceErrorCode::InvalidRequest,
+                            "scan_page_size overflow",
+                        )
+                    })?,
+                }),
+                _ => return Err(FormatError::InvalidEnvelope("invalid budget tag").into()),
+            };
+            Ok(RpcRequest::CollectReport {
+                operation_id,
+                budget,
+            })
+        }
+        46 => {
+            let report_id = OperationId::from_bytes(d.fixed()?);
+            let page_index = match d.u8()? {
+                0 => None,
+                1 => Some(d.u32_le()?),
+                _ => return Err(FormatError::InvalidEnvelope("invalid page_index tag").into()),
+            };
+            Ok(RpcRequest::GetGcReport {
+                report_id,
+                page_index,
+            })
+        }
         _ => Err(FormatError::InvalidEnvelope("unknown RPC request opcode").into()),
     }
 }
@@ -2498,6 +2610,26 @@ pub fn decode_rpc_log_batch(bytes: &[u8]) -> Result<RpcLogBatch, ServiceError> {
     Ok((log_id, first_seq, end_seq, records, attachments))
 }
 
+/// Encodes a [`GcReportSummary`] RPC response payload.
+pub fn encode_rpc_gc_report_summary(summary: &GcReportSummary) -> Vec<u8> {
+    summary.encode()
+}
+
+/// Decodes a [`GcReportSummary`] RPC response payload.
+pub fn decode_rpc_gc_report_summary(bytes: &[u8]) -> Result<GcReportSummary, ServiceError> {
+    Ok(GcReportSummary::decode(bytes)?)
+}
+
+/// Encodes a [`GcCandidatePage`] RPC response payload.
+pub fn encode_rpc_gc_report_page(page: &GcCandidatePage) -> Result<Vec<u8>, ServiceError> {
+    Ok(page.encode()?)
+}
+
+/// Decodes a [`GcCandidatePage`] RPC response payload.
+pub fn decode_rpc_gc_report_page(bytes: &[u8]) -> Result<GcCandidatePage, ServiceError> {
+    Ok(GcCandidatePage::decode(bytes)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2797,8 +2929,21 @@ mod tests {
             RpcRequest::ListArtifacts {
                 protection_id: prot_id,
             },
-            RpcRequest::CollectReport,
-            RpcRequest::GetGcReport,
+            RpcRequest::CollectReport {
+                operation_id: op_id,
+                budget: Some(GcReportBudget {
+                    max_in_memory_visited: 128,
+                    max_candidate_pages: 4,
+                    max_candidates_per_page: 16,
+                    max_report_bytes: 4096,
+                    detail_ttl_nanos: 60_000_000_000,
+                    scan_page_size: 32,
+                }),
+            },
+            RpcRequest::GetGcReport {
+                report_id: op_id,
+                page_index: Some(0),
+            },
         ];
 
         for req in requests {
