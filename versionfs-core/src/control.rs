@@ -3526,8 +3526,8 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let page_limit = std::num::NonZeroUsize::new(scan_page_size.max(1)).ok_or(
             ControlError::InvalidRequest("scan_page_size must be nonzero"),
         )?;
-        let snapshot = self.authority.snapshot()?;
         let boundary_time = self.authority.now();
+        let snapshot = self.authority.snapshot()?;
         let scan_result =
             self.scan_sealed_roots_from_snapshot(&snapshot, boundary_time, page_limit);
         // Release the read-only snapshot explicitly before any persistence or object I/O.

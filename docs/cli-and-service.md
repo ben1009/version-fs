@@ -84,5 +84,6 @@ guarantee consistency of:
   and persists bounded `GcCandidatePage`s without issuing any object deletions.
 - Missing/corrupt objects, missing metadata, uncertain `Preparing` operations,
   and candidate budget exhaustion are recorded explicitly in
-  `GcReportSummary::completeness`; expired detail pages return `ReportExpired`
-  while preserving the terminal summary.
+  `GcReportSummary::completeness`; backend inventory listing errors abort the
+  collection call, and expired detail pages return `ReportExpired` while
+  preserving the terminal summary.

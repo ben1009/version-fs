@@ -45,7 +45,7 @@ impl TempDir {
             "versionfs-retention-reports-{}-{id}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 }

@@ -420,7 +420,7 @@ pub struct DiskSpillVisitedSet {
     in_memory: HashSet<ObjectId>,
     max_in_memory: usize,
     spill_dir: PathBuf,
-    spill_runs: Vec<(PathBuf, usize)>,
+    spill_runs: Vec<(PathBuf, File, usize, ObjectId, ObjectId)>,
     total_marked: u64,
 }
 
@@ -455,8 +455,11 @@ impl DiskSpillVisitedSet {
             return Ok(true);
         }
         let target = id.as_bytes();
-        for (path, count) in &self.spill_runs {
-            let mut file = File::open(path)?;
+        for (_, file, count, min_id, max_id) in &self.spill_runs {
+            if target < min_id.as_bytes() || target > max_id.as_bytes() {
+                continue;
+            }
+            let mut file = file;
             let mut low = 0_usize;
             let mut high = *count;
             let mut buf = [0_u8; 32];
@@ -494,28 +497,32 @@ impl DiskSpillVisitedSet {
         if self.in_memory.is_empty() {
             return Ok(());
         }
-        let mut ids: Vec<ObjectId> = self.in_memory.drain().collect();
+        let mut ids: Vec<ObjectId> = self.in_memory.iter().copied().collect();
         ids.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let min_id = ids[0];
+        let max_id = ids[ids.len() - 1];
         let run_path = self
             .spill_dir
             .join(format!("visited-run-{}.bin", self.spill_runs.len()));
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
+            .read(true)
             .write(true)
             .open(&run_path)?;
         for id in &ids {
             file.write_all(id.as_bytes())?;
         }
         file.flush()?;
-        self.spill_runs.push((run_path, ids.len()));
+        self.spill_runs
+            .push((run_path, file, ids.len(), min_id, max_id));
+        self.in_memory.clear();
         Ok(())
     }
 }
 
 impl Drop for DiskSpillVisitedSet {
     fn drop(&mut self) {
-        for (path, _) in &self.spill_runs {
+        for (path, _, _, _, _) in &self.spill_runs {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -586,8 +593,7 @@ impl DiskSpillWorkQueue {
             .spill_dir
             .join(format!("work-chunk-{}.bin", self.spill_chunks.len()));
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .open(&path)?;
         let mut buf = [0_u8; WORK_QUEUE_RECORD_BYTES];

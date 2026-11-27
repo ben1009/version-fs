@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use versionfs_core::control::{ControlError, GcReportState, WorkspaceControl};
 use versionfs_core::format::ObjectRef;
 use versionfs_core::gc::{
@@ -117,6 +117,14 @@ where
     O: ObjectStore + Send + Sync + 'static,
 {
     let budget = raw_budget.clamped_to_server_limits();
+    if matches!(
+        Handle::try_current(),
+        Ok(current) if current.runtime_flavor() == RuntimeFlavor::CurrentThread
+    ) {
+        return Err(GcReportError::Io(std::io::Error::other(
+            "mark-only report requires a multi-thread Tokio runtime when invoked on a runtime thread",
+        )));
+    }
 
     // Step 1: Admit or resume durable report lifecycle, enforcing caller/budget
     // consistency and aborting permanently if a prior snapshot was lost.
@@ -135,7 +143,7 @@ where
         "versionfs-gc-spill-{report_id}-{}-{spill_seq}",
         std::process::id()
     ));
-    std::fs::create_dir_all(&spill_dir)?;
+    std::fs::create_dir(&spill_dir)?;
     let _spill_guard = SpillDirGuard(spill_dir.clone());
     let mut visited = DiskSpillVisitedSet::new(&spill_dir, budget.max_in_memory_visited)?;
     let mut work_queue = DiskSpillWorkQueue::new(&spill_dir, budget.max_in_memory_visited)?;
@@ -313,7 +321,9 @@ fn flush_candidate_page(
         entries,
     };
     let encoded_len = page.encode().map(|b| b.len()).unwrap_or(usize::MAX);
-    if total_persisted_bytes.saturating_add(encoded_len) > budget.max_report_bytes {
+    if encoded_len > versionfs_core::rpc::MAX_RPC_FRAME_BYTES
+        || total_persisted_bytes.saturating_add(encoded_len) > budget.max_report_bytes
+    {
         *budget_exhausted = true;
         return;
     }
