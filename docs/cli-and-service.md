@@ -66,3 +66,24 @@ guarantee consistency of:
 - Database WAL/transaction state that has not been flushed to the filesystem/block
   device before freeze/barrier;
 - Process memory, open file descriptors, or live OS processes.
+
+## Mark-only retention reports (P10)
+
+`versionfs report collect` and `versionfs report get` (backed by
+`ServiceClient::collect_report` / `ServiceClient::get_gc_report` and
+`WorkspaceService`) run bounded, mark-only retention reporting:
+
+- Roots from retained Generations, live branches, active protections, and active
+  preparations are sealed from one read-only `MetadataAuthority` snapshot, and
+  the snapshot is released before any object-store I/O.
+- Graph traversal follows typed strong edges (including recorded
+  `ProvenanceContext` required evidence roots `required_logs_root` and
+  `required_artifacts_root`) using a disk-spill visited set
+  (`DiskSpillVisitedSet`), while excluding `optional_links` and descriptive IDs.
+- Object-store inventory runs over a recorded Unix-ms window (`inventory_page`)
+  and persists bounded `GcCandidatePage`s without issuing any object deletions.
+- Missing/corrupt objects, missing metadata, uncertain `Preparing` operations,
+  and candidate budget exhaustion are recorded explicitly in
+  `GcReportSummary::completeness`; backend inventory listing errors abort the
+  collection call, and expired detail pages return `ReportExpired` while
+  preserving the terminal summary.

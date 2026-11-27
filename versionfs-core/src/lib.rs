@@ -3,6 +3,7 @@
 pub mod control;
 pub mod fault;
 pub mod format;
+pub mod gc;
 pub mod graph;
 pub mod identity;
 pub mod metadata;

@@ -31,9 +31,10 @@ use versionfs_core::rpc::{
     DiffStreamChunk, MAX_DIFF_CHUNK_ITEMS, MAX_LOG_READ_BATCHES, MAX_STREAM_READ_BYTES, RpcAuth,
     RpcEnvelope, RpcRequest, RpcResponseFrame, ServiceError, ServiceErrorCode,
     encode_rpc_artifact_list, encode_rpc_attachment, encode_rpc_branch, encode_rpc_capture,
-    encode_rpc_diff_chunk, encode_rpc_generation_seed, encode_rpc_grant, encode_rpc_log_batch,
-    encode_rpc_log_list, encode_rpc_operation_state, encode_rpc_provenance_inspection,
-    encode_rpc_published_generation, encode_rpc_root_transition, read_frame, write_frame,
+    encode_rpc_diff_chunk, encode_rpc_gc_report_page, encode_rpc_gc_report_summary,
+    encode_rpc_generation_seed, encode_rpc_grant, encode_rpc_log_batch, encode_rpc_log_list,
+    encode_rpc_operation_state, encode_rpc_provenance_inspection, encode_rpc_published_generation,
+    encode_rpc_root_transition, read_frame, write_frame,
 };
 use versionfs_core::time::MonotonicTime;
 use versionfs_core::views::{
@@ -1034,11 +1035,37 @@ where
                 finish_protected_read(&control, protection_id, read_deadline)?;
                 sink(RpcResponseFrame::Data(encode_rpc_artifact_list(&entries)?))?;
             }
-            RpcRequest::CollectReport | RpcRequest::GetGcReport => {
-                return Err(ServiceError::new(
-                    ServiceErrorCode::UnsupportedOperation,
-                    "P10 retention and mark-only GC reports are not implemented yet",
-                ));
+            RpcRequest::CollectReport {
+                operation_id,
+                budget,
+            } => {
+                let summary = crate::gc_report::run_mark_only_report(
+                    &control,
+                    &self.authority,
+                    &self.object_store,
+                    &self.runtime,
+                    auth.workspace_id,
+                    operation_id,
+                    budget.unwrap_or_default(),
+                )
+                .map_err(map_gc_report_err)?;
+                sink(RpcResponseFrame::Data(encode_rpc_gc_report_summary(
+                    &summary,
+                )))?;
+            }
+            RpcRequest::GetGcReport {
+                report_id,
+                page_index,
+            } => {
+                let (summary, page) = control
+                    .get_gc_report(report_id, page_index, crate::gc_report::unix_ms_now())
+                    .map_err(ServiceError::from)?;
+                sink(RpcResponseFrame::Data(encode_rpc_gc_report_summary(
+                    &summary,
+                )))?;
+                if let Some(page) = page {
+                    sink(RpcResponseFrame::Data(encode_rpc_gc_report_page(&page)?))?;
+                }
             }
         }
         Ok(())
@@ -1741,6 +1768,27 @@ fn map_view_err(err: ViewError) -> ServiceError {
         }
         ViewError::Format(f) => f.into(),
         ViewError::Map(m) => ServiceError::new(ServiceErrorCode::IntegrityError, m.to_string()),
+    }
+}
+
+fn map_gc_report_err(err: crate::gc_report::GcReportError) -> ServiceError {
+    match err {
+        crate::gc_report::GcReportError::Control(e) => e.into(),
+        crate::gc_report::GcReportError::ObjectStore(ObjectStoreError::LimitExceeded(msg)) => {
+            ServiceError::new(ServiceErrorCode::LimitExceeded, msg)
+        }
+        crate::gc_report::GcReportError::ObjectStore(ObjectStoreError::InvalidCursor) => {
+            ServiceError::new(ServiceErrorCode::InvalidRequest, "invalid inventory cursor")
+        }
+        crate::gc_report::GcReportError::ObjectStore(e) => {
+            ServiceError::new(ServiceErrorCode::BackendError, e.to_string())
+        }
+        crate::gc_report::GcReportError::Gc(e) => {
+            ServiceError::new(ServiceErrorCode::BackendError, e.to_string())
+        }
+        crate::gc_report::GcReportError::Io(e) => {
+            ServiceError::new(ServiceErrorCode::BackendError, e.to_string())
+        }
     }
 }
 

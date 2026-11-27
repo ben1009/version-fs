@@ -19,6 +19,7 @@ use versionfs_core::format::{
     ArtifactDescriptor, CaptureMode, LogMapEntry, ObjectRef, ProvenanceBinding, ProvenanceStatus,
     VolumeGeometry,
 };
+use versionfs_core::gc::{GcCandidatePage, GcReportBudget, GcReportSummary};
 use versionfs_core::graph::ProvenanceInspection;
 use versionfs_core::identity::{
     AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
@@ -28,7 +29,8 @@ use versionfs_core::persistent_map::{DurableObjectStore, MapObjectStore};
 use versionfs_core::rpc::{
     DiffStreamChunk, RpcAuth, RpcEnvelope, RpcRequest, RpcResponseFrame, ServiceError,
     ServiceErrorCode, decode_rpc_artifact_list, decode_rpc_attachment, decode_rpc_branch,
-    decode_rpc_capture, decode_rpc_diff_chunk, decode_rpc_generation_seed, decode_rpc_grant,
+    decode_rpc_capture, decode_rpc_diff_chunk, decode_rpc_gc_report_page,
+    decode_rpc_gc_report_summary, decode_rpc_generation_seed, decode_rpc_grant,
     decode_rpc_log_batch, decode_rpc_log_list, decode_rpc_operation_state,
     decode_rpc_provenance_inspection, decode_rpc_published_generation, decode_rpc_root_transition,
     read_frame, write_frame,
@@ -777,16 +779,40 @@ impl ServiceClient {
         decode_rpc_artifact_list(single_frame(&frames)?)
     }
 
-    /// P10 mark-only report collection placeholder (returns `UnsupportedOperation`).
-    pub fn collect_report(&self) -> Result<(), ServiceError> {
-        let _ = self.call_stream(RpcRequest::CollectReport)?;
-        Ok(())
+    /// Collects a bounded mark-only retention/GC report (P10).
+    pub fn collect_report(
+        &self,
+        operation_id: OperationId,
+        budget: Option<GcReportBudget>,
+    ) -> Result<GcReportSummary, ServiceError> {
+        let frames = self.call_stream(RpcRequest::CollectReport {
+            operation_id,
+            budget,
+        })?;
+        decode_rpc_gc_report_summary(single_frame(&frames)?)
     }
 
-    /// P10 GC report lookup placeholder (returns `UnsupportedOperation`).
-    pub fn get_gc_report(&self) -> Result<(), ServiceError> {
-        let _ = self.call_stream(RpcRequest::GetGcReport)?;
-        Ok(())
+    /// Looks up a persisted mark-only GC report summary and optional candidate page (P10).
+    pub fn get_gc_report(
+        &self,
+        report_id: OperationId,
+        page_index: Option<u32>,
+    ) -> Result<(GcReportSummary, Option<GcCandidatePage>), ServiceError> {
+        let frames = self.call_stream(RpcRequest::GetGcReport {
+            report_id,
+            page_index,
+        })?;
+        match frames.as_slice() {
+            [summary_frame] => Ok((decode_rpc_gc_report_summary(summary_frame)?, None)),
+            [summary_frame, page_frame] => Ok((
+                decode_rpc_gc_report_summary(summary_frame)?,
+                Some(decode_rpc_gc_report_page(page_frame)?),
+            )),
+            _ => Err(ServiceError::new(
+                ServiceErrorCode::BackendError,
+                "unexpected frame count in GetGcReport response",
+            )),
+        }
     }
 }
 

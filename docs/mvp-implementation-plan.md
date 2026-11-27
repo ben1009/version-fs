@@ -415,21 +415,28 @@ and real S3 qualification remain pending in P12 / ignored tests.
 
 ### P10. Retention and mark-only reports
 
-- [ ] Resolve expired preparations/attachments and capture tokens atomically against
+- [x] Resolve expired preparations/attachments and capture tokens atomically against
   final commits. Bytes physically present do not revive expired Generation eligibility.
-- [ ] Copy/seal retained and live volume/log/artifact roots from one read-only
+- [x] Copy/seal retained and live volume/log/artifact roots from one read-only
   authority snapshot; release the snapshot before object I/O.
-- [ ] Include recorded context and required evidence outside ordinary view roots
+- [x] Include recorded context and required evidence outside ordinary view roots
   in retained/protected closure; exclude optional links and descriptive IDs.
-- [ ] Traverse typed strong edges and uncertain preparations using bounded RAM/disk
+- [x] Traverse typed strong edges and uncertain preparations using bounded RAM/disk
   spill; inventory S3 over a recorded window and persist bounded candidate pages.
-- [ ] Make corruption, missing graph metadata, snapshot loss, budget exhaustion,
+- [x] Make corruption, missing graph metadata, snapshot loss, budget exhaustion,
   and detail expiry explicit. Candidates never authorize deletion; report work
   never holds publication admission or the authority gate through object I/O.
 
-**Exit evidence:** races with publication/pins/readers and interrupted reports
-produce honest boundaries/completeness without an outage or S3 DELETE. Include
-live roots newer than Generation heads and historical attachment/log dependencies.
+**Exit evidence:** `versionfs-core` (`gc.rs`, `control.rs`, `rpc.rs`),
+`versionfs-service` (`gc_report.rs`, `DirectoryObjectStore::inventory_page`,
+`service.rs`), `versionfs-sdk`, and `versionfs-cli` implement bounded mark-only
+reports, disk-spill visited sets, and `ReportExpired` summary preservation.
+`versionfs-service/tests/retention_reports.rs`, `service_lifecycle.rs`, and
+`cli_lifecycle.rs` verify unretained Generation non-revival, provenance required
+evidence vs `optional_links` exclusion, disk spill (`max_in_memory_visited = 2`),
+uncertain `Preparing` operations, budget exhaustion, and `ReportExpired` against
+`ToyKvMetadataAuthority` and `DirectoryObjectStore` with zero object deletions.
+Real S3 inventory/report qualification remains pending in P12 / ignored tests.
 
 ### P11. Integrated recovery and fault campaigns
 
