@@ -1355,3 +1355,124 @@ fn work_queue_spill_pop_spill_tracks_disk_budget_accurately() {
     queue.push(mk_ref(14)).unwrap();
     assert!(queue.push(mk_ref(15)).is_err());
 }
+
+#[test]
+fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
+    use versionfs_core::metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
+    };
+
+    struct PauseAfterAdmitAuthority {
+        inner: Arc<ToyKvMetadataAuthority>,
+        paused_once: AtomicBool,
+        admitted_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl MetadataAuthority for PauseAfterAdmitAuthority {
+        type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+        fn now(&self) -> MonotonicTime {
+            self.inner.now()
+        }
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+            self.inner.get(key)
+        }
+
+        fn transact<R, F>(&self, op: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
+        where
+            F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+        {
+            let res = self.inner.transact(op, body);
+            if res.is_ok()
+                && op.outcome_key.ends_with(b"admit")
+                && !self.paused_once.swap(true, Ordering::AcqRel)
+            {
+                if let Some(tx) = self.admitted_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                if let Some(rx) = self.resume_rx.lock().unwrap().take() {
+                    let _ = rx.recv();
+                }
+            }
+            res
+        }
+
+        fn reconcile_unknown(
+            &self,
+            op: MutationIdentity<'_>,
+        ) -> Result<ReconciledOutcome, MetadataError> {
+            self.inner.reconcile_unknown(op)
+        }
+
+        fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+            self.inner.snapshot()
+        }
+
+        fn scan_prefix(
+            &self,
+            snapshot: &Self::Snapshot,
+            prefix: &[u8],
+            cursor: Option<&MetadataCursor>,
+            limit: std::num::NonZeroUsize,
+        ) -> Result<MetadataPage, MetadataError> {
+            self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+        }
+    }
+
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(140));
+    let principal = PrincipalId::from_bytes(id16(141));
+    let (_client, _main_branch, _boundary_id, _branch, _grant, _att) =
+        setup_workspace(&harness, ws, principal);
+
+    let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let wrapper = Arc::new(PauseAfterAdmitAuthority {
+        inner: Arc::clone(&harness.authority),
+        paused_once: AtomicBool::new(false),
+        admitted_tx: std::sync::Mutex::new(Some(admitted_tx)),
+        resume_rx: std::sync::Mutex::new(Some(resume_rx)),
+    });
+
+    let report_id = OperationId::from_bytes(id16(142));
+    let budget = GcReportBudget::default();
+
+    let w_a = Arc::clone(&wrapper);
+    let os_a = Arc::clone(&harness.object_store);
+    let rt_a = harness.rt.handle().clone();
+    let inc_a = harness.incarnation;
+    let thread_a = std::thread::spawn(move || {
+        let ctrl_a = WorkspaceControl::new(w_a.clone(), ws, os_a.scope_id(ws), principal, inc_a);
+        versionfs_service::gc_report::run_mark_only_report(
+            &ctrl_a, &w_a, &os_a, &rt_a, ws, report_id, budget,
+        )
+    });
+
+    // Wait until A has committed `Sealing` and is paused BEFORE `begin_gc_report_attempt` returns.
+    admitted_rx.recv().unwrap();
+
+    // Start B concurrently: B sees `Sealing` owned by A, sees A is registered in
+    // `active_sealers()`, and waits rather than aborting A.
+    let w_b = Arc::clone(&wrapper);
+    let os_b = Arc::clone(&harness.object_store);
+    let rt_b = harness.rt.handle().clone();
+    let inc_b = harness.incarnation;
+    let thread_b = std::thread::spawn(move || {
+        let ctrl_b = WorkspaceControl::new(w_b.clone(), ws, os_b.scope_id(ws), principal, inc_b);
+        versionfs_service::gc_report::run_mark_only_report(
+            &ctrl_b, &w_b, &os_b, &rt_b, ws, report_id, budget,
+        )
+    });
+
+    // Give B a moment to observe A's `Sealing` state, then unblock A.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    resume_tx.send(()).unwrap();
+
+    let res_a = thread_a.join().unwrap().unwrap();
+    let res_b = thread_b.join().unwrap().unwrap();
+    assert_eq!(res_a, res_b);
+    assert_eq!(res_a.completeness, GcReportCompleteness::Complete);
+}

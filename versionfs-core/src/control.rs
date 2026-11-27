@@ -3441,6 +3441,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     let _ = self.abort_gc_report_attempt(
                         report_id,
                         fp,
+                        None,
                         "snapshot lost after process restart before sealing",
                     );
                     return Err(ControlError::Aborted);
@@ -3491,6 +3492,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let _ = self.abort_gc_report_attempt(
                 report_id,
                 fp,
+                None,
                 "snapshot lost after process restart before sealing",
             );
             return Err(ControlError::Aborted);
@@ -3531,20 +3533,24 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 GcReportState::Aborted { .. } => return Err(ControlError::Aborted),
             }
         }
-        self.abort_gc_report_attempt(
+        match self.abort_gc_report_attempt(
             report_id,
             fp,
+            Some(expected_attempt_id),
             "sealing executor exited before completing seal",
-        )?;
-        Err(ControlError::Aborted)
+        )? {
+            GcReportState::Aborted { .. } => Err(ControlError::Aborted),
+            other => Ok(other),
+        }
     }
 
     fn abort_gc_report_attempt(
         &self,
         report_id: OperationId,
         fingerprint: [u8; 32],
+        expected_attempt_id: Option<OperationId>,
         reason: &str,
-    ) -> Result<(), ControlError> {
+    ) -> Result<GcReportState, ControlError> {
         let state_key = gc_report_state_key(self.workspace_id, report_id);
         let outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"abort");
         let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
@@ -3553,22 +3559,48 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             reason: reason.to_owned(),
         }
         .encode()?;
-        match self.transact_with_outcome(&outcome_key, |txn| {
-            if let Some(existing) = txn.get(&state_key)? {
-                let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
-                if !matches!(
-                    decoded,
-                    GcReportState::Admitted { .. } | GcReportState::Sealing { .. }
-                ) {
-                    return Ok(existing);
+
+        let mut last_err = None;
+        for _ in 0..4 {
+            match self.transact_with_outcome(&outcome_key, |txn| {
+                if let Some(existing) = txn.get(&state_key)? {
+                    let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
+                    match &decoded {
+                        GcReportState::Sealed { .. }
+                        | GcReportState::Completed { .. }
+                        | GcReportState::Aborted { .. } => return Ok(existing),
+                        GcReportState::Sealing {
+                            root_attempt_id, ..
+                        } if expected_attempt_id
+                            .is_some_and(|expected| expected != *root_attempt_id) =>
+                        {
+                            return Ok(existing);
+                        }
+                        GcReportState::Admitted { .. } | GcReportState::Sealing { .. } => {}
+                    }
                 }
+                txn.put(&state_key, &aborted)?;
+                Ok(aborted.clone())
+            }) {
+                Ok(bytes) => {
+                    return GcReportState::decode(&bytes)
+                        .map_err(|e| ControlError::CorruptRecord(e.to_string()));
+                }
+                Err(
+                    err @ (ControlError::Conflict
+                    | ControlError::Metadata(MetadataError::UnknownOutcome { .. })
+                    | ControlError::Metadata(MetadataError::ReconciliationRequired { .. })),
+                ) => {
+                    if let Some(bytes) = reconcile_outcome(self.authority.as_ref(), &outcome_key)? {
+                        return GcReportState::decode(&bytes)
+                            .map_err(|e| ControlError::CorruptRecord(e.to_string()));
+                    }
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
             }
-            txn.put(&state_key, &aborted)?;
-            Ok(aborted.clone())
-        }) {
-            Ok(_) | Err(ControlError::Conflict) => Ok(()),
-            Err(err) => Err(err),
         }
+        Err(last_err.unwrap_or(ControlError::Conflict))
     }
 
     /// Copies and seals retained/live volume, log, artifact, and provenance roots
@@ -3621,6 +3653,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         let _ = self.abort_gc_report_attempt(
                             report_id,
                             fp,
+                            None,
                             "snapshot lost after process restart before sealing",
                         );
                         return Err(ControlError::Aborted);
@@ -3649,7 +3682,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             Ok(snap) => snap,
             Err(err) => {
                 let err = map_metadata_error(err);
-                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                let _ = self.abort_gc_report_attempt(
+                    report_id,
+                    fp,
+                    Some(root_attempt_id),
+                    &err.to_string(),
+                );
                 return Err(err);
             }
         };
@@ -3661,7 +3699,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let (mut roots, uncertain_preparations, missing_metadata) = match scan_result {
             Ok(res) => res,
             Err(err) => {
-                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                let _ = self.abort_gc_report_attempt(
+                    report_id,
+                    fp,
+                    Some(root_attempt_id),
+                    &err.to_string(),
+                );
                 return Err(err);
             }
         };
@@ -3704,7 +3747,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 u32::try_from(batch_idx).unwrap_or(u32::MAX),
             );
             if let Err(err) = self.persist_encoded_batch(&batch_outcome_key, &encoded_batch) {
-                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                let _ = self.abort_gc_report_attempt(
+                    report_id,
+                    fp,
+                    Some(root_attempt_id),
+                    &err.to_string(),
+                );
                 return Err(err);
             }
         }

@@ -166,10 +166,10 @@ where
         )));
     }
 
-    // Step 1: Admit or resume durable report lifecycle, enforcing caller/budget
-    // consistency, exclusive Sealing ownership, and permanent abort on snapshot loss
-    // or failed sealing executors.
+    // Step 1: Register this executor before durable admission so any visible
+    // `Sealing` state already has a live executor entry in `active_sealers()`.
     let my_root_attempt_id = next_attempt_id(control.owner_incarnation());
+    let sealer_guard = ActiveSealerGuard::enter(workspace_id, report_id, my_root_attempt_id);
     let mut sealed_pair = None;
     for _ in 0..1000 {
         match control.begin_gc_report_attempt(report_id, my_root_attempt_id, budget)? {
@@ -187,8 +187,6 @@ where
                 ..
             } => {
                 if active_attempt == my_root_attempt_id {
-                    let _sealer_guard =
-                        ActiveSealerGuard::enter(workspace_id, report_id, my_root_attempt_id);
                     sealed_pair = Some(control.seal_gc_report_roots(
                         report_id,
                         my_root_attempt_id,
@@ -221,6 +219,7 @@ where
             GcReportState::Aborted { .. } => return Err(ControlError::Aborted.into()),
         }
     }
+    drop(sealer_guard);
     let (root_attempt_id, header) = sealed_pair.ok_or(ControlError::InProgress)?;
 
     // Step 2: Traverse typed strong edges using bounded RAM + shared disk spill
