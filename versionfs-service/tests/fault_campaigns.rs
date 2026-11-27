@@ -19,7 +19,7 @@ use versionfs_core::{
     fault::{FailureInjector, FailurePoint, OneShotFailures},
     format::{
         CaptureMode, EXTENT_BYTES, ObjectRef, ObjectType, ProvenanceBinding, ProvenanceContext,
-        VolumeGeometry, decode_generation_descriptor,
+        VolumeGeometry, VolumeRoot, decode_generation_descriptor,
     },
     graph::verify_generation,
     identity::{
@@ -28,12 +28,13 @@ use versionfs_core::{
     },
     persistent_map::{DurableObjectStore, MapObjectStore},
     time::{Clock, MonotonicTime},
+    views::VolumeExtentMap,
 };
 use versionfs_sdk::{
     barrier::{DurableVolume, FileBarrierJournal, initialize_empty_workspace},
     capture::{
-        BlockCutOnlyBoundary, CaptureConfig, CheckpointCoordinator, CheckpointRequest,
-        FileCaptureJournal, FilesystemBoundary, NoopProducerGate,
+        BlockCutOnlyBoundary, CaptureConfig, CaptureJournal, CheckpointCoordinator,
+        CheckpointRequest, FileCaptureJournal, FilesystemBoundary, NoopProducerGate,
     },
     volume::{BlockDevice, BlockError, BlockRequest, BlockResponse},
 };
@@ -90,15 +91,21 @@ fn id16(tag: u8) -> [u8; 16] {
     bytes
 }
 
+fn dir_object_path(obj_dir: &Path, ws: WorkspaceId, reference: ObjectRef) -> PathBuf {
+    obj_dir
+        .join(ws.to_string())
+        .join(format!("{:04x}", reference.object_type as u16))
+        .join(format!("{}.obj", reference.object_id))
+}
+
 #[derive(Clone)]
 struct FaultyDirStore {
     rt: Arc<tokio::runtime::Runtime>,
     inner: Arc<DirectoryObjectStore>,
     ws: WorkspaceId,
     scope: ObjectStoreScopeId,
-    refs: Arc<Mutex<std::collections::HashMap<ObjectId, ObjectRef>>>,
     failures: Arc<OneShotFailures>,
-    arm_on_descriptor_put: Arc<Mutex<Option<FailurePoint>>>,
+    arm_on_type_put: Arc<Mutex<Option<(ObjectType, FailurePoint)>>>,
 }
 
 impl FaultyDirStore {
@@ -116,9 +123,8 @@ impl FaultyDirStore {
             inner,
             ws,
             scope,
-            refs: Arc::new(Mutex::new(std::collections::HashMap::new())),
             failures,
-            arm_on_descriptor_put: Arc::new(Mutex::new(None)),
+            arm_on_type_put: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -128,11 +134,11 @@ impl MapObjectStore for FaultyDirStore {
         self.scope
     }
 
-    fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
-        let reference = self.refs.lock().unwrap().get(&id).copied();
-        let Some(reference) = reference else {
-            return Ok(None);
-        };
+    fn get(&self, _id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
+
+    fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
         match self.rt.block_on(self.inner.get(self.ws, reference)) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(ObjectStoreError::NotFound { .. }) => Ok(None),
@@ -148,9 +154,7 @@ impl MapObjectStore for FaultyDirStore {
         self.rt
             .block_on(self.inner.put(self.ws, &bytes))
             .map(|_| ())
-            .map_err(|e| e.to_string())?;
-        self.refs.lock().unwrap().insert(id, reference);
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -163,13 +167,18 @@ impl DurableObjectStore for FaultyDirStore {
             .block_on(self.inner.put(self.ws, encoded))
             .map(|_| ())
             .map_err(|e| e.to_string())?;
-        self.refs
-            .lock()
-            .unwrap()
-            .insert(reference.object_id, reference);
-        if reference.object_type == ObjectType::GenerationDescriptor
-            && let Some(point) = self.arm_on_descriptor_put.lock().unwrap().take()
-        {
+        let armed = {
+            let mut guard = self.arm_on_type_put.lock().unwrap();
+            if guard
+                .as_ref()
+                .is_some_and(|(ty, _)| *ty == reference.object_type)
+            {
+                guard.take().map(|(_, point)| point)
+            } else {
+                None
+            }
+        };
+        if let Some(point) = armed {
             self.failures.arm(point);
         }
         self.failures
@@ -185,7 +194,7 @@ struct CampaignEnv {
     obj_dir: PathBuf,
     clock: Arc<TestClock>,
     failures: Arc<OneShotFailures>,
-    authority: Arc<ToyKvMetadataAuthority>,
+    authority: Option<Arc<ToyKvMetadataAuthority>>,
     owner: OwnerIncarnation,
     ws: WorkspaceId,
     principal: PrincipalId,
@@ -248,7 +257,7 @@ impl CampaignEnv {
             obj_dir,
             clock,
             failures,
-            authority,
+            authority: Some(authority),
             owner,
             ws,
             principal,
@@ -259,9 +268,13 @@ impl CampaignEnv {
         }
     }
 
+    fn authority(&self) -> Arc<ToyKvMetadataAuthority> {
+        Arc::clone(self.authority.as_ref().expect("authority is open"))
+    }
+
     fn control(&self) -> WorkspaceControl<ToyKvMetadataAuthority> {
         WorkspaceControl::new(
-            Arc::clone(&self.authority),
+            self.authority(),
             self.ws,
             self.store.proof_scope(),
             self.principal,
@@ -305,7 +318,16 @@ impl CampaignEnv {
         )
     }
 
+    /// Shuts down the existing `ToyKvMetadataAuthority` instance completely (verifying
+    /// `strong_count == 1` so no worker/controller holds a stale handle) before reopening from WAL.
     fn restart_authority(&mut self, op_tag: u8) {
+        let old = self.authority.take().expect("authority already closed");
+        assert_eq!(
+            Arc::strong_count(&old),
+            1,
+            "all old worker/control handles must be dropped before authority restart"
+        );
+        drop(old);
         let new_auth = Arc::new(
             ToyKvMetadataAuthority::open_with(
                 &self.meta_dir,
@@ -317,7 +339,7 @@ impl CampaignEnv {
         self.owner =
             start_authority_owner(new_auth.as_ref(), OperationId::from_bytes(id16(op_tag)))
                 .unwrap();
-        self.authority = new_auth;
+        self.authority = Some(new_auth);
     }
 
     fn reattach_fresh_worker(
@@ -347,15 +369,8 @@ impl CampaignEnv {
             ProtectionId::from_bytes(id16(op_base + 3)),
         )
         .unwrap();
-        let fresh_store = FaultyDirStore {
-            rt: Arc::clone(&self.store.rt),
-            inner: Arc::new(DirectoryObjectStore::open(&self.obj_dir).unwrap()),
-            ws: self.ws,
-            scope: self.store.scope,
-            refs: Arc::clone(&self.store.refs),
-            failures: Arc::clone(&self.failures),
-            arm_on_descriptor_put: Arc::clone(&self.store.arm_on_descriptor_put),
-        };
+        // Brand-new store adapter with zero shared in-memory state from the old worker.
+        let fresh_store = FaultyDirStore::new(&self.obj_dir, self.ws, Arc::clone(&self.failures));
         let fresh_journal = FileBarrierJournal::open_with(
             self.dir.0.join(format!("barrier-{worker_name}")),
             Arc::clone(&self.failures) as Arc<dyn FailureInjector>,
@@ -450,9 +465,9 @@ impl FilesystemBoundary for ScriptedBoundary {
 
 // Campaign 1 (RFC-002 16.2):
 // Ordinary writes + FLUSH + FUA-tagged write + post-FUA volatile write -> worker loss ->
-// fresh worker with empty cache recovers both flushed and FUA-tagged payloads while losing only
-// volatile post-FUA writes. Also tests lost FLUSH/FUA commit reply + child barrier survival
-// when parent checkpoint aborts.
+// fresh worker with empty cache and no shared in-memory state recovers both flushed and FUA-tagged
+// payloads while losing only volatile post-FUA writes. Also tests lost FUA commit reply + child
+// barrier survival when parent checkpoint aborts.
 #[test]
 fn campaign_worker_loss_recovers_flush_and_fua_and_child_barrier_survives_parent_abort() {
     let mut env = CampaignEnv::new(20);
@@ -468,7 +483,6 @@ fn campaign_worker_loss_recovers_flush_and_fua_and_child_barrier_survives_parent
     vol.dispatch(BlockRequest::Flush).unwrap();
 
     // 2. Write distinct earlier volatile data (extent 1) AND a FUA-tagged payload (extent 2).
-    // Combined preflush/data/FUA semantics must persist both earlier writes and the tagged payload.
     vol.dispatch(BlockRequest::Write {
         offset: u64::from(EXTENT_BYTES),
         data: &[0x22; 4096],
@@ -533,7 +547,7 @@ fn campaign_worker_loss_recovers_flush_and_fua_and_child_barrier_survives_parent
         BlockResponse::Read(vec![0x00; 4096])
     );
 
-    // 4. Fail a FUA reply at AuthorityCommitOutcomeUnknownWithoutCommit, reconcile, and verify
+    // 4. Fail a FUA reply at AuthorityCommitOutcomeUnknownWithoutCommit, retry/flush, and verify
     // a committed child barrier remains valid even if a subsequent parent checkpoint aborts.
     env.failures
         .arm(FailurePoint::AuthorityCommitOutcomeUnknownWithoutCommit);
@@ -592,11 +606,12 @@ fn campaign_worker_loss_recovers_flush_and_fua_and_child_barrier_survives_parent
 }
 
 // Campaign 2 (RFC-002 16.2):
-// Pause/fail an extent upload after partial upload, overwrite the same buffer, and verify the
-// sealed cut remains uncontaminated by later writes.
+// Pause/fail an extent upload *after* committing the extent object
+// (`ObjectUploadAfterCommitBeforeReply`), attempt to overwrite the same offset, and verify the
+// sealed cut remains uncontaminated on fresh recovery.
 #[test]
 fn campaign_paused_upload_overwrite_does_not_contaminate_sealed_cut() {
-    let env = CampaignEnv::new(40);
+    let mut env = CampaignEnv::new(40);
     let mut vol = env.open_volume("worker-a", 4 * EXTENT_BYTES as usize);
 
     vol.dispatch(BlockRequest::Write {
@@ -606,18 +621,18 @@ fn campaign_paused_upload_overwrite_does_not_contaminate_sealed_cut() {
     })
     .unwrap();
 
-    // Arm ObjectUploadBeforeRequest so the flush seals extent 0 with 0xAA, fails before uploading,
-    // and retains the pending sealed barrier.
-    env.failures.arm(FailurePoint::ObjectUploadBeforeRequest);
-    let err = vol
+    // Arm ObjectUploadAfterCommitBeforeReply after the Extent object is uploaded to
+    // DirectoryObjectStore, so the flush pauses mid-upload with the Extent already on disk.
+    *env.store.arm_on_type_put.lock().unwrap() = Some((
+        ObjectType::Extent,
+        FailurePoint::ObjectUploadAfterCommitBeforeReply,
+    ));
+    let _err = vol
         .dispatch(BlockRequest::Flush)
-        .expect_err("upload failure must fail flush");
-    let _ = err;
+        .expect_err("paused upload must fail flush");
     assert!(vol.pending_barrier_operation_id().is_some());
 
-    // Subsequent writes to the same offset cannot overwrite or contaminate the pending sealed cut:
-    // DurableVolume blocks new writes while a barrier cut is pending, and reconciling completes
-    // the exact 0xAA cut.
+    // Subsequent writes to the same offset cannot overwrite or contaminate the pending sealed cut.
     let _write_err = vol
         .dispatch(BlockRequest::Write {
             offset: 0,
@@ -627,26 +642,30 @@ fn campaign_paused_upload_overwrite_does_not_contaminate_sealed_cut() {
         .expect_err("writes must not overtake pending barrier");
 
     vol.flush().unwrap();
+    drop(vol);
+
+    let mut vol_b = env.reattach_fresh_worker("worker-b", 215);
     assert_eq!(
-        vol.dispatch(BlockRequest::Read {
-            offset: 0,
-            length: 4096,
-        })
-        .unwrap(),
+        vol_b
+            .dispatch(BlockRequest::Read {
+                offset: 0,
+                length: 4096,
+            })
+            .unwrap(),
         BlockResponse::Read(vec![0xAA; 4096])
     );
 }
 
 // Campaign 3 (RFC-002 16.2):
-// Coordinator/authority crash around commit (`AuthorityAfterCommitBeforeReply`), authority restart
-// fencing old incarnation, reconciling published Generation without circular dependence, and
-// verifying all three CaptureMode boundaries (`block_cut`, `filesystem_frozen`,
-// `filesystem_clean_unmount`).
+// Authority crash/restart around commit (`AuthorityAfterCommitBeforeReply`), full shutdown of old
+// authority & worker handles before WAL reopen, exact operation/Generation reconciliation, old
+// Generation immutability against journal-replay writes, and all three CaptureMode boundaries.
 #[test]
 fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_capture_modes() {
-    // Part A: AuthorityAfterCommitBeforeReply + authority restart -> old owner fenced, committed
-    // Generation reconciled and verified on fresh worker.
     let mut env = CampaignEnv::new(60);
+    let initial_branch = env.control().get_branch(env.branch_id).unwrap();
+    let initial_gen_id = initial_branch.head;
+
     let mut vol = env.open_volume("worker-a", 4 * EXTENT_BYTES as usize);
     vol.dispatch(BlockRequest::Write {
         offset: 0,
@@ -659,10 +678,12 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
     let mut producers = NoopProducerGate;
     let mut boundary = ScriptedBoundary::frozen(Some((4096, vec![0x7B; 4096])));
 
-    // Arm AuthorityAfterCommitBeforeReply on the Generation descriptor upload so `publish_capture`
+    // Arm AuthorityAfterCommitBeforeReply on the GenerationDescriptor upload so `publish_capture`
     // commits in toy-kv WAL and loses the reply.
-    *env.store.arm_on_descriptor_put.lock().unwrap() =
-        Some(FailurePoint::AuthorityAfterCommitBeforeReply);
+    *env.store.arm_on_type_put.lock().unwrap() = Some((
+        ObjectType::GenerationDescriptor,
+        FailurePoint::AuthorityAfterCommitBeforeReply,
+    ));
     let _err = coord
         .checkpoint(
             &mut vol,
@@ -674,11 +695,18 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
         .expect_err("lost publish_capture reply must surface error before thaw");
     assert!(boundary.frozen);
 
-    // Restart ToyKvMetadataAuthority from preserved WAL storage -> new owner incarnation fences
-    // inc1.
+    // Truly destroy old worker, coordinator, and authority handles before reopening from WAL.
+    drop(vol);
+    drop(coord);
+    let pending_capture = FileCaptureJournal::open(env.dir.0.join("capture-worker-a"))
+        .unwrap()
+        .load_pending()
+        .unwrap()
+        .expect("pending capture journal must record capture_id before publish");
     env.restart_authority(251);
+
     let stale_ctrl = WorkspaceControl::new(
-        Arc::clone(&env.authority),
+        env.authority(),
         env.ws,
         env.store.proof_scope(),
         env.principal,
@@ -688,9 +716,18 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
         stale_ctrl.acquire_writer(OperationId::from_bytes(id16(210)), env.branch_id, 1, 1,),
         Err(ControlError::Fenced)
     ));
+    drop(stale_ctrl);
 
-    // Fresh worker recovers the committed Generation from durable storage cleanly.
-    let mut vol_b = env.reattach_fresh_worker("worker-b", 200);
+    // Verify exact committed outcome and Generation identity on the reopened authority.
+    let ctrl = env.control();
+    let op_state = ctrl.get_operation(pending_capture.capture_id).unwrap();
+    assert!(matches!(op_state, OperationState::Committed(_)));
+    let branch_after = ctrl.get_branch(env.branch_id).unwrap();
+    assert_eq!(branch_after.head, pending_capture.generation_id);
+    assert_ne!(branch_after.head, initial_gen_id);
+
+    // Fresh worker with zero shared in-memory state recovers the committed Generation cleanly.
+    let mut vol_b = env.reattach_fresh_worker("worker-b", 220);
     assert_eq!(
         vol_b
             .dispatch(BlockRequest::Read {
@@ -709,18 +746,34 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
             .unwrap(),
         BlockResponse::Read(vec![0x7B; 4096])
     );
-    let branch = env.control().get_branch(env.branch_id).unwrap();
-    let gen_rec = env.control().get_generation(branch.head).unwrap();
-    let desc_bytes = env
-        .store
-        .get(gen_rec.descriptor.object_id)
-        .unwrap()
-        .unwrap();
+    let gen_rec = ctrl.get_generation(branch_after.head).unwrap();
+    let fresh_store = FaultyDirStore::new(&env.obj_dir, env.ws, Arc::clone(&env.failures));
+    let desc_bytes = fresh_store.get_ref(gen_rec.descriptor).unwrap().unwrap();
     let desc = decode_generation_descriptor(&desc_bytes).unwrap();
     assert_eq!(desc.capture_mode(), CaptureMode::FilesystemFrozen);
 
+    // Old immutable Generation `initial_gen_id` must remain untouched (zeros at 0 and 4096) and
+    // never absorb journal-replay writes.
+    let old_gen_rec = ctrl.get_generation(initial_gen_id).unwrap();
+    let old_desc_bytes = fresh_store
+        .get_ref(old_gen_rec.descriptor)
+        .unwrap()
+        .unwrap();
+    let old_desc = decode_generation_descriptor(&old_desc_bytes).unwrap();
+    let old_vol_root = VolumeRoot::decode(
+        &fresh_store
+            .get_ref(old_desc.volume_root())
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let old_map = VolumeExtentMap::from_root(old_vol_root).unwrap();
+    assert_eq!(
+        old_map.read_range(&fresh_store, 0, 8192).unwrap(),
+        vec![0u8; 8192]
+    );
+
     // Part B: Verify BlockCut and FilesystemCleanUnmount persist their exact declared modes.
-    let ctrl_b = env.control();
     let mut coord_b = CheckpointCoordinator::new(
         FileCaptureJournal::open(env.dir.0.join("capture-worker-b")).unwrap(),
         CaptureConfig::default(),
@@ -735,12 +788,8 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
             &[],
         )
         .unwrap();
-    let raw_gen = ctrl_b.get_generation(res_raw.generation_id).unwrap();
-    let raw_desc_bytes = env
-        .store
-        .get(raw_gen.descriptor.object_id)
-        .unwrap()
-        .unwrap();
+    let raw_gen = ctrl.get_generation(res_raw.generation_id).unwrap();
+    let raw_desc_bytes = fresh_store.get_ref(raw_gen.descriptor).unwrap().unwrap();
     assert_eq!(
         decode_generation_descriptor(&raw_desc_bytes)
             .unwrap()
@@ -763,10 +812,9 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
         )
         .unwrap();
     assert!(unmount_boundary.unmounted);
-    let unmount_gen = ctrl_b.get_generation(res_unmount.generation_id).unwrap();
-    let unmount_desc_bytes = env
-        .store
-        .get(unmount_gen.descriptor.object_id)
+    let unmount_gen = ctrl.get_generation(res_unmount.generation_id).unwrap();
+    let unmount_desc_bytes = fresh_store
+        .get_ref(unmount_gen.descriptor)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -778,8 +826,9 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
 }
 
 // Campaign 4 (RFC-002 16.2):
-// Slow >10-minute preparation renewed every 3 minutes, lost renewal replay without double
-// extension, and definite expiry/fencing rejecting final commit.
+// Slow >10-minute preparation renewed every 3 minutes, lost renewal reply replayed without double
+// extension, and preparation expiry while writer & attachment remain valid rejecting final commit
+// with `ControlError::Expired` and unchanged live roots/revision.
 #[test]
 fn campaign_slow_preparation_renewals_idempotent_replay_and_expiry_rejection() {
     let env = CampaignEnv::new(80);
@@ -809,13 +858,12 @@ fn campaign_slow_preparation_renewals_idempotent_replay_and_expiry_rejection() {
         })
         .unwrap();
 
-    // Renew writer lease every 20s and renew attachment + preparation every 3 minutes past 10
-    // minutes (12m total).
+    // Renew writer every 20s and attachment+preparation every 3m past 10m (12m total).
     let twenty_secs_ns = 20 * 1_000_000_000_u64;
     let mut grant = env.grant;
     let mut last_deadline = env.clock.now();
     let mut op_seq = 130_u8;
-    for _cycle in 0..4 {
+    for cycle in 0..4 {
         for _tick in 0..9 {
             env.clock.advance_nanos(twenty_secs_ns);
             op_seq += 1;
@@ -836,12 +884,22 @@ fn campaign_slow_preparation_renewals_idempotent_replay_and_expiry_rejection() {
 
         op_seq += 1;
         let renew_prep_op = OperationId::from_bytes(id16(op_seq));
+        // On cycle 0, inject AuthorityAfterCommitBeforeReply so the replay tests an actual lost
+        // reply.
+        if cycle == 0 {
+            env.failures
+                .arm(FailurePoint::AuthorityAfterCommitBeforeReply);
+            let err = ctrl
+                .renew_preparation(renew_prep_op, prep_op, grant)
+                .expect_err("lost renewal reply must surface error");
+            let _ = err;
+        }
         let renewed = ctrl
             .renew_preparation(renew_prep_op, prep_op, grant)
             .unwrap();
         assert!(renewed > last_deadline);
 
-        // Lost renewal replay with identical operation_id returns the exact old deadline without
+        // Second replay with identical operation_id returns the exact same deadline without
         // extending twice.
         let replayed = ctrl
             .renew_preparation(renew_prep_op, prep_op, grant)
@@ -850,26 +908,45 @@ fn campaign_slow_preparation_renewals_idempotent_replay_and_expiry_rejection() {
         last_deadline = renewed;
     }
 
-    // Advance past `last_deadline`; final commit must be rejected as Expired/Aborted/Fenced.
-    env.clock.advance_nanos(60 * 60 * 1_000_000_000_u64);
+    // Keep writer & attachment valid while advancing just past `last_deadline` so ONLY the
+    // preparation expires (not the writer or attachment).
+    while env.clock.now() <= last_deadline {
+        env.clock.advance_nanos(twenty_secs_ns);
+        op_seq += 1;
+        grant = ctrl
+            .renew_writer(OperationId::from_bytes(id16(op_seq)), grant)
+            .unwrap();
+        op_seq += 1;
+        ctrl.renew_attachment_base(
+            OperationId::from_bytes(id16(op_seq)),
+            env.branch_id,
+            env.attachment_id,
+            branch.volume_epoch,
+            att_prot,
+            grant,
+        )
+        .unwrap();
+    }
+
     let commit_err = ctrl
         .commit_live_roots(prep_op, branch.revision, grant, live_roots, None)
         .expect_err("expired preparation must reject final commit");
-    assert!(matches!(
-        commit_err,
-        ControlError::Expired | ControlError::Aborted | ControlError::Fenced
-    ));
+    assert!(matches!(commit_err, ControlError::Expired));
+
+    let after_branch = ctrl.get_branch(env.branch_id).unwrap();
+    assert_eq!(after_branch.revision, branch.revision);
+    assert_eq!(after_branch.volume_root, branch.volume_root);
 }
 
 // Campaign 5 (RFC-002 16.2):
 // Absent-operation abort tombstone wins against delayed execution; committed operation cannot be
-// undone by abort and still resolves after head movement and branch creation.
+// undone by abort and still resolves to its exact original result after head movement, branch
+// deletion, and name reuse.
 #[test]
 fn campaign_abort_tombstone_wins_absent_op_while_committed_op_survives_abort_and_name_reuse() {
     let env = CampaignEnv::new(100);
     let ctrl = env.control();
     let branch = ctrl.get_branch(env.branch_id).unwrap();
-
     let live_roots = LiveRoots {
         volume: branch.volume_root,
         logs: branch.logs_root,
@@ -913,11 +990,12 @@ fn campaign_abort_tombstone_wins_absent_op_while_committed_op_survives_abort_and
     let committed_branch = ctrl
         .commit_live_roots(committed_op, branch.revision, env.grant, live_roots, None)
         .unwrap();
+    let original_op_state = ctrl.get_operation(committed_op).unwrap();
     let abort_state = ctrl.abort_operation(committed_op).unwrap();
-    assert!(matches!(abort_state, OperationState::Committed(_)));
+    assert_eq!(abort_state, original_op_state);
 
-    // Move head (create another branch): original committed operation still resolves to its
-    // original result.
+    // 3. Move head (via another branch), detach & delete `"main"`, then recreate `"main"` with
+    // a new BranchId: original committed operation still resolves to its exact original result.
     let alt_branch = BranchId::from_bytes(id16(164));
     ctrl.create_branch(
         OperationId::from_bytes(id16(165)),
@@ -926,17 +1004,40 @@ fn campaign_abort_tombstone_wins_absent_op_while_committed_op_survives_abort_and
         committed_branch.head,
     )
     .unwrap();
-    let status = ctrl.get_operation(committed_op).unwrap();
-    let _ = status;
+    ctrl.detach_volume(
+        OperationId::from_bytes(id16(166)),
+        env.branch_id,
+        env.attachment_id,
+        committed_branch.volume_epoch,
+        committed_branch.attachment.unwrap().protection_id,
+        env.grant,
+    )
+    .unwrap();
+    ctrl.delete_branch(
+        OperationId::from_bytes(id16(167)),
+        env.branch_id,
+        committed_branch.revision,
+        env.grant,
+        false,
+    )
+    .unwrap();
+    let reused_branch = BranchId::from_bytes(id16(168));
+    ctrl.create_branch(
+        OperationId::from_bytes(id16(169)),
+        reused_branch,
+        "main",
+        committed_branch.head,
+    )
+    .unwrap();
+    assert_eq!(ctrl.get_operation(committed_op).unwrap(), original_op_state);
 }
 
 // Campaign 6 (RFC-002 16.2):
-// Corrupt/missing allocated extent, descriptor, and required provenance evidence -> explicit
-// error instead of zero-fill; optional_links removal does not alter committed provenance binding
-// or state restore.
+// Corrupt Generation descriptor and corrupt allocated extent in `DirectoryObjectStore` fail
+// explicitly on `verify_generation` and fresh `DurableVolume` read instead of zero-fill.
 #[test]
 fn campaign_corrupt_objects_and_provenance_integrity_fail_explicitly_without_zero_fill() {
-    let env = CampaignEnv::new(120);
+    let mut env = CampaignEnv::new(120);
     let mut vol = env.open_volume("worker-a", 4 * EXTENT_BYTES as usize);
 
     vol.dispatch(BlockRequest::Write {
@@ -949,7 +1050,6 @@ fn campaign_corrupt_objects_and_provenance_integrity_fail_explicitly_without_zer
     let mut producers = NoopProducerGate;
     let mut boundary = BlockCutOnlyBoundary;
 
-    // Publish a Generation with recorded provenance context + optional_links.
     let initial_branch = env.control().get_branch(env.branch_id).unwrap();
     let ctx = ProvenanceContext {
         recording_principal: env.principal,
@@ -979,44 +1079,56 @@ fn campaign_corrupt_objects_and_provenance_integrity_fail_explicitly_without_zer
         .checkpoint(&mut vol, &mut producers, &mut boundary, &req, &[])
         .unwrap();
 
-    // Verify graph succeeds cleanly while all objects are intact.
+    let fresh_store = FaultyDirStore::new(&env.obj_dir, env.ws, Arc::clone(&env.failures));
     let gen_rec = env
         .control()
         .get_generation(published.generation_id)
         .unwrap();
-    verify_generation(&env.store, gen_rec.descriptor).unwrap();
+    verify_generation(&fresh_store, gen_rec.descriptor).unwrap();
 
-    // Volume reads still return 0xE1 and descriptor retains the provenance binding.
-    assert_eq!(
-        vol.dispatch(BlockRequest::Read {
-            offset: 0,
-            length: 4096,
-        })
-        .unwrap(),
-        BlockResponse::Read(vec![0xE1; 4096])
+    // Corrupting the allocated extent object in DirectoryObjectStore must fail a fresh reader's
+    // BlockRequest::Read rather than returning zeros.
+    let desc_bytes = fresh_store.get_ref(gen_rec.descriptor).unwrap().unwrap();
+    let desc = decode_generation_descriptor(&desc_bytes).unwrap();
+    let vol_root =
+        VolumeRoot::decode(&fresh_store.get_ref(desc.volume_root()).unwrap().unwrap()).unwrap();
+    let map = VolumeExtentMap::from_root(vol_root).unwrap();
+    let extent_ref = map
+        .extent(&fresh_store, 0)
+        .unwrap()
+        .expect("extent 0 must exist");
+    let extent_path = dir_object_path(&env.obj_dir, env.ws, extent_ref);
+    assert!(
+        extent_path.exists(),
+        "extent object file must exist on disk"
+    );
+    std::fs::write(&extent_path, b"corrupt-extent").unwrap();
+
+    drop(vol);
+    let mut vol_b = env.reattach_fresh_worker("worker-b", 230);
+    assert!(
+        vol_b
+            .dispatch(BlockRequest::Read {
+                offset: 0,
+                length: 4096,
+            })
+            .is_err(),
+        "corrupt allocated extent must fail read instead of returning zeros"
     );
 
-    // Corrupting the Generation descriptor object in object storage must fail verification rather
-    // than silently succeeding.
-    let desc_path = env.dir.0.join("objects").join(format!(
-        "{}/{}",
-        env.store.proof_scope(),
-        gen_rec.descriptor.object_id
-    ));
-    if desc_path.exists() {
-        std::fs::write(&desc_path, b"corrupt-descriptor").unwrap();
-        assert!(verify_generation(&env.store, gen_rec.descriptor).is_err());
-    }
+    // Corrupting the Generation descriptor object on disk must fail verify_generation explicitly.
+    let desc_path = dir_object_path(&env.obj_dir, env.ws, gen_rec.descriptor);
+    assert!(desc_path.exists(), "descriptor file must exist on disk");
+    std::fs::write(&desc_path, b"corrupt-descriptor").unwrap();
+    assert!(verify_generation(&fresh_store, gen_rec.descriptor).is_err());
 }
 
 // Campaign 7 (RFC-002 16.2):
-// Capacity exhaustion (dirty limit) and unavailable S3 / authority fail safely without dirty
-// eviction, weakened acknowledgement, or reversion to a cached head.
+// Capacity exhaustion (dirty limit) and unavailable authority fail safely without dirty eviction
+// or weakened acknowledgement, and recover cleanly on a fresh worker with empty cache.
 #[test]
 fn campaign_capacity_exhaustion_and_backend_outages_preserve_recoverable_state() {
-    // Dirty capacity = 1 extent (64 KiB); writing a second extent must reject without evicting
-    // dirty extent 0.
-    let env = CampaignEnv::new(140);
+    let mut env = CampaignEnv::new(140);
     let mut vol = env.open_volume("worker-a", EXTENT_BYTES as usize);
 
     vol.dispatch(BlockRequest::Write {
@@ -1049,15 +1161,20 @@ fn campaign_capacity_exhaustion_and_backend_outages_preserve_recoverable_state()
         .dispatch(BlockRequest::Flush)
         .expect_err("unavailable authority must fail flush");
 
-    // Reconcile/retry once authority is back -> flush completes and extent 0 is durable.
+    // Retry once authority is back -> flush completes and fresh worker recovers [0xC1; 4096].
     vol.flush().unwrap();
     assert_eq!(vol.dirty_extent_count(), 0);
+    drop(vol);
+    let _ = std::fs::remove_dir_all(env.dir.0.join("barrier-worker-a"));
+
+    let mut vol_b = env.reattach_fresh_worker("worker-b", 240);
     assert_eq!(
-        vol.dispatch(BlockRequest::Read {
-            offset: 0,
-            length: 4096,
-        })
-        .unwrap(),
+        vol_b
+            .dispatch(BlockRequest::Read {
+                offset: 0,
+                length: 4096,
+            })
+            .unwrap(),
         BlockResponse::Read(vec![0xC1; 4096])
     );
 }

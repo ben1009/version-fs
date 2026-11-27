@@ -455,12 +455,13 @@ Real S3 inventory/report qualification remains pending in P12 / ignored tests.
 campaigns) together with `metadata_authority.rs`, `barrier_authority.rs`,
 `capture_authority.rs`, `control_authority.rs`, `native_views_authority.rs`,
 `retention_reports.rs`, and `service_lifecycle.rs` (indexed in
-[docs/p11-fault-campaigns.md](p11-fault-campaigns.md)) verify every RFC-002
-Section 16.2 failure-injection gate against `ToyKvMetadataAuthority` WAL
-persistence and `DirectoryObjectStore`: API/device acknowledgements match
-persisted state, old immutable Generations never absorb journal-replay writes,
-and no failure weakens ordering, durability, retention, or authorization.
-Real Linux `ublk`/`ext4`/`fsfreeze` and real-S3 runs remain in P12.
+[docs/p11-fault-campaigns.md](p11-fault-campaigns.md)) verify the RFC-002
+Section 16.2 failure-injection gates against `ToyKvMetadataAuthority` WAL
+persistence and `DirectoryObjectStore` under deterministic fault injection:
+API/device acknowledgements match persisted state, old immutable Generations
+never absorb journal-replay writes, and no failure weakens ordering, durability,
+retention, or authorization. Real Linux `ublk`/`ext4`/`fsfreeze` kernel-emulation
+campaigns and real-S3 runs remain in P12.
 
 ### P12. Benchmarks and operator handoff
 
