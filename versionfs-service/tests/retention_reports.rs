@@ -1095,11 +1095,11 @@ fn cow_shared_btree_subtrees_are_skipped_without_reloading() {
 
     // Build a multi-level VolumeExtentMap, then create a second root sharing most subtrees.
     let mut vol = VolumeExtentMap::empty(
-        VolumeGeometry::new(64 * EXTENT_BYTES as u64).unwrap(),
+        VolumeGeometry::new(256 * EXTENT_BYTES as u64).unwrap(),
         &mut store,
     )
     .unwrap();
-    for idx in 0..40_u64 {
+    for idx in 0..160_u64 {
         let ext =
             encode_object(ObjectType::Extent, &vec![idx as u8; EXTENT_BYTES as usize]).unwrap();
         let ext_ref = harness.put_obj(ws, &ext);
@@ -1109,7 +1109,7 @@ fn cow_shared_btree_subtrees_are_skipped_without_reloading() {
 
     let extra_ext = encode_object(ObjectType::Extent, &[0x99_u8; EXTENT_BYTES as usize]).unwrap();
     let extra_ref = harness.put_obj(ws, &extra_ext);
-    let vol2 = vol.insert_extent(&mut store, 40, extra_ref).unwrap();
+    let vol2 = vol.insert_extent(&mut store, 160, extra_ref).unwrap();
     let r2 = vol2.seal(&mut store).unwrap();
 
     let spill_dir = TempDir::new();
@@ -1466,7 +1466,9 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
     });
 
     // Wait until A has committed `Sealing` and is paused BEFORE `begin_gc_report_attempt` returns.
-    admitted_rx.recv().unwrap();
+    admitted_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
 
     // Start B concurrently: B sees `Sealing` owned by A, sees A is registered in
     // `active_sealers()`, and waits rather than aborting A.
@@ -1482,7 +1484,9 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
     });
 
     // Wait deterministically until B has observed A's `Sealing` state, then unblock A.
-    b_saw_sealing_rx.recv().unwrap();
+    b_saw_sealing_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
     resume_tx.send(()).unwrap();
 
     let res_a = thread_a.join().unwrap().unwrap();

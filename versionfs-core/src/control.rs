@@ -3562,9 +3562,17 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let state_key = gc_report_state_key(self.workspace_id, report_id);
         let outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"abort");
         let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+        let mut capped_reason = reason;
+        if capped_reason.len() > 4096 {
+            let mut end = 4096;
+            while !capped_reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            capped_reason = &capped_reason[..end];
+        }
         let aborted = GcReportState::Aborted {
             fingerprint,
-            reason: reason.to_owned(),
+            reason: capped_reason.to_owned(),
         }
         .encode()?;
 
@@ -4097,7 +4105,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     GcReportState::Admitted { .. } | GcReportState::Sealing { .. } => {
                         return Err(reject("invalid_transition"));
                     }
-                    GcReportState::Sealed { .. } => {}
+                    GcReportState::Sealed { fingerprint, .. } => {
+                        if fingerprint != fp {
+                            return Err(reject("mismatch"));
+                        }
+                    }
                 }
             } else {
                 return Err(reject("invalid_transition"));
@@ -4112,9 +4124,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             Ok(bytes) => bytes,
             Err(ControlError::Conflict) => {
                 let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
-                self.authority.get(&sum_key)?.ok_or_else(|| {
-                    ControlError::CorruptRecord("missing gc report summary".into())
-                })?
+                self.authority
+                    .get(&sum_key)?
+                    .ok_or(ControlError::Conflict)?
             }
             Err(err) => return Err(err),
         };

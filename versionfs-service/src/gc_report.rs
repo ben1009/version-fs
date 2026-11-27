@@ -377,7 +377,7 @@ where
         .now()
         .saturating_add_nanos(budget.detail_ttl_nanos);
     let detail_expires_at_unix_ms =
-        inventory_finished_unix_ms.saturating_add(budget.detail_ttl_nanos / 1_000_000);
+        inventory_finished_unix_ms.saturating_add(budget.detail_ttl_nanos.div_ceil(1_000_000));
     let summary = GcReportSummary {
         report_id,
         boundary_time: header.boundary_time,

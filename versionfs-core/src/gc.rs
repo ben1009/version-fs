@@ -618,14 +618,18 @@ impl DiskSpillVisitedSet {
         };
         for id in &ids {
             if let Err(err) = file.write_all(id.as_bytes()) {
-                self.budget.release(added_bytes);
-                let _ = std::fs::remove_file(&run_path);
+                drop(file);
+                if std::fs::remove_file(&run_path).is_ok() {
+                    self.budget.release(added_bytes);
+                }
                 return Err(err.into());
             }
         }
         if let Err(err) = file.flush() {
-            self.budget.release(added_bytes);
-            let _ = std::fs::remove_file(&run_path);
+            drop(file);
+            if std::fs::remove_file(&run_path).is_ok() {
+                self.budget.release(added_bytes);
+            }
             return Err(err.into());
         }
         let cached_file = if self.spill_runs.len() < MAX_OPEN_SPILL_FDS {
@@ -703,11 +707,12 @@ impl DiskSpillWorkQueue {
         if let Some(item) = self.in_memory.pop() {
             return Ok(Some(item));
         }
-        let Some((path, count)) = self.spill_chunks.pop() else {
+        let Some((path, count)) = self.spill_chunks.last().cloned() else {
             return Ok(None);
         };
         let mut file = File::open(&path)?;
         let mut buf = [0_u8; WORK_QUEUE_RECORD_BYTES];
+        let mut reloaded = Vec::with_capacity(count);
         for _ in 0..count {
             file.read_exact(&mut buf)?;
             let type_code = u16::from_le_bytes([buf[0], buf[1]]);
@@ -716,16 +721,18 @@ impl DiskSpillWorkQueue {
             id_bytes.copy_from_slice(&buf[2..34]);
             let mut len_bytes = [0_u8; 8];
             len_bytes.copy_from_slice(&buf[34..42]);
-            self.in_memory.push(ObjectRef {
+            reloaded.push(ObjectRef {
                 object_type,
                 object_id: ObjectId::from_bytes(id_bytes),
                 encoded_len: u64::from_le_bytes(len_bytes),
             });
         }
-        if std::fs::remove_file(path).is_ok() {
-            self.budget
-                .release((count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
-        }
+        drop(file);
+        std::fs::remove_file(&path)?;
+        self.spill_chunks.pop();
+        self.budget
+            .release((count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
+        self.in_memory.extend(reloaded);
         Ok(self.in_memory.pop())
     }
 
@@ -853,6 +860,9 @@ pub fn mark_reachable_closure<S: MapObjectStore>(
                             let mut d = CanonicalDecoder::new(&val);
                             match d.object_ref().and_then(|r| {
                                 d.finish()?;
+                                if r.object_type != ObjectType::Extent {
+                                    return Err(FormatError::ObjectReferenceMismatch);
+                                }
                                 Ok(r)
                             }) {
                                 Ok(ext_ref) => queue.push(ext_ref)?,
