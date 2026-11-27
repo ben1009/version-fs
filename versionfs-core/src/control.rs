@@ -3818,7 +3818,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         return Err(reject("fenced"));
                     }
                     if fingerprint != fp || cur_attempt != root_attempt_id {
-                        return Err(reject("conflict"));
+                        return Err(MetadataError::Conflict);
                     }
                 }
                 GcReportState::Admitted { .. } => return Err(reject("invalid_transition")),
@@ -4107,7 +4107,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     }
                     GcReportState::Sealed { fingerprint, .. } => {
                         if fingerprint != fp {
-                            return Err(reject("mismatch"));
+                            return Err(reject("operation_mismatch"));
                         }
                     }
                 }
