@@ -3434,17 +3434,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let state = validate_gc_report_state(state, fp)?;
             if let GcReportState::Sealing {
                 owner_incarnation_u64,
+                root_attempt_id: active_attempt,
                 ..
             } = state
             {
                 if owner_incarnation_u64 != self.owner_incarnation.0 {
-                    let _ = self.abort_gc_report_attempt(
-                        report_id,
-                        fp,
-                        None,
-                        "snapshot lost after process restart before sealing",
-                    );
-                    return Err(ControlError::Aborted);
+                    return self.recover_cross_owner_sealing(report_id, fp, active_attempt);
                 }
                 return Ok(state);
             }
@@ -3485,19 +3480,31 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let state = validate_gc_report_state(state, fp)?;
         if let GcReportState::Sealing {
             owner_incarnation_u64,
+            root_attempt_id: active_attempt,
             ..
         } = state
             && owner_incarnation_u64 != self.owner_incarnation.0
         {
-            let _ = self.abort_gc_report_attempt(
-                report_id,
-                fp,
-                None,
-                "snapshot lost after process restart before sealing",
-            );
-            return Err(ControlError::Aborted);
+            return self.recover_cross_owner_sealing(report_id, fp, active_attempt);
         }
         Ok(state)
+    }
+
+    fn recover_cross_owner_sealing(
+        &self,
+        report_id: OperationId,
+        fp: [u8; 32],
+        active_attempt: OperationId,
+    ) -> Result<GcReportState, ControlError> {
+        match self.abort_gc_report_attempt(
+            report_id,
+            fp,
+            Some(active_attempt),
+            "snapshot lost after process restart before sealing",
+        )? {
+            GcReportState::Aborted { .. } => Err(ControlError::Aborted),
+            state => Ok(state),
+        }
     }
 
     /// Reconciles and aborts a stale `Sealing` attempt in the same owner incarnation
@@ -3563,6 +3570,12 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let mut last_err = None;
         for _ in 0..4 {
             match self.transact_with_outcome(&outcome_key, |txn| {
+                if let Some(owner_bytes) = txn.get(&owner_incarnation_key())? {
+                    let current_owner = decode_owner(&owner_bytes).map_err(to_metadata_error)?;
+                    if current_owner != self.owner_incarnation.0 {
+                        return Err(reject("fenced"));
+                    }
+                }
                 if let Some(existing) = txn.get(&state_key)? {
                     let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
                     match &decoded {
@@ -3650,13 +3663,25 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                         return Err(ControlError::OperationMismatch);
                     }
                     if owner_incarnation_u64 != self.owner_incarnation.0 {
-                        let _ = self.abort_gc_report_attempt(
+                        return match self.recover_cross_owner_sealing(
                             report_id,
                             fp,
-                            None,
-                            "snapshot lost after process restart before sealing",
-                        );
-                        return Err(ControlError::Aborted);
+                            active_attempt,
+                        )? {
+                            GcReportState::Sealed {
+                                root_attempt_id: winner,
+                                header,
+                                ..
+                            } => Ok((winner, header)),
+                            GcReportState::Completed { .. } => Err(ControlError::InvalidRequest(
+                                "gc report is already completed",
+                            )),
+                            GcReportState::Sealing {
+                                root_attempt_id: other_attempt,
+                                ..
+                            } if other_attempt != root_attempt_id => Err(ControlError::InProgress),
+                            _ => Err(ControlError::Conflict),
+                        };
                     }
                     if active_attempt != root_attempt_id {
                         return Err(ControlError::InProgress);

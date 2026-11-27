@@ -1366,7 +1366,9 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
     struct PauseAfterAdmitAuthority {
         inner: Arc<ToyKvMetadataAuthority>,
         paused_once: AtomicBool,
+        signaled_sealing: AtomicBool,
         admitted_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        b_saw_sealing_tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
         resume_rx: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
 
@@ -1378,7 +1380,16 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
         }
 
         fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
-            self.inner.get(key)
+            let res = self.inner.get(key);
+            if self.paused_once.load(Ordering::Acquire)
+                && matches!(res, Ok(Some(_)))
+                && key.windows(16).any(|w| w == b"gc-report/state/")
+                && !self.signaled_sealing.swap(true, Ordering::AcqRel)
+                && let Some(tx) = self.b_saw_sealing_tx.lock().unwrap().take()
+            {
+                let _ = tx.send(());
+            }
+            res
         }
 
         fn transact<R, F>(&self, op: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
@@ -1429,11 +1440,14 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
         setup_workspace(&harness, ws, principal);
 
     let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+    let (b_saw_sealing_tx, b_saw_sealing_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     let wrapper = Arc::new(PauseAfterAdmitAuthority {
         inner: Arc::clone(&harness.authority),
         paused_once: AtomicBool::new(false),
+        signaled_sealing: AtomicBool::new(false),
         admitted_tx: std::sync::Mutex::new(Some(admitted_tx)),
+        b_saw_sealing_tx: std::sync::Mutex::new(Some(b_saw_sealing_tx)),
         resume_rx: std::sync::Mutex::new(Some(resume_rx)),
     });
 
@@ -1467,12 +1481,135 @@ fn active_sealer_registered_before_admission_prevents_concurrent_abort() {
         )
     });
 
-    // Give B a moment to observe A's `Sealing` state, then unblock A.
-    std::thread::sleep(std::time::Duration::from_millis(30));
+    // Wait deterministically until B has observed A's `Sealing` state, then unblock A.
+    b_saw_sealing_rx.recv().unwrap();
     resume_tx.send(()).unwrap();
 
     let res_a = thread_a.join().unwrap().unwrap();
     let res_b = thread_b.join().unwrap().unwrap();
     assert_eq!(res_a, res_b);
     assert_eq!(res_a.completeness, GcReportCompleteness::Complete);
+}
+
+#[test]
+fn cross_owner_abort_propagates_conflict_and_fences_stale_owner() {
+    use versionfs_core::metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
+    };
+
+    struct AbortConflictAuthority {
+        inner: Arc<ToyKvMetadataAuthority>,
+        fail_abort_with_conflict: AtomicBool,
+    }
+
+    impl MetadataAuthority for AbortConflictAuthority {
+        type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+        fn now(&self) -> MonotonicTime {
+            self.inner.now()
+        }
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+            self.inner.get(key)
+        }
+
+        fn transact<R, F>(&self, op: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
+        where
+            F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+        {
+            if self.fail_abort_with_conflict.load(Ordering::Acquire)
+                && op.outcome_key.ends_with(b"abort")
+            {
+                return Err(MetadataError::Conflict);
+            }
+            self.inner.transact(op, body)
+        }
+
+        fn reconcile_unknown(
+            &self,
+            op: MutationIdentity<'_>,
+        ) -> Result<ReconciledOutcome, MetadataError> {
+            self.inner.reconcile_unknown(op)
+        }
+
+        fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+            self.inner.snapshot()
+        }
+
+        fn scan_prefix(
+            &self,
+            snapshot: &Self::Snapshot,
+            prefix: &[u8],
+            cursor: Option<&MetadataCursor>,
+            limit: std::num::NonZeroUsize,
+        ) -> Result<MetadataPage, MetadataError> {
+            self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+        }
+    }
+
+    let dir = TempDir::new();
+    let meta_dir = dir.0.join("meta");
+    let obj_dir = dir.0.join("objects");
+    let clock = Arc::new(TestClock::new(1_000_000_000));
+    let authority = Arc::new(
+        ToyKvMetadataAuthority::open_with(
+            &meta_dir,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::new(NoFailures),
+        )
+        .unwrap(),
+    );
+    let inc1 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(150))).unwrap();
+    let object_store = Arc::new(DirectoryObjectStore::open(&obj_dir).unwrap());
+    let ws = WorkspaceId::from_bytes(id16(151));
+    let principal = PrincipalId::from_bytes(id16(152));
+    let report_id = OperationId::from_bytes(id16(153));
+    let budget = GcReportBudget::default();
+
+    // Owner 1 enters Sealing.
+    let attempt1 = OperationId::from_bytes(id16(154));
+    let ctrl1 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc1,
+    );
+    ctrl1
+        .begin_gc_report_attempt(report_id, attempt1, budget)
+        .unwrap();
+
+    // Owner 2 starts, sees Owner 1's Sealing, but abort hits persistent Conflict ->
+    // must propagate Conflict rather than falsely returning Aborted.
+    let inc2 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(155))).unwrap();
+    let conflict_auth = Arc::new(AbortConflictAuthority {
+        inner: Arc::clone(&authority),
+        fail_abort_with_conflict: AtomicBool::new(true),
+    });
+    let ctrl2 = WorkspaceControl::new(
+        Arc::clone(&conflict_auth),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc2,
+    );
+    let err = ctrl2
+        .begin_gc_report_attempt(report_id, OperationId::from_bytes(id16(156)), budget)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        versionfs_core::control::ControlError::Conflict
+    ));
+
+    // Stale Owner 1 trying to abort after Owner 2 started must be fenced.
+    let stale_err = ctrl1
+        .abort_stale_sealing_attempt(report_id, attempt1, budget)
+        .unwrap_err();
+    assert!(matches!(
+        stale_err,
+        versionfs_core::control::ControlError::Fenced
+    ));
 }
