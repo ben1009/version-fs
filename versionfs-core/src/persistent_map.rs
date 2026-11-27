@@ -106,6 +106,21 @@ pub enum MapChange {
 /// One ordered key/value entry returned by a persistent map.
 pub type MapEntry = (Vec<u8>, Vec<u8>);
 
+/// Immediate edges decoded from one persistent B-tree node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BTreeNodeEdges {
+    /// Leaf node containing ordered `(key, encoded_value)` entries.
+    Leaf {
+        /// Ordered leaf entries.
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    /// Internal node referencing child subtrees.
+    Internal {
+        /// Immediate child B-tree node references.
+        children: Vec<ObjectRef>,
+    },
+}
+
 /// All entries and node references reachable from one persistent map root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MapContents {
@@ -307,6 +322,21 @@ impl PersistentBTree {
             &mut entries,
         )?;
         Ok(entries)
+    }
+
+    /// Decodes a single B-tree node's immediate outbound edges without loading
+    /// child subtrees, enabling bounded node-level graph traversal.
+    pub fn decode_node_edges(
+        reference: ObjectRef,
+        encoded: &[u8],
+    ) -> Result<BTreeNodeEdges, PersistentMapError> {
+        let object = reference.verify(encoded)?;
+        match decode_node(object.payload, reference.object_type)? {
+            Node::Leaf(entries) => Ok(BTreeNodeEdges::Leaf { entries }),
+            Node::Internal { children, .. } => Ok(BTreeNodeEdges::Internal {
+                children: children.into_iter().map(|(_, child)| child).collect(),
+            }),
+        }
     }
 
     /// Returns ordered entries and every reachable map-node reference.

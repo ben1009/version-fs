@@ -1058,7 +1058,7 @@ where
                 page_index,
             } => {
                 let (summary, page) = control
-                    .get_gc_report(report_id, page_index)
+                    .get_gc_report(report_id, page_index, crate::gc_report::unix_ms_now())
                     .map_err(ServiceError::from)?;
                 sink(RpcResponseFrame::Data(encode_rpc_gc_report_summary(
                     &summary,

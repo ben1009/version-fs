@@ -1,9 +1,11 @@
 //! Bounded mark-only retention report execution for `WorkspaceService`.
 //!
-//! Mark-only reports seal roots from one read-only authority snapshot, release
-//! the snapshot before any object-store I/O, traverse typed strong edges with
-//! bounded RAM + disk spill, inventory objects over a recorded Unix-ms window,
-//! and persist bounded candidate pages without issuing any object deletions.
+//! Mark-only reports admit a durable report lifecycle, seal roots from one
+//! read-only authority snapshot, release the snapshot before any persistence or
+//! object-store I/O, traverse typed strong edges with node-level B-tree decoding
+//! and bounded RAM + disk spill, inventory objects over a recorded Unix-ms
+//! window, and persist bounded candidate pages in small batches without issuing
+//! any object deletions.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,11 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::runtime::Handle;
-use versionfs_core::control::{ControlError, WorkspaceControl};
+use versionfs_core::control::{ControlError, GcReportState, WorkspaceControl};
 use versionfs_core::format::ObjectRef;
 use versionfs_core::gc::{
-    DiskSpillVisitedSet, GcCandidateEntry, GcCandidatePage, GcError, GcReportBudget,
-    GcReportCompleteness, GcReportSummary, mark_reachable_closure,
+    CANDIDATE_PERSIST_BATCH_PAGES, DiskSpillVisitedSet, DiskSpillWorkQueue, GcCandidateEntry,
+    GcCandidatePage, GcError, GcReportBudget, GcReportCompleteness, GcReportSummary,
+    mark_reachable_closure,
 };
 use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, OperationId, WorkspaceId};
 use versionfs_core::metadata::MetadataAuthority;
@@ -86,7 +89,8 @@ impl<O: ObjectStore> MapObjectStore for GcObjectBridge<O> {
     }
 }
 
-fn unix_ms_now() -> u64 {
+/// Current wall-clock time in Unix milliseconds.
+pub fn unix_ms_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -96,9 +100,9 @@ fn unix_ms_now() -> u64 {
 /// Runs a bounded, mark-only retention report for `workspace_id`.
 ///
 /// The authority snapshot is acquired and dropped inside
-/// [`WorkspaceControl::seal_gc_report_roots`] before any object-store I/O
-/// occurs, so publication admission and the authority gate are never held across
-/// object reads or inventory pagination.
+/// [`WorkspaceControl::seal_gc_report_roots`] before any persistence or
+/// object-store I/O occurs, so publication admission and the authority gate are
+/// never held across object reads or inventory pagination.
 pub fn run_mark_only_report<A, O>(
     control: &WorkspaceControl<A>,
     authority: &Arc<A>,
@@ -106,24 +110,25 @@ pub fn run_mark_only_report<A, O>(
     runtime: &Handle,
     workspace_id: WorkspaceId,
     report_id: OperationId,
-    budget: GcReportBudget,
+    raw_budget: GcReportBudget,
 ) -> Result<GcReportSummary, GcReportError>
 where
     A: MetadataAuthority + Send + Sync + 'static,
     O: ObjectStore + Send + Sync + 'static,
 {
-    match control.get_gc_report(report_id, None) {
-        Ok((existing_summary, _)) => return Ok(existing_summary),
-        Err(ControlError::NotFound) => {}
-        Err(err) => return Err(err.into()),
-    }
+    let budget = raw_budget.clamped_to_server_limits();
 
-    // Step 1: Seal retained/live roots from one read-only snapshot, then release
-    // the snapshot before any object-store I/O.
-    let scan_page_size = budget.scan_page_size.clamp(1, MAX_INVENTORY_PAGE_SIZE);
-    let sealed = control.seal_gc_report_roots(report_id, scan_page_size)?;
+    // Step 1: Admit or resume durable report lifecycle, enforcing caller/budget
+    // consistency and aborting permanently if a prior snapshot was lost.
+    let header = match control.begin_gc_report_attempt(report_id, budget)? {
+        GcReportState::Completed { summary, .. } => return Ok(summary),
+        GcReportState::Sealed { header, .. } => header,
+        GcReportState::Admitted { .. } => control.seal_gc_report_roots(report_id, budget)?,
+        GcReportState::Aborted { .. } => return Err(ControlError::Aborted.into()),
+    };
 
-    // Step 2: Traverse typed strong edges using bounded RAM + disk spill.
+    // Step 2: Traverse typed strong edges using bounded RAM + disk spill for both
+    // the visited set and the pending work queue.
     static NEXT_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
     let spill_seq = NEXT_SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
     let spill_dir = std::env::temp_dir().join(format!(
@@ -133,16 +138,25 @@ where
     std::fs::create_dir_all(&spill_dir)?;
     let _spill_guard = SpillDirGuard(spill_dir.clone());
     let mut visited = DiskSpillVisitedSet::new(&spill_dir, budget.max_in_memory_visited)?;
+    let mut work_queue = DiskSpillWorkQueue::new(&spill_dir, budget.max_in_memory_visited)?;
+    for page_idx in 0..header.root_page_count {
+        let root_page = control.read_sealed_root_page(report_id, page_idx)?;
+        for root in root_page.roots {
+            work_queue.push(root)?;
+        }
+    }
+
     let bridge = GcObjectBridge {
         store: Arc::clone(object_store),
         workspace_id,
         scope: object_store.scope_id(workspace_id),
         runtime: runtime.clone(),
     };
-    let mark_stats = mark_reachable_closure(&bridge, &sealed, &mut visited)?;
+    let mark_stats = mark_reachable_closure(&bridge, &mut work_queue, &mut visited)?;
 
     // Step 3: Inventory objects over a recorded Unix-ms window and build
     // bounded candidate pages without issuing any deletions.
+    let scan_page_size = budget.scan_page_size.clamp(1, MAX_INVENTORY_PAGE_SIZE);
     let inventory_started_unix_ms = unix_ms_now();
     let mut observed_objects: u64 = 0;
     let mut observed_bytes: u64 = 0;
@@ -226,29 +240,41 @@ where
         };
     }
 
+    // Persist candidate pages in bounded batches so the authority commit gate is
+    // never held for a single multi-megabyte transaction.
+    for (batch_idx, batch) in pages.chunks(CANDIDATE_PERSIST_BATCH_PAGES).enumerate() {
+        control.persist_gc_report_batch(
+            report_id,
+            u32::try_from(batch_idx).unwrap_or(u32::MAX),
+            batch,
+        )?;
+    }
+
     let inventory_finished_unix_ms = unix_ms_now();
     let completeness = if mark_stats.missing_or_corrupt_objects == 0
-        && sealed.uncertain_preparations == 0
+        && header.uncertain_preparations == 0
         && !budget_exhausted
-        && sealed.missing_metadata == 0
+        && header.missing_metadata == 0
     {
         GcReportCompleteness::Complete
     } else {
         GcReportCompleteness::Incomplete {
             missing_or_corrupt_objects: mark_stats.missing_or_corrupt_objects,
-            uncertain_preparations: sealed.uncertain_preparations,
+            uncertain_preparations: header.uncertain_preparations,
             budget_exhausted,
-            missing_metadata: sealed.missing_metadata,
+            missing_metadata: header.missing_metadata,
         }
     };
 
     let detail_expires_at = authority
         .now()
         .saturating_add_nanos(budget.detail_ttl_nanos);
+    let detail_expires_at_unix_ms =
+        inventory_finished_unix_ms.saturating_add(budget.detail_ttl_nanos / 1_000_000);
     let summary = GcReportSummary {
         report_id,
-        boundary_time: sealed.boundary_time,
-        sealed_root_count: u64::try_from(sealed.roots.len()).unwrap_or(u64::MAX),
+        boundary_time: header.boundary_time,
+        sealed_root_count: header.total_roots,
         marked_objects: mark_stats.marked_objects,
         observed_objects,
         observed_bytes,
@@ -258,11 +284,14 @@ where
         inventory_started_unix_ms,
         inventory_finished_unix_ms,
         detail_expires_at,
+        detail_expires_at_unix_ms,
+        owner_incarnation_u64: control.owner_incarnation().as_u64(),
         completeness,
     };
 
-    control.persist_gc_report(&summary, &pages)?;
-    Ok(summary)
+    // Atomically publish summary with first-writer-wins semantics and return the
+    // authoritative summary stored in metadata.
+    Ok(control.finalize_gc_report(budget, &summary)?)
 }
 
 fn flush_candidate_page(

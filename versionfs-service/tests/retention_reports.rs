@@ -655,3 +655,411 @@ fn uncertain_preparations_budget_exhaustion_and_detail_expiry_behave_explicitly(
     assert_eq!(summary_after, summary);
     assert!(page_after.is_none());
 }
+
+#[test]
+fn concurrent_same_report_id_returns_identical_terminal_summary_and_rejects_budget_mismatch() {
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(40));
+    let principal = PrincipalId::from_bytes(id16(41));
+    let (client, _main_branch, _boundary_id, _branch, _grant, _att) =
+        setup_workspace(&harness, ws, principal);
+
+    let report_id = OperationId::from_bytes(id16(42));
+    let budget = GcReportBudget::default();
+
+    let c1 = harness.client(ws, principal);
+    let c2 = harness.client(ws, principal);
+    let t1 = std::thread::spawn(move || c1.collect_report(report_id, Some(budget)));
+    let t2 = std::thread::spawn(move || c2.collect_report(report_id, Some(budget)));
+    let r1 = t1.join().unwrap().unwrap();
+    let r2 = t2.join().unwrap().unwrap();
+    assert_eq!(r1, r2);
+
+    // Retrying the same report_id with a different budget must fail with
+    // OperationMismatch/Conflict.
+    let mismatched_budget = GcReportBudget {
+        max_candidate_pages: 7,
+        ..budget
+    };
+    let err = client
+        .collect_report(report_id, Some(mismatched_budget))
+        .unwrap_err();
+    assert_eq!(err.code, ServiceErrorCode::OperationMismatch);
+}
+
+#[test]
+fn unknown_outcome_during_report_lifecycle_reconciles_and_unblocks_mutations() {
+    use versionfs_core::fault::{FailureInjector, FailurePoint, InjectedFailure};
+
+    struct ArmedUnknown(AtomicBool);
+    impl FailureInjector for ArmedUnknown {
+        fn check(&self, point: FailurePoint) -> Result<(), InjectedFailure> {
+            if point == FailurePoint::AuthorityCommitOutcomeUnknownWithoutCommit
+                && self.0.swap(false, Ordering::AcqRel)
+            {
+                return Err(InjectedFailure(point));
+            }
+            Ok(())
+        }
+    }
+
+    let dir = TempDir::new();
+    let meta_dir = dir.0.join("meta");
+    let obj_dir = dir.0.join("objects");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let clock = Arc::new(TestClock::new(1_000_000_000));
+    let faults = Arc::new(ArmedUnknown(AtomicBool::new(false)));
+    let authority = Arc::new(
+        ToyKvMetadataAuthority::open_with(
+            &meta_dir,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::clone(&faults) as Arc<dyn FailureInjector>,
+        )
+        .unwrap(),
+    );
+    let incarnation =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(60))).unwrap();
+    let object_store = Arc::new(DirectoryObjectStore::open(&obj_dir).unwrap());
+    let ws = WorkspaceId::from_bytes(id16(61));
+    let principal = PrincipalId::from_bytes(id16(62));
+
+    let service = Arc::new(WorkspaceService::new(
+        Arc::clone(&authority),
+        incarnation,
+        Arc::clone(&object_store),
+        rt.handle().clone(),
+        ServiceConfig::new(b"secret-token".to_vec()),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_bg = Arc::clone(&shutdown);
+    let server_thread = std::thread::spawn(move || {
+        let _ = serve_tcp(service, listener, shutdown_bg);
+    });
+
+    let client = ServiceClient::connect(
+        ServiceEndpoint::Tcp(addr),
+        RpcAuth {
+            workspace_id: ws,
+            principal_id: principal,
+            auth_token: b"secret-token".to_vec(),
+        },
+    )
+    .unwrap();
+    let main_branch = BranchId::from_bytes(id16(63));
+    let boundary_id = VolumeBoundaryId::from_bytes(id16(64));
+    let init = client
+        .create_empty_workspace(
+            OperationId::from_bytes(id16(65)),
+            GenerationId::from_bytes(id16(66)),
+            boundary_id,
+            VolumeGeometry::new(64 * 1024).unwrap(),
+            1_700_000_000_000,
+            main_branch,
+            "main",
+            60_000,
+            OperationId::from_bytes(id16(67)),
+            OperationId::from_bytes(id16(68)),
+            AttachmentId::from_bytes(id16(69)),
+            ProtectionId::from_bytes(id16(70)),
+        )
+        .unwrap();
+
+    // Arm unknown outcome for the next metadata commit (GC report admission/sealing).
+    let report_id = OperationId::from_bytes(id16(71));
+    faults.0.store(true, Ordering::Release);
+    let first_err = client.collect_report(report_id, None).unwrap_err();
+    assert_eq!(first_err.code, ServiceErrorCode::UnknownOutcome);
+
+    // Retrying with the same report_id reconciles the unknown outcome and succeeds.
+    let summary = client.collect_report(report_id, None).unwrap();
+    assert_eq!(summary.report_id, report_id);
+    assert_eq!(summary.completeness, GcReportCompleteness::Complete);
+
+    // Normal branch mutations are not blocked and succeed.
+    let prep_op = OperationId::from_bytes(id16(72));
+    client
+        .begin_preparation(PreparationRequest {
+            operation_id: prep_op,
+            branch_id: main_branch,
+            expected_revision: init.branch.revision,
+            grant: init.writer_grant,
+            attachment_id: init.attachment.attachment_id,
+            volume_epoch: init.attachment.volume_epoch,
+            protection_id: ProtectionId::from_bytes(id16(73)),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(versionfs_core::control::LiveRoots {
+                volume: init.branch.volume_root,
+                logs: init.branch.logs_root,
+                artifacts: init.branch.artifacts_root,
+            }),
+            dependencies: Vec::new(),
+        })
+        .unwrap();
+
+    shutdown.store(true, Ordering::Release);
+    let _ = server_thread.join();
+}
+
+#[test]
+fn snapshot_loss_before_sealing_aborts_report_id_permanently() {
+    use versionfs_core::metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
+    };
+
+    struct SnapshotLossAuthority {
+        inner: Arc<ToyKvMetadataAuthority>,
+        fail_scan: AtomicBool,
+    }
+
+    impl MetadataAuthority for SnapshotLossAuthority {
+        type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+        fn now(&self) -> MonotonicTime {
+            self.inner.now()
+        }
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+            self.inner.get(key)
+        }
+
+        fn transact<R, F>(&self, op: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
+        where
+            F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+        {
+            self.inner.transact(op, body)
+        }
+
+        fn reconcile_unknown(
+            &self,
+            op: MutationIdentity<'_>,
+        ) -> Result<ReconciledOutcome, MetadataError> {
+            self.inner.reconcile_unknown(op)
+        }
+
+        fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+            self.inner.snapshot()
+        }
+
+        fn scan_prefix(
+            &self,
+            snapshot: &Self::Snapshot,
+            prefix: &[u8],
+            cursor: Option<&MetadataCursor>,
+            limit: std::num::NonZeroUsize,
+        ) -> Result<MetadataPage, MetadataError> {
+            if self.fail_scan.load(Ordering::Acquire) {
+                return Err(MetadataError::Backend("snapshot lost".to_owned()));
+            }
+            self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+        }
+    }
+
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(80));
+    let principal = PrincipalId::from_bytes(id16(81));
+    let (_client, _main_branch, _boundary_id, _branch, _grant, _att) =
+        setup_workspace(&harness, ws, principal);
+
+    let wrapper = Arc::new(SnapshotLossAuthority {
+        inner: Arc::clone(&harness.authority),
+        fail_scan: AtomicBool::new(true),
+    });
+    let control = WorkspaceControl::new(
+        wrapper,
+        ws,
+        harness.object_store.scope_id(ws),
+        principal,
+        harness.incarnation,
+    );
+
+    let report_id = OperationId::from_bytes(id16(82));
+    let budget = GcReportBudget::default();
+    control.begin_gc_report_attempt(report_id, budget).unwrap();
+
+    // Snapshot loss during root scanning fails AND durably aborts report_id.
+    let err = control.seal_gc_report_roots(report_id, budget).unwrap_err();
+    assert!(matches!(
+        err,
+        versionfs_core::control::ControlError::Metadata(MetadataError::Backend(_))
+    ));
+
+    // Retrying with the same report_id remains permanently Aborted (never acquires a new snapshot).
+    let retry_err = control
+        .begin_gc_report_attempt(report_id, budget)
+        .unwrap_err();
+    assert!(matches!(
+        retry_err,
+        versionfs_core::control::ControlError::Aborted
+    ));
+}
+
+#[test]
+fn authority_restart_expires_details_via_unix_ms_and_preserves_summary() {
+    let dir = TempDir::new();
+    let meta_dir = dir.0.join("meta");
+    let obj_dir = dir.0.join("objects");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let clock = Arc::new(TestClock::new(1_000_000_000));
+    let authority = Arc::new(
+        ToyKvMetadataAuthority::open_with(
+            &meta_dir,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::new(NoFailures),
+        )
+        .unwrap(),
+    );
+    let incarnation1 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(90))).unwrap();
+    let object_store = Arc::new(DirectoryObjectStore::open(&obj_dir).unwrap());
+    let ws = WorkspaceId::from_bytes(id16(91));
+    let principal = PrincipalId::from_bytes(id16(92));
+
+    let control1 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        incarnation1,
+    );
+
+    // Put one orphan object and collect a report with detail_ttl_nanos = 0.
+    let orphan = encode_artifact_blob(b"restart-orphan").unwrap();
+    rt.block_on(object_store.put(ws, &orphan)).unwrap();
+
+    let report_id = OperationId::from_bytes(id16(93));
+    let summary = versionfs_service::gc_report::run_mark_only_report(
+        &control1,
+        &authority,
+        &object_store,
+        rt.handle(),
+        ws,
+        report_id,
+        GcReportBudget {
+            detail_ttl_nanos: 0,
+            ..GcReportBudget::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.candidate_page_count, 1);
+
+    // Simulate authority restart with a new OwnerIncarnation.
+    let incarnation2 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(94))).unwrap();
+    assert_ne!(incarnation1.as_u64(), incarnation2.as_u64());
+    let control2 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        incarnation2,
+    );
+
+    let err = control2
+        .get_gc_report(
+            report_id,
+            Some(0),
+            versionfs_service::gc_report::unix_ms_now(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        versionfs_core::control::ControlError::ReportExpired
+    ));
+
+    let (summary_only, page) = control2
+        .get_gc_report(report_id, None, versionfs_service::gc_report::unix_ms_now())
+        .unwrap();
+    assert_eq!(summary_only, summary);
+    assert!(page.is_none());
+}
+
+#[test]
+fn cow_shared_btree_subtrees_are_skipped_without_reloading() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use versionfs_core::gc::{DiskSpillVisitedSet, DiskSpillWorkQueue, mark_reachable_closure};
+
+    struct CountingStore<'a> {
+        inner: &'a SyncStore<'a>,
+        reads: Mutex<HashMap<ObjectId, usize>>,
+    }
+
+    impl MapObjectStore for CountingStore<'_> {
+        fn proof_scope(&self) -> ObjectStoreScopeId {
+            self.inner.proof_scope()
+        }
+
+        fn get(&self, id: ObjectId) -> Result<Option<Vec<u8>>, String> {
+            self.inner.get(id)
+        }
+
+        fn get_ref(&self, reference: ObjectRef) -> Result<Option<Vec<u8>>, String> {
+            *self
+                .reads
+                .lock()
+                .unwrap()
+                .entry(reference.object_id)
+                .or_insert(0) += 1;
+            self.inner.get_ref(reference)
+        }
+
+        fn put(&mut self, _id: ObjectId, _bytes: Vec<u8>) -> Result<(), String> {
+            Err("read-only".to_owned())
+        }
+    }
+
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(100));
+    let mut store = SyncStore {
+        rt: &harness.rt,
+        store: &harness.object_store,
+        ws,
+    };
+
+    // Build a multi-level VolumeExtentMap, then create a second root sharing most subtrees.
+    let mut vol = VolumeExtentMap::empty(
+        VolumeGeometry::new(64 * EXTENT_BYTES as u64).unwrap(),
+        &mut store,
+    )
+    .unwrap();
+    for idx in 0..40_u64 {
+        let ext =
+            encode_object(ObjectType::Extent, &vec![idx as u8; EXTENT_BYTES as usize]).unwrap();
+        let ext_ref = harness.put_obj(ws, &ext);
+        vol = vol.insert_extent(&mut store, idx, ext_ref).unwrap();
+    }
+    let r1 = vol.seal(&mut store).unwrap();
+
+    let extra_ext = encode_object(ObjectType::Extent, &[0x99_u8; EXTENT_BYTES as usize]).unwrap();
+    let extra_ref = harness.put_obj(ws, &extra_ext);
+    let vol2 = vol.insert_extent(&mut store, 40, extra_ref).unwrap();
+    let r2 = vol2.seal(&mut store).unwrap();
+
+    let spill_dir = TempDir::new();
+    let mut visited = DiskSpillVisitedSet::new(&spill_dir.0, 8).unwrap();
+    let mut queue = DiskSpillWorkQueue::new(&spill_dir.0, 8).unwrap();
+    queue.push(r1).unwrap();
+    queue.push(r2).unwrap();
+
+    let counting = CountingStore {
+        inner: &store,
+        reads: Mutex::new(HashMap::new()),
+    };
+    let stats = mark_reachable_closure(&counting, &mut queue, &mut visited).unwrap();
+    assert_eq!(stats.missing_or_corrupt_objects, 0);
+    assert!(visited.spill_run_count() > 0);
+
+    // Every object (including shared COW B-tree nodes) was fetched at most once.
+    for (obj_id, count) in counting.reads.lock().unwrap().iter() {
+        assert_eq!(*count, 1, "object {obj_id} was fetched {count} times");
+    }
+}

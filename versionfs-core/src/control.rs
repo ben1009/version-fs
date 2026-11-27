@@ -16,7 +16,10 @@ use crate::{
         MAX_PROVENANCE_CONTEXT_BYTES, MetadataRecordType, ObjectRef, ObjectType, ProvenanceBinding,
         decode_metadata_record, encode_metadata_record,
     },
-    gc::{GcCandidatePage, GcReportSummary, SealedRootSet},
+    gc::{
+        CANDIDATE_PERSIST_BATCH_PAGES, GcCandidatePage, GcReportBudget, GcReportSummary,
+        SEALED_ROOT_PAGE_SIZE, SealedRootHeader, SealedRootPage,
+    },
     graph::DependencyProof,
     identity::{
         AttachmentId, BranchId, GenerationId, ObjectId, ObjectStoreScopeId, OperationId, PinId,
@@ -83,6 +86,13 @@ const MAX_PROTECTED_DEPENDENCIES: usize = 1024;
 /// A durable authority-owner incarnation. Every owner restart advances it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct OwnerIncarnation(u64);
+
+impl OwnerIncarnation {
+    /// Returns the raw monotonic incarnation counter.
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 
 impl OwnerIncarnation {
     /// Reconstructs an incarnation from its durable fixed-width value.
@@ -3383,25 +3393,251 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
     }
 
-    /// Enumerates retained/protected roots and uncertain preparations from one
-    /// read-only authority snapshot, seals them for `report_id`, and drops the
-    /// snapshot before any object-store I/O.
+    /// Returns the authority owner incarnation configured on this control handle.
+    pub const fn owner_incarnation(&self) -> OwnerIncarnation {
+        self.owner_incarnation
+    }
+
+    /// Computes the canonical request fingerprint for a GC report attempt,
+    /// binding it to the caller principal and clamped budget.
+    pub fn gc_report_fingerprint(&self, budget: GcReportBudget) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(b"versionfs-gc-report-v1:");
+        h.update(self.principal_id.as_bytes());
+        h.update(budget.clamped_to_server_limits().encode());
+        h.finalize().into()
+    }
+
+    /// Admits or resumes a durable mark-only GC report attempt.
+    pub fn begin_gc_report_attempt(
+        &self,
+        report_id: OperationId,
+        budget: GcReportBudget,
+    ) -> Result<GcReportState, ControlError> {
+        let fp = self.gc_report_fingerprint(budget);
+        let state_key = gc_report_state_key(self.workspace_id, report_id);
+        let outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"admit");
+        let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+
+        if let Some(existing) = self.authority.get(&state_key)? {
+            let state = GcReportState::decode(&existing)
+                .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
+            return validate_gc_report_state(state, fp);
+        }
+
+        let committed = self.transact_with_outcome(&outcome_key, |txn| {
+            if let Some(existing) = txn.get(&state_key)? {
+                return Ok(existing);
+            }
+            let admitted = GcReportState::Admitted { fingerprint: fp };
+            let encoded = admitted.encode().map_err(to_metadata_error)?;
+            txn.put(&state_key, &encoded)?;
+            Ok(encoded)
+        });
+
+        let bytes = match committed {
+            Ok(bytes) => bytes,
+            Err(ControlError::Conflict) => {
+                let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+                self.authority
+                    .get(&state_key)?
+                    .ok_or_else(|| ControlError::CorruptRecord("missing gc report state".into()))?
+            }
+            Err(err) => return Err(err),
+        };
+        let state = GcReportState::decode(&bytes)
+            .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
+        validate_gc_report_state(state, fp)
+    }
+
+    fn abort_gc_report_attempt(
+        &self,
+        report_id: OperationId,
+        fingerprint: [u8; 32],
+        reason: &str,
+    ) -> Result<(), ControlError> {
+        let state_key = gc_report_state_key(self.workspace_id, report_id);
+        let outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"abort");
+        let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+        let aborted = GcReportState::Aborted {
+            fingerprint,
+            reason: reason.to_owned(),
+        }
+        .encode()?;
+        match self.transact_with_outcome(&outcome_key, |txn| {
+            if let Some(existing) = txn.get(&state_key)? {
+                let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
+                if !matches!(decoded, GcReportState::Admitted { .. }) {
+                    return Ok(existing);
+                }
+            }
+            txn.put(&state_key, &aborted)?;
+            Ok(aborted.clone())
+        }) {
+            Ok(_) | Err(ControlError::Conflict) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Copies and seals retained/live volume, log, artifact, and provenance roots
+    /// from one read-only authority snapshot, releases the snapshot before any
+    /// persistence or object-store I/O, and persists sealed roots in bounded pages.
     pub fn seal_gc_report_roots(
         &self,
         report_id: OperationId,
-        scan_page_size: usize,
-    ) -> Result<SealedRootSet, ControlError> {
-        let roots_key = gc_report_roots_key(self.workspace_id, report_id);
-        if let Some(existing) = self.authority.get(&roots_key)? {
-            return SealedRootSet::decode(&existing)
-                .map_err(|e| ControlError::CorruptRecord(e.to_string()));
+        budget: GcReportBudget,
+    ) -> Result<SealedRootHeader, ControlError> {
+        let fp = self.gc_report_fingerprint(budget);
+        let state_key = gc_report_state_key(self.workspace_id, report_id);
+        let seal_outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"seal");
+        let _ = reconcile_outcome(self.authority.as_ref(), &seal_outcome_key)?;
+
+        if let Some(existing) = self.authority.get(&state_key)? {
+            match GcReportState::decode(&existing)
+                .map_err(|e| ControlError::CorruptRecord(e.to_string()))?
+            {
+                GcReportState::Sealed {
+                    fingerprint,
+                    header,
+                } => {
+                    if fingerprint != fp {
+                        return Err(ControlError::OperationMismatch);
+                    }
+                    return Ok(header);
+                }
+                GcReportState::Completed { fingerprint, .. } => {
+                    if fingerprint != fp {
+                        return Err(ControlError::OperationMismatch);
+                    }
+                    return Err(ControlError::InvalidRequest(
+                        "gc report is already completed",
+                    ));
+                }
+                GcReportState::Aborted { .. } => return Err(ControlError::Aborted),
+                GcReportState::Admitted { fingerprint } => {
+                    if fingerprint != fp {
+                        return Err(ControlError::OperationMismatch);
+                    }
+                }
+            }
         }
 
+        let scan_page_size = budget.clamped_to_server_limits().scan_page_size;
         let page_limit = std::num::NonZeroUsize::new(scan_page_size.max(1)).ok_or(
             ControlError::InvalidRequest("scan_page_size must be nonzero"),
         )?;
         let snapshot = self.authority.snapshot()?;
         let boundary_time = self.authority.now();
+        let scan_result =
+            self.scan_sealed_roots_from_snapshot(&snapshot, boundary_time, page_limit);
+        // Release the read-only snapshot explicitly before any persistence or object I/O.
+        drop(snapshot);
+
+        let (mut roots, uncertain_preparations, missing_metadata) = match scan_result {
+            Ok(res) => res,
+            Err(err) => {
+                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                return Err(err);
+            }
+        };
+
+        roots.sort_by(|a, b| {
+            a.object_id
+                .as_bytes()
+                .cmp(b.object_id.as_bytes())
+                .then_with(|| (a.object_type as u16).cmp(&(b.object_type as u16)))
+        });
+        roots.dedup();
+
+        let total_roots = u64::try_from(roots.len()).unwrap_or(u64::MAX);
+        let chunks: Vec<SealedRootPage> = roots
+            .chunks(SEALED_ROOT_PAGE_SIZE)
+            .enumerate()
+            .map(|(idx, slice)| SealedRootPage {
+                page_index: u32::try_from(idx).unwrap_or(u32::MAX),
+                roots: slice.to_vec(),
+            })
+            .collect();
+        let root_page_count = u32::try_from(chunks.len()).unwrap_or(u32::MAX);
+
+        for (batch_idx, batch) in chunks.chunks(CANDIDATE_PERSIST_BATCH_PAGES).enumerate() {
+            let mut encoded_batch = Vec::with_capacity(batch.len());
+            for page in batch {
+                encoded_batch.push((page.page_index, page.encode()?));
+            }
+            let batch_outcome_key = gc_report_batch_outcome_key(
+                self.workspace_id,
+                report_id,
+                b"root-batch",
+                u32::try_from(batch_idx).unwrap_or(u32::MAX),
+            );
+            let _ = reconcile_outcome(self.authority.as_ref(), &batch_outcome_key)?;
+            match self.transact_with_outcome(&batch_outcome_key, |txn| {
+                for (page_idx, bytes) in &encoded_batch {
+                    let key = gc_report_root_page_key(self.workspace_id, report_id, *page_idx);
+                    if txn.get(&key)?.is_none() {
+                        txn.put(&key, bytes)?;
+                    }
+                }
+                Ok(Vec::new())
+            }) {
+                Ok(_) | Err(ControlError::Conflict) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let header = SealedRootHeader {
+            report_id,
+            boundary_time,
+            root_page_count,
+            total_roots,
+            uncertain_preparations,
+            missing_metadata,
+        };
+        let sealed_state = GcReportState::Sealed {
+            fingerprint: fp,
+            header,
+        }
+        .encode()?;
+        let committed = self.transact_with_outcome(&seal_outcome_key, |txn| {
+            if let Some(existing) = txn.get(&state_key)? {
+                match GcReportState::decode(&existing).map_err(to_metadata_error)? {
+                    GcReportState::Sealed { .. }
+                    | GcReportState::Completed { .. }
+                    | GcReportState::Aborted { .. } => return Ok(existing),
+                    GcReportState::Admitted { .. } => {}
+                }
+            }
+            txn.put(&state_key, &sealed_state)?;
+            Ok(sealed_state.clone())
+        });
+        let bytes = match committed {
+            Ok(bytes) => bytes,
+            Err(ControlError::Conflict) => {
+                let _ = reconcile_outcome(self.authority.as_ref(), &seal_outcome_key)?;
+                self.authority
+                    .get(&state_key)?
+                    .ok_or_else(|| ControlError::CorruptRecord("missing sealed report".into()))?
+            }
+            Err(err) => return Err(err),
+        };
+        match GcReportState::decode(&bytes)
+            .map_err(|e| ControlError::CorruptRecord(e.to_string()))?
+        {
+            GcReportState::Sealed { header, .. } => Ok(header),
+            GcReportState::Aborted { .. } => Err(ControlError::Aborted),
+            other => Err(ControlError::CorruptRecord(format!(
+                "unexpected state after seal: {other:?}"
+            ))),
+        }
+    }
+
+    fn scan_sealed_roots_from_snapshot(
+        &self,
+        snapshot: &A::Snapshot,
+        boundary_time: MonotonicTime,
+        page_limit: std::num::NonZeroUsize,
+    ) -> Result<(Vec<ObjectRef>, u64, u64), ControlError> {
         let mut roots = Vec::new();
         let mut uncertain_preparations = 0_u64;
         let mut missing_metadata = 0_u64;
@@ -3412,7 +3648,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         loop {
             let page =
                 self.authority
-                    .scan_prefix(&snapshot, &gen_prefix, cursor.as_ref(), page_limit)?;
+                    .scan_prefix(snapshot, &gen_prefix, cursor.as_ref(), page_limit)?;
             for (_, val) in page.entries {
                 match decode_generation(&val) {
                     Ok(gen_rec) => {
@@ -3435,7 +3671,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         loop {
             let page =
                 self.authority
-                    .scan_prefix(&snapshot, &br_prefix, cursor.as_ref(), page_limit)?;
+                    .scan_prefix(snapshot, &br_prefix, cursor.as_ref(), page_limit)?;
             for (_, val) in page.entries {
                 match decode_branch(&val) {
                     Ok(branch) => {
@@ -3470,7 +3706,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         loop {
             let page =
                 self.authority
-                    .scan_prefix(&snapshot, &prot_prefix, cursor.as_ref(), page_limit)?;
+                    .scan_prefix(snapshot, &prot_prefix, cursor.as_ref(), page_limit)?;
             for (_, val) in page.entries {
                 match decode_protection(&val) {
                     Ok(ProtectionRecord::LiveLogRead {
@@ -3515,7 +3751,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         loop {
             let page =
                 self.authority
-                    .scan_prefix(&snapshot, &op_prefix, cursor.as_ref(), page_limit)?;
+                    .scan_prefix(snapshot, &op_prefix, cursor.as_ref(), page_limit)?;
             for (key, val) in page.entries {
                 if key.len() != op_record_key_len {
                     continue;
@@ -3535,99 +3771,136 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             }
         }
 
-        // Release the read-only snapshot explicitly before any report persistence or object I/O.
-        drop(snapshot);
-
-        roots.sort_by(|a, b| {
-            a.object_id
-                .as_bytes()
-                .cmp(b.object_id.as_bytes())
-                .then_with(|| (a.object_type as u16).cmp(&(b.object_type as u16)))
-        });
-        roots.dedup();
-
-        let sealed = SealedRootSet {
-            report_id,
-            boundary_time,
-            roots,
-            uncertain_preparations,
-            missing_metadata,
-        };
-        let encoded = sealed.encode()?;
-        let outcome_key = gc_report_roots_outcome_key(self.workspace_id, report_id);
-        let mut op_id_bytes = Vec::from(b"gc-seal:".as_slice());
-        op_id_bytes.extend_from_slice(report_id.as_bytes());
-        let identity = MutationIdentity {
-            operation_id: &op_id_bytes,
-            outcome_key: &outcome_key,
-        };
-        let persisted = self.authority.transact(identity, |txn| {
-            if let Some(existing) = txn.get(&roots_key)? {
-                txn.put(&outcome_key, &existing)?;
-                return Ok(existing);
-            }
-            txn.put(&roots_key, &encoded)?;
-            txn.put(&outcome_key, &encoded)?;
-            Ok(encoded.clone())
-        })?;
-        SealedRootSet::decode(&persisted).map_err(|e| ControlError::CorruptRecord(e.to_string()))
+        Ok((roots, uncertain_preparations, missing_metadata))
     }
 
-    /// Persists the terminal summary and bounded candidate pages for a mark-only GC report.
-    pub fn persist_gc_report(
+    /// Reads one persisted sealed root page for `report_id`.
+    pub fn read_sealed_root_page(
         &self,
-        summary: &GcReportSummary,
+        report_id: OperationId,
+        page_index: u32,
+    ) -> Result<SealedRootPage, ControlError> {
+        let key = gc_report_root_page_key(self.workspace_id, report_id, page_index);
+        let bytes = self.authority.get(&key)?.ok_or(ControlError::NotFound)?;
+        SealedRootPage::decode(&bytes).map_err(|e| ControlError::CorruptRecord(e.to_string()))
+    }
+
+    /// Persists one bounded batch of candidate pages without holding the authority
+    /// commit gate across the entire report.
+    pub fn persist_gc_report_batch(
+        &self,
+        report_id: OperationId,
+        batch_index: u32,
         pages: &[GcCandidatePage],
     ) -> Result<(), ControlError> {
-        let sum_key = gc_report_summary_key(self.workspace_id, summary.report_id);
-        let sum_bytes = summary.encode();
-        let outcome_key = gc_report_persist_outcome_key(self.workspace_id, summary.report_id);
-        let mut op_id_bytes = Vec::from(b"gc-persist:".as_slice());
-        op_id_bytes.extend_from_slice(summary.report_id.as_bytes());
-        let identity = MutationIdentity {
-            operation_id: &op_id_bytes,
-            outcome_key: &outcome_key,
-        };
         let mut encoded_pages = Vec::with_capacity(pages.len());
         for page in pages {
             encoded_pages.push((page.page_index, page.encode()?));
         }
-        self.authority.transact(identity, |txn| {
-            if let Some(existing) = txn.get(&sum_key)? {
-                txn.put(&outcome_key, &existing)?;
-                return Ok(existing);
+        let outcome_key =
+            gc_report_batch_outcome_key(self.workspace_id, report_id, b"cand-batch", batch_index);
+        let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+        match self.transact_with_outcome(&outcome_key, |txn| {
+            for (idx, bytes) in &encoded_pages {
+                let pkey = gc_report_page_key(self.workspace_id, report_id, *idx);
+                if txn.get(&pkey)?.is_none() {
+                    txn.put(&pkey, bytes)?;
+                }
+            }
+            Ok(Vec::new())
+        }) {
+            Ok(_) | Err(ControlError::Conflict) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Atomically publishes the terminal [`GcReportSummary`] with first-writer-wins
+    /// idempotency, returning the authoritative summary persisted in metadata.
+    pub fn finalize_gc_report(
+        &self,
+        budget: GcReportBudget,
+        summary: &GcReportSummary,
+    ) -> Result<GcReportSummary, ControlError> {
+        let fp = self.gc_report_fingerprint(budget);
+        let state_key = gc_report_state_key(self.workspace_id, summary.report_id);
+        let sum_key = gc_report_summary_key(self.workspace_id, summary.report_id);
+        let outcome_key = gc_report_outcome_key(self.workspace_id, summary.report_id, b"finalize");
+        let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+
+        let sum_bytes = summary.encode();
+        let completed_bytes = GcReportState::Completed {
+            fingerprint: fp,
+            summary: summary.clone(),
+        }
+        .encode()?;
+
+        let committed = self.transact_with_outcome(&outcome_key, |txn| {
+            if let Some(existing_sum) = txn.get(&sum_key)? {
+                return Ok(existing_sum);
+            }
+            if let Some(existing_state) = txn.get(&state_key)? {
+                match GcReportState::decode(&existing_state).map_err(to_metadata_error)? {
+                    GcReportState::Completed { summary, .. } => return Ok(summary.encode()),
+                    GcReportState::Aborted { .. } => return Err(reject("aborted")),
+                    GcReportState::Admitted { .. } | GcReportState::Sealed { .. } => {}
+                }
             }
             txn.put(&sum_key, &sum_bytes)?;
-            for (idx, bytes) in &encoded_pages {
-                let pkey = gc_report_page_key(self.workspace_id, summary.report_id, *idx);
-                txn.put(&pkey, bytes)?;
-            }
-            txn.put(&outcome_key, &sum_bytes)?;
+            txn.put(&state_key, &completed_bytes)?;
             Ok(sum_bytes.clone())
-        })?;
-        Ok(())
+        });
+
+        let winning_bytes = match committed {
+            Ok(bytes) => bytes,
+            Err(ControlError::Conflict) => {
+                let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+                self.authority.get(&sum_key)?.ok_or_else(|| {
+                    ControlError::CorruptRecord("missing gc report summary".into())
+                })?
+            }
+            Err(err) => return Err(err),
+        };
+        GcReportSummary::decode(&winning_bytes)
+            .map_err(|e| ControlError::CorruptRecord(e.to_string()))
     }
 
     /// Reads a persisted mark-only GC report summary and optional candidate page.
     ///
     /// Terminal summary metadata remains readable after detail expiry; requesting a
-    /// candidate page past `detail_expires_at` returns [`ControlError::ReportExpired`].
+    /// candidate page past expiry returns [`ControlError::ReportExpired`].
+    /// Checks monotonic deadline within the same authority incarnation and
+    /// `detail_expires_at_unix_ms` across authority restarts.
     pub fn get_gc_report(
         &self,
         report_id: OperationId,
         page_index: Option<u32>,
+        current_unix_ms: u64,
     ) -> Result<(GcReportSummary, Option<GcCandidatePage>), ControlError> {
         let sum_key = gc_report_summary_key(self.workspace_id, report_id);
-        let sum_bytes = self
-            .authority
-            .get(&sum_key)?
-            .ok_or(ControlError::NotFound)?;
+        let sum_bytes = match self.authority.get(&sum_key) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Err(ControlError::NotFound),
+            Err(MetadataError::ReconciliationRequired { .. }) => {
+                let outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"finalize");
+                let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
+                self.authority
+                    .get(&sum_key)?
+                    .ok_or(ControlError::NotFound)?
+            }
+            Err(err) => return Err(map_metadata_error(err)),
+        };
         let summary = GcReportSummary::decode(&sum_bytes)
             .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
         let Some(idx) = page_index else {
             return Ok((summary, None));
         };
-        if self.authority.now() >= summary.detail_expires_at {
+        let expired = if summary.owner_incarnation_u64 == self.owner_incarnation.as_u64() {
+            self.authority.now() >= summary.detail_expires_at
+        } else {
+            summary.detail_expires_at_unix_ms == 0
+                || current_unix_ms >= summary.detail_expires_at_unix_ms
+        };
+        if expired {
             return Err(ControlError::ReportExpired);
         }
         let pkey = gc_report_page_key(self.workspace_id, report_id, idx);
@@ -5917,21 +6190,170 @@ fn protections_prefix(workspace: WorkspaceId) -> Vec<u8> {
 fn workspace_operations_prefix(workspace: WorkspaceId) -> Vec<u8> {
     [KEY_PREFIX, b"operation/", workspace.as_bytes()].concat()
 }
-fn gc_report_roots_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+/// Durable lifecycle state for a mark-only GC report attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GcReportState {
+    /// Report attempt was admitted; metadata snapshot has not been sealed yet.
+    Admitted {
+        /// Request fingerprint binding principal and clamped budget.
+        fingerprint: [u8; 32],
+    },
+    /// Authority snapshot roots were sealed and persisted in bounded pages.
+    Sealed {
+        /// Request fingerprint binding principal and clamped budget.
+        fingerprint: [u8; 32],
+        /// Sealed root header metadata.
+        header: SealedRootHeader,
+    },
+    /// Terminal summary was atomically published.
+    Completed {
+        /// Request fingerprint binding principal and clamped budget.
+        fingerprint: [u8; 32],
+        /// Winning terminal summary.
+        summary: GcReportSummary,
+    },
+    /// Report attempt failed/aborted (for example snapshot loss before sealing).
+    Aborted {
+        /// Request fingerprint binding principal and clamped budget.
+        fingerprint: [u8; 32],
+        /// Human-readable abort reason.
+        reason: String,
+    },
+}
+
+impl GcReportState {
+    fn encode(&self) -> Result<Vec<u8>, FormatError> {
+        let mut e = CanonicalEncoder::new();
+        match self {
+            Self::Admitted { fingerprint } => {
+                e.u8(1);
+                e.fixed(fingerprint);
+            }
+            Self::Sealed {
+                fingerprint,
+                header,
+            } => {
+                e.u8(2);
+                e.fixed(fingerprint);
+                e.bytes(&header.encode())?;
+            }
+            Self::Completed {
+                fingerprint,
+                summary,
+            } => {
+                e.u8(3);
+                e.fixed(fingerprint);
+                e.bytes(&summary.encode())?;
+            }
+            Self::Aborted {
+                fingerprint,
+                reason,
+            } => {
+                e.u8(4);
+                e.fixed(fingerprint);
+                e.bytes(reason.as_bytes())?;
+            }
+        }
+        Ok(e.finish())
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, FormatError> {
+        let mut d = CanonicalDecoder::new(bytes);
+        let state = match d.u8()? {
+            1 => Self::Admitted {
+                fingerprint: d.fixed()?,
+            },
+            2 => Self::Sealed {
+                fingerprint: d.fixed()?,
+                header: SealedRootHeader::decode(d.bytes(4096)?)?,
+            },
+            3 => Self::Completed {
+                fingerprint: d.fixed()?,
+                summary: GcReportSummary::decode(d.bytes(4096)?)?,
+            },
+            4 => {
+                let fingerprint = d.fixed()?;
+                let raw_reason = d.bytes(4096)?;
+                let reason = std::str::from_utf8(raw_reason)
+                    .map_err(|_| FormatError::InvalidEnvelope("invalid utf-8 in abort reason"))?
+                    .to_owned();
+                Self::Aborted {
+                    fingerprint,
+                    reason,
+                }
+            }
+            _ => return Err(FormatError::InvalidEnvelope("invalid gc report state tag")),
+        };
+        d.finish()?;
+        Ok(state)
+    }
+}
+
+fn validate_gc_report_state(
+    state: GcReportState,
+    expected_fp: [u8; 32],
+) -> Result<GcReportState, ControlError> {
+    let fp = match &state {
+        GcReportState::Admitted { fingerprint }
+        | GcReportState::Sealed { fingerprint, .. }
+        | GcReportState::Completed { fingerprint, .. }
+        | GcReportState::Aborted { fingerprint, .. } => *fingerprint,
+    };
+    if fp != expected_fp {
+        return Err(ControlError::OperationMismatch);
+    }
+    if matches!(state, GcReportState::Aborted { .. }) {
+        return Err(ControlError::Aborted);
+    }
+    Ok(state)
+}
+
+fn gc_report_state_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
     [
         KEY_PREFIX,
-        b"gc-report/roots/",
+        b"gc-report/state/",
         workspace.as_bytes(),
         report_id.as_bytes(),
     ]
     .concat()
 }
-fn gc_report_roots_outcome_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+fn gc_report_outcome_key(workspace: WorkspaceId, report_id: OperationId, tag: &[u8]) -> Vec<u8> {
     [
         KEY_PREFIX,
-        b"gc-report/roots-outcome/",
+        b"gc-report/outcome/",
         workspace.as_bytes(),
         report_id.as_bytes(),
+        tag,
+    ]
+    .concat()
+}
+fn gc_report_batch_outcome_key(
+    workspace: WorkspaceId,
+    report_id: OperationId,
+    tag: &[u8],
+    batch_index: u32,
+) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/batch-outcome/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+        tag,
+        &batch_index.to_be_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_root_page_key(
+    workspace: WorkspaceId,
+    report_id: OperationId,
+    page_index: u32,
+) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/root-page/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+        &page_index.to_be_bytes(),
     ]
     .concat()
 }
@@ -5939,15 +6361,6 @@ fn gc_report_summary_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<
     [
         KEY_PREFIX,
         b"gc-report/summary/",
-        workspace.as_bytes(),
-        report_id.as_bytes(),
-    ]
-    .concat()
-}
-fn gc_report_persist_outcome_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
-    [
-        KEY_PREFIX,
-        b"gc-report/persist-outcome/",
         workspace.as_bytes(),
         report_id.as_bytes(),
     ]

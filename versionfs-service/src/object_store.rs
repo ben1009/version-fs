@@ -441,7 +441,10 @@ impl ObjectStore for DirectoryObjectStore {
             }
         };
 
-        let mut items: Vec<(String, InventoryEntry)> = Vec::new();
+        let cursor_token = cursor.map(|c| c.backend_token.as_str());
+        let cursor_type = cursor_token.and_then(|t| t.split('/').next());
+
+        let mut type_dirs_sorted: Vec<(String, std::path::PathBuf)> = Vec::new();
         for type_dir_res in type_dirs {
             let type_dir = type_dir_res.map_err(|err| {
                 ObjectStoreError::Backend(format!(
@@ -469,17 +472,36 @@ impl ObjectStore for DirectoryObjectStore {
                     type_dir.path().display().to_string(),
                 ));
             }
-            let obj_entries = std::fs::read_dir(type_dir.path()).map_err(|err| {
+            if cursor_type.is_some_and(|ct| type_str < ct) {
+                continue;
+            }
+            type_dirs_sorted.push((type_str.to_owned(), type_dir.path()));
+        }
+        type_dirs_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Maintain a bounded sorted window of at most `limit + 1` smallest tokens
+        // strictly greater than `cursor_token` so memory stays O(limit).
+        let mut bounded: std::collections::BTreeMap<String, InventoryEntry> =
+            std::collections::BTreeMap::new();
+        for (type_str, type_path) in type_dirs_sorted {
+            if bounded.len() > limit
+                && let Some(max_kept) = bounded.keys().next_back()
+                && let Some(max_type) = max_kept.split('/').next()
+                && type_str.as_str() > max_type
+            {
+                break;
+            }
+            let obj_entries = std::fs::read_dir(&type_path).map_err(|err| {
                 ObjectStoreError::Backend(format!(
                     "read object type dir {}: {err}",
-                    type_dir.path().display()
+                    type_path.display()
                 ))
             })?;
             for obj_entry_res in obj_entries {
                 let obj_entry = obj_entry_res.map_err(|err| {
                     ObjectStoreError::Backend(format!(
                         "read object entry in {}: {err}",
-                        type_dir.path().display()
+                        type_path.display()
                     ))
                 })?;
                 let obj_name = obj_entry.file_name();
@@ -502,30 +524,35 @@ impl ObjectStore for DirectoryObjectStore {
                     return Err(ObjectStoreError::InvalidInventoryEntry(raw_path));
                 }
                 let entry =
-                    parse_inventory_components(type_str, digest_str, metadata.len(), &raw_path)?;
+                    parse_inventory_components(&type_str, digest_str, metadata.len(), &raw_path)?;
                 let token = format!("{type_str}/{digest_str}");
-                items.push((token, entry));
+                if cursor_token.is_some_and(|ct| token.as_str() <= ct) {
+                    continue;
+                }
+                bounded.insert(token, entry);
+                if bounded.len() > limit + 1 {
+                    let _ = bounded.pop_last();
+                }
             }
         }
 
-        items.sort_by(|a, b| a.0.cmp(&b.0));
-        if let Some(cursor) = cursor {
-            items.retain(|(token, _)| token.as_str() > cursor.backend_token.as_str());
+        let has_more = bounded.len() > limit;
+        let mut entries = Vec::with_capacity(limit.min(bounded.len()));
+        let mut last_token = None;
+        for (token, entry) in bounded.into_iter().take(limit) {
+            last_token = Some(token);
+            entries.push(entry);
         }
-
-        let has_more = items.len() > limit;
-        items.truncate(limit);
         let next_cursor = if has_more {
-            items.last().map(|(token, _)| InventoryCursor {
+            last_token.map(|backend_token| InventoryCursor {
                 workspace_id,
                 deployment_prefix: String::new(),
                 backend_namespace: self.namespace.clone(),
-                backend_token: token.clone(),
+                backend_token,
             })
         } else {
             None
         };
-        let entries = items.into_iter().map(|(_, entry)| entry).collect();
         Ok(InventoryPage {
             entries,
             next_cursor,
