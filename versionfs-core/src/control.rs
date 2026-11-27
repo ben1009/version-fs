@@ -3914,14 +3914,26 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 match decode_branch(&val) {
                     Ok(branch) => {
                         if !branch.deleted {
-                            if self
-                                .snapshot_get(
-                                    snapshot,
-                                    &generation_key(self.workspace_id, branch.head),
-                                )?
-                                .is_none()
-                            {
-                                missing_metadata = missing_metadata.saturating_add(1);
+                            match self.snapshot_get(
+                                snapshot,
+                                &generation_key(self.workspace_id, branch.head),
+                            )? {
+                                Some(gen_bytes) => match decode_generation(&gen_bytes) {
+                                    Ok(head_gen) => {
+                                        if head_gen.seed.generation_id != branch.head
+                                            || head_gen.branch_refs == 0
+                                        {
+                                            missing_metadata = missing_metadata.saturating_add(1);
+                                        }
+                                        roots.push(head_gen.seed.descriptor);
+                                    }
+                                    Err(_) => {
+                                        missing_metadata = missing_metadata.saturating_add(1);
+                                    }
+                                },
+                                None => {
+                                    missing_metadata = missing_metadata.saturating_add(1);
+                                }
                             }
                             roots.push(branch.volume_root);
                             roots.push(branch.logs_root);
