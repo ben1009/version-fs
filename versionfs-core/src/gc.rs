@@ -441,7 +441,7 @@ pub struct DiskSpillVisitedSet {
 impl DiskSpillVisitedSet {
     /// Creates a bounded visited set spilling to `spill_dir` once `max_in_memory`
     /// distinct IDs are held in RAM, capped by [`SERVER_MAX_SPILL_BYTES`] on disk
-    /// and [`MAX_OPEN_SPILL_FDS`] open file descriptors.
+    /// and a bounded pool of open file descriptors.
     pub fn new(spill_dir: impl Into<PathBuf>, max_in_memory: usize) -> Result<Self, GcError> {
         let spill_dir = spill_dir.into();
         std::fs::create_dir_all(&spill_dir)?;
