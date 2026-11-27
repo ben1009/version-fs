@@ -50,11 +50,15 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new() -> Self {
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let path = std::env::temp_dir().join(format!(
-            "versionfs-fault-campaigns-{}-{id}",
+            "versionfs-fault-campaigns-{}-{nanos}-{id}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
