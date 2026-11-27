@@ -3851,6 +3851,21 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
     }
 
+    fn snapshot_get(
+        &self,
+        snapshot: &A::Snapshot,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, MetadataError> {
+        let page = self
+            .authority
+            .scan_prefix(snapshot, key, None, std::num::NonZeroUsize::MIN)?;
+        Ok(page
+            .entries
+            .into_iter()
+            .find(|(k, _)| k.as_slice() == key)
+            .map(|(_, v)| v))
+    }
+
     fn scan_sealed_roots_from_snapshot(
         &self,
         snapshot: &A::Snapshot,
@@ -3860,6 +3875,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let mut roots = Vec::new();
         let mut uncertain_preparations = 0_u64;
         let mut missing_metadata = 0_u64;
+        let current_owner = self
+            .snapshot_get(snapshot, &owner_incarnation_key())?
+            .map(|bytes| decode_owner(&bytes).map(OwnerIncarnation))
+            .transpose()?;
 
         // 1. Retained/eligible Generations.
         let gen_prefix = generations_prefix(self.workspace_id);
@@ -3895,6 +3914,15 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 match decode_branch(&val) {
                     Ok(branch) => {
                         if !branch.deleted {
+                            if self
+                                .snapshot_get(
+                                    snapshot,
+                                    &generation_key(self.workspace_id, branch.head),
+                                )?
+                                .is_none()
+                            {
+                                missing_metadata = missing_metadata.saturating_add(1);
+                            }
                             roots.push(branch.volume_root);
                             roots.push(branch.logs_root);
                             roots.push(branch.artifacts_root);
@@ -3929,24 +3957,35 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             for (_, val) in page.entries {
                 match decode_protection(&val) {
                     Ok(ProtectionRecord::LiveLogRead {
-                        root, expires_at, ..
-                    }) if expires_at > boundary_time => {
+                        root,
+                        owner_incarnation,
+                        expires_at,
+                        ..
+                    }) if expires_at > boundary_time
+                        && current_owner == Some(owner_incarnation) =>
+                    {
                         roots.push(root);
                     }
                     Ok(ProtectionRecord::AttachmentBase {
                         roots: att_roots,
+                        owner_incarnation,
                         expires_at,
                         ..
-                    }) if expires_at > boundary_time => {
+                    }) if expires_at > boundary_time
+                        && current_owner == Some(owner_incarnation) =>
+                    {
                         roots.push(att_roots.volume);
                         roots.push(att_roots.logs);
                         roots.push(att_roots.artifacts);
                     }
                     Ok(ProtectionRecord::Preparation {
                         dependencies,
+                        owner_incarnation,
                         expires_at,
                         ..
-                    }) if expires_at > boundary_time => {
+                    }) if expires_at > boundary_time
+                        && current_owner == Some(owner_incarnation) =>
+                    {
                         roots.extend_from_slice(&dependencies);
                     }
                     Ok(ProtectionRecord::GenerationRead { .. })

@@ -1701,3 +1701,121 @@ fn cross_owner_abort_propagates_conflict_and_fences_stale_owner() {
     let (read_sum, _) = ctrl3.get_gc_report(report2, None, 0).unwrap();
     assert_eq!(read_sum, summary);
 }
+
+#[test]
+fn sealed_root_scan_excludes_fenced_protections_and_flags_missing_branch_head_generation() {
+    use versionfs_core::metadata::{MetadataAuthority, MutationIdentity};
+
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(180));
+    let principal = PrincipalId::from_bytes(id16(181));
+    let (_client, main_branch, _boundary_id, branch, grant, att) =
+        setup_workspace(&harness, ws, principal);
+
+    let ctrl1 = WorkspaceControl::new(
+        Arc::clone(&harness.authority),
+        ws,
+        harness.object_store.scope_id(ws),
+        principal,
+        harness.incarnation,
+    );
+
+    // Create a Preparation protection under inc1 with a distinct dependency root.
+    let dep_root = ObjectRef {
+        object_type: ObjectType::Extent,
+        object_id: ObjectId::from_bytes([195; 32]),
+        encoded_len: 64,
+    };
+    ctrl1
+        .begin_preparation(PreparationRequest {
+            operation_id: OperationId::from_bytes(id16(196)),
+            branch_id: main_branch,
+            expected_revision: branch.revision,
+            grant,
+            attachment_id: att.attachment_id,
+            volume_epoch: att.volume_epoch,
+            protection_id: ProtectionId::from_bytes(id16(197)),
+            kind: PreparationKind::VolumeBarrier,
+            expected_roots: Some(versionfs_core::control::LiveRoots {
+                volume: branch.volume_root,
+                logs: branch.logs_root,
+                artifacts: branch.artifacts_root,
+            }),
+            dependencies: vec![dep_root],
+        })
+        .unwrap();
+
+    let budget = GcReportBudget::default();
+    // Under inc1, the unexpired Preparation protection keeps `dep_root` in the sealed roots.
+    let report1 = OperationId::from_bytes(id16(198));
+    let attempt1 = OperationId::from_bytes(id16(199));
+    ctrl1
+        .begin_gc_report_attempt(report1, attempt1, budget)
+        .unwrap();
+    let (_, header1) = ctrl1
+        .seal_gc_report_roots(report1, attempt1, budget)
+        .unwrap();
+    assert_eq!(header1.missing_metadata, 0);
+    let page1 = ctrl1.read_sealed_root_page(report1, attempt1, 0).unwrap();
+    assert!(page1.roots.contains(&dep_root));
+
+    // Rotate owner incarnation to inc2: the inc1 Preparation protection is now fenced and must be
+    // excluded from the sealed root scan even though its deadline is unexpired.
+    let inc2 = start_authority_owner(
+        harness.authority.as_ref(),
+        OperationId::from_bytes(id16(200)),
+    )
+    .unwrap();
+    let ctrl2 = WorkspaceControl::new(
+        Arc::clone(&harness.authority),
+        ws,
+        harness.object_store.scope_id(ws),
+        principal,
+        inc2,
+    );
+    let report2 = OperationId::from_bytes(id16(201));
+    let attempt2 = OperationId::from_bytes(id16(202));
+    ctrl2
+        .begin_gc_report_attempt(report2, attempt2, budget)
+        .unwrap();
+    let (_, header2) = ctrl2
+        .seal_gc_report_roots(report2, attempt2, budget)
+        .unwrap();
+    assert_eq!(header2.missing_metadata, 0);
+    let page2 = ctrl2.read_sealed_root_page(report2, attempt2, 0).unwrap();
+    assert!(!page2.roots.contains(&dep_root));
+
+    // Delete the branch's head Generation record; the sealed root scan must count it as
+    // missing_metadata so the report cannot falsely claim Complete.
+    let gen_key = [
+        b"\x01versionfs\x00\x01".as_slice(),
+        b"generation/".as_slice(),
+        ws.as_bytes().as_slice(),
+        branch.head.as_bytes().as_slice(),
+    ]
+    .concat();
+    harness
+        .authority
+        .transact(
+            MutationIdentity {
+                operation_id: b"test_delete_gen",
+                outcome_key: b"test_delete_gen_outcome",
+            },
+            |txn| {
+                txn.delete(&gen_key)?;
+                txn.put(b"test_delete_gen_outcome", b"ok")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    let report3 = OperationId::from_bytes(id16(203));
+    let attempt3 = OperationId::from_bytes(id16(204));
+    ctrl2
+        .begin_gc_report_attempt(report3, attempt3, budget)
+        .unwrap();
+    let (_, header3) = ctrl2
+        .seal_gc_report_roots(report3, attempt3, budget)
+        .unwrap();
+    assert_eq!(header3.missing_metadata, 1);
+}
