@@ -34,7 +34,7 @@ use versionfs_sdk::{
     barrier::{DurableVolume, FileBarrierJournal, initialize_empty_workspace},
     capture::{
         BlockCutOnlyBoundary, CaptureConfig, CaptureJournal, CheckpointCoordinator,
-        CheckpointRequest, FileCaptureJournal, FilesystemBoundary, NoopProducerGate,
+        CheckpointRequest, FileCaptureJournal, FilesystemBoundary, NoopProducerGate, ProducerGate,
     },
     volume::{BlockDevice, BlockError, BlockRequest, BlockResponse},
 };
@@ -610,11 +610,10 @@ fn campaign_worker_loss_recovers_flush_and_fua_and_child_barrier_survives_parent
 }
 
 // Campaign 2 (RFC-002 16.2):
-// Pause/fail an extent upload *after* committing the extent object
-// (`ObjectUploadAfterCommitBeforeReply`), attempt to overwrite the same offset, and verify the
-// sealed cut remains uncontaminated on fresh recovery.
+// Upload lost reply (`ObjectUploadAfterCommitBeforeReply`) after committing Extent 0 blocks
+// overtaking writes (`PendingBarrier`), and retry completes the uncontaminated sealed cut.
 #[test]
-fn campaign_paused_upload_overwrite_does_not_contaminate_sealed_cut() {
+fn campaign_upload_lost_reply_blocks_overtaking_write_without_contaminating_cut() {
     let mut env = CampaignEnv::new(40);
     let mut vol = env.open_volume("worker-a", 4 * EXTENT_BYTES as usize);
 
@@ -666,6 +665,26 @@ fn campaign_paused_upload_overwrite_does_not_contaminate_sealed_cut() {
 // Generation immutability against journal-replay writes, and all three CaptureMode boundaries.
 #[test]
 fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_capture_modes() {
+    #[derive(Default)]
+    struct TrackingProducerGate {
+        reopened: usize,
+    }
+
+    impl ProducerGate for TrackingProducerGate {
+        fn close_admission(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn drain_producers(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reopen_admission(&mut self) -> Result<(), String> {
+            self.reopened += 1;
+            Ok(())
+        }
+    }
+
     let mut env = CampaignEnv::new(60);
     let initial_branch = env.control().get_branch(env.branch_id).unwrap();
     let initial_gen_id = initial_branch.head;
@@ -679,7 +698,7 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
     .unwrap();
 
     let mut coord = env.coordinator("worker-a");
-    let mut producers = NoopProducerGate;
+    let mut producers = TrackingProducerGate::default();
     let mut boundary = ScriptedBoundary::frozen(Some((4096, vec![0x7B; 4096])));
 
     // Arm AuthorityAfterCommitBeforeReply on the GenerationDescriptor upload so `publish_capture`
@@ -698,10 +717,12 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
         )
         .expect_err("lost publish_capture reply must surface error before thaw");
     assert!(boundary.frozen);
+    let reopened_before_recovery = producers.reopened;
 
     // Truly destroy old worker, coordinator, and authority handles before reopening from WAL.
     drop(vol);
     drop(coord);
+    let old_owner = env.owner;
     let pending_capture = FileCaptureJournal::open(env.dir.0.join("capture-worker-a"))
         .unwrap()
         .load_pending()
@@ -714,7 +735,7 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
         env.ws,
         env.store.proof_scope(),
         env.principal,
-        OwnerIncarnation::from_u64(1),
+        old_owner,
     );
     assert!(matches!(
         stale_ctrl.acquire_writer(OperationId::from_bytes(id16(210)), env.branch_id, 1, 1,),
@@ -722,10 +743,26 @@ fn campaign_authority_restart_around_commit_reconciles_and_persists_exact_captur
     ));
     drop(stale_ctrl);
 
-    // Verify exact committed outcome and Generation identity on the reopened authority.
+    // Reopen the old coordinator's capture journal and run detached recovery to reconcile the
+    // committed publication, thaw the boundary, and reopen producer admission without duplicating
+    // publication.
     let ctrl = env.control();
     let op_state = ctrl.get_operation(pending_capture.capture_id).unwrap();
     assert!(matches!(op_state, OperationState::Committed(_)));
+    let mut recovery_coord = CheckpointCoordinator::new(
+        FileCaptureJournal::open(env.dir.0.join("capture-worker-a")).unwrap(),
+        CaptureConfig::default(),
+    );
+    recovery_coord
+        .recover_pending_capture_detached(&ctrl, &mut producers, &mut boundary)
+        .unwrap();
+    assert!(!boundary.frozen);
+    assert!(producers.reopened > reopened_before_recovery);
+    assert!(recovery_coord.pending_capture().unwrap().is_none());
+    assert_eq!(
+        ctrl.get_operation(pending_capture.capture_id).unwrap(),
+        op_state
+    );
     let branch_after = ctrl.get_branch(env.branch_id).unwrap();
     assert_eq!(branch_after.head, pending_capture.generation_id);
     assert_ne!(branch_after.head, initial_gen_id);
@@ -944,7 +981,7 @@ fn campaign_slow_preparation_renewals_idempotent_replay_and_expiry_rejection() {
 
 // Campaign 5 (RFC-002 16.2):
 // Absent-operation abort tombstone wins against delayed execution; committed operation cannot be
-// undone by abort and still resolves to its exact original result after head movement, branch
+// undone by abort and still resolves to its exact original result after branch creation,
 // deletion, and name reuse.
 #[test]
 fn campaign_abort_tombstone_wins_absent_op_while_committed_op_survives_abort_and_name_reuse() {
@@ -998,7 +1035,7 @@ fn campaign_abort_tombstone_wins_absent_op_while_committed_op_survives_abort_and
     let abort_state = ctrl.abort_operation(committed_op).unwrap();
     assert_eq!(abort_state, original_op_state);
 
-    // 3. Move head (via another branch), detach & delete `"main"`, then recreate `"main"` with
+    // 3. Create another branch, detach & delete `"main"`, then recreate `"main"` with
     // a new BranchId: original committed operation still resolves to its exact original result.
     let alt_branch = BranchId::from_bytes(id16(164));
     ctrl.create_branch(
@@ -1106,6 +1143,7 @@ fn campaign_corrupt_objects_and_provenance_integrity_fail_explicitly_without_zer
         extent_path.exists(),
         "extent object file must exist on disk"
     );
+    let original_extent_bytes = std::fs::read(&extent_path).unwrap();
     std::fs::write(&extent_path, b"corrupt-extent").unwrap();
 
     drop(vol);
@@ -1120,7 +1158,9 @@ fn campaign_corrupt_objects_and_provenance_integrity_fail_explicitly_without_zer
         "corrupt allocated extent must fail read instead of returning zeros"
     );
 
-    // Corrupting the Generation descriptor object on disk must fail verify_generation explicitly.
+    // Restore the valid extent object before corrupting the Generation descriptor so the two
+    // corruption checks are isolated.
+    std::fs::write(&extent_path, &original_extent_bytes).unwrap();
     let desc_path = dir_object_path(&env.obj_dir, env.ws, gen_rec.descriptor);
     assert!(desc_path.exists(), "descriptor file must exist on disk");
     std::fs::write(&desc_path, b"corrupt-descriptor").unwrap();
