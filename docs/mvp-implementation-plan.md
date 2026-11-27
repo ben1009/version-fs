@@ -465,6 +465,10 @@ runs remain in P12.
 
 ### P12. Benchmarks and operator handoff
 
+- [ ] Complete remaining real-environment and race gates deferred from P11:
+  real Linux `ublk`/`ext4`/`fsfreeze` kernel-emulation campaigns, real-S3 outage
+  runs, full disk/cache/queue capacity exhaustion, and concurrent report-vs-pin/reader
+  race integration.
 - [ ] Run all real ublk/ext4/S3/toy-kv scenarios from RFC-002 Section 14.3,
   including sparse/populated capacity, random/sequential I/O, the million-file
   filesystem fixture, 100 GiB content, barriers, history/fan-out, and native logs.
