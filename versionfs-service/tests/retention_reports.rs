@@ -1612,4 +1612,88 @@ fn cross_owner_abort_propagates_conflict_and_fences_stale_owner() {
         stale_err,
         versionfs_core::control::ControlError::Fenced
     ));
+
+    // Stale Owner 1 creating a new report must be fenced.
+    let new_report = OperationId::from_bytes(id16(157));
+    let new_err = ctrl1
+        .begin_gc_report_attempt(new_report, OperationId::from_bytes(id16(158)), budget)
+        .unwrap_err();
+    assert!(matches!(
+        new_err,
+        versionfs_core::control::ControlError::Fenced
+    ));
+
+    // Stale Owner 1 sealing its old attempt1 after Owner 2 started must be fenced.
+    let seal_err = ctrl1
+        .seal_gc_report_roots(report_id, attempt1, budget)
+        .unwrap_err();
+    assert!(matches!(
+        seal_err,
+        versionfs_core::control::ControlError::Fenced
+    ));
+
+    // Owner 2 creates and seals report2; stale Owner 1 attempting to finalize it must be fenced,
+    // while Owner 2 can finalize it and read the terminal summary.
+    let report2 = OperationId::from_bytes(id16(159));
+    let attempt2 = OperationId::from_bytes(id16(160));
+    let ctrl2_real = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc2,
+    );
+    ctrl2_real
+        .begin_gc_report_attempt(report2, attempt2, budget)
+        .unwrap();
+    let (sealed_attempt, header) = ctrl2_real
+        .seal_gc_report_roots(report2, attempt2, budget)
+        .unwrap();
+    assert_eq!(sealed_attempt, attempt2);
+
+    let inv_attempt = OperationId::from_bytes(id16(161));
+    let summary = versionfs_core::gc::GcReportSummary {
+        report_id: report2,
+        boundary_time: header.boundary_time,
+        sealed_root_count: header.total_roots,
+        marked_objects: 0,
+        observed_objects: 0,
+        observed_bytes: 0,
+        unreachable_objects: 0,
+        unreachable_bytes: 0,
+        candidate_page_count: 0,
+        inventory_started_unix_ms: 1,
+        inventory_finished_unix_ms: 2,
+        detail_expires_at: clock.now().saturating_add_nanos(1_000_000),
+        detail_expires_at_unix_ms: u64::MAX,
+        owner_incarnation_u64: inc2.as_u64(),
+        completeness: GcReportCompleteness::Complete,
+    };
+
+    let fin_err = ctrl1
+        .finalize_gc_report(budget, inv_attempt, &summary)
+        .unwrap_err();
+    assert!(matches!(
+        fin_err,
+        versionfs_core::control::ControlError::Fenced
+    ));
+
+    // Owner 2 finalizes report2 cleanly, and a subsequent Owner 3 can still read the terminal
+    // summary.
+    let published = ctrl2_real
+        .finalize_gc_report(budget, inv_attempt, &summary)
+        .unwrap();
+    assert_eq!(published, summary);
+
+    let inc3 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(162))).unwrap();
+    let ctrl3 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc3,
+    );
+    let (read_sum, _) = ctrl3.get_gc_report(report2, None, 0).unwrap();
+    assert_eq!(read_sum, summary);
 }

@@ -3455,6 +3455,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
         .encode()?;
         let committed = self.transact_with_outcome(&outcome_key, |txn| {
+            self.require_current_owner(txn)?;
             if let Some(existing) = txn.get(&state_key)? {
                 let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
                 if !matches!(decoded, GcReportState::Admitted { .. }) {
@@ -3570,12 +3571,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let mut last_err = None;
         for _ in 0..4 {
             match self.transact_with_outcome(&outcome_key, |txn| {
-                if let Some(owner_bytes) = txn.get(&owner_incarnation_key())? {
-                    let current_owner = decode_owner(&owner_bytes).map_err(to_metadata_error)?;
-                    if current_owner != self.owner_incarnation.0 {
-                        return Err(reject("fenced"));
-                    }
-                }
+                self.require_current_owner(txn)?;
                 if let Some(existing) = txn.get(&state_key)? {
                     let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
                     match &decoded {
@@ -3797,13 +3793,27 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
         .encode()?;
         let committed = self.transact_with_outcome(&seal_outcome_key, |txn| {
-            if let Some(existing) = txn.get(&state_key)? {
-                match GcReportState::decode(&existing).map_err(to_metadata_error)? {
-                    GcReportState::Sealed { .. }
-                    | GcReportState::Completed { .. }
-                    | GcReportState::Aborted { .. } => return Ok(existing),
-                    GcReportState::Admitted { .. } | GcReportState::Sealing { .. } => {}
+            self.require_current_owner(txn)?;
+            let existing = txn
+                .get(&state_key)?
+                .ok_or_else(|| reject("invalid_transition"))?;
+            match GcReportState::decode(&existing).map_err(to_metadata_error)? {
+                GcReportState::Sealed { .. }
+                | GcReportState::Completed { .. }
+                | GcReportState::Aborted { .. } => return Ok(existing),
+                GcReportState::Sealing {
+                    fingerprint,
+                    owner_incarnation_u64,
+                    root_attempt_id: cur_attempt,
+                } => {
+                    if owner_incarnation_u64 != self.owner_incarnation.0 {
+                        return Err(reject("fenced"));
+                    }
+                    if fingerprint != fp || cur_attempt != root_attempt_id {
+                        return Err(reject("conflict"));
+                    }
                 }
+                GcReportState::Admitted { .. } => return Err(reject("invalid_transition")),
             }
             txn.put(&state_key, &sealed_state)?;
             Ok(sealed_state.clone())
@@ -4028,6 +4038,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         let mut last_err = None;
         for _ in 0..4 {
             match self.transact_with_outcome(outcome_key, |txn| {
+                self.require_current_owner(txn)?;
                 for (key, bytes) in entries {
                     txn.put(key, bytes)?;
                 }
@@ -4078,6 +4089,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             if let Some(existing_sum) = txn.get(&sum_key)? {
                 return Ok(existing_sum);
             }
+            self.require_current_owner(txn)?;
             if let Some(existing_state) = txn.get(&state_key)? {
                 match GcReportState::decode(&existing_state).map_err(to_metadata_error)? {
                     GcReportState::Completed { summary, .. } => return Ok(summary.encode()),
