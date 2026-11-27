@@ -1131,3 +1131,227 @@ fn cow_shared_btree_subtrees_are_skipped_without_reloading() {
         assert_eq!(*count, 1, "object {obj_id} was fetched {count} times");
     }
 }
+
+#[test]
+fn same_owner_dead_sealing_executor_aborts_without_hanging_in_progress() {
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(120));
+    let principal = PrincipalId::from_bytes(id16(121));
+    let (_client, _main_branch, _boundary_id, _branch, _grant, _att) =
+        setup_workspace(&harness, ws, principal);
+
+    let control = WorkspaceControl::new(
+        Arc::clone(&harness.authority),
+        ws,
+        harness.object_store.scope_id(ws),
+        principal,
+        harness.incarnation,
+    );
+    let report_id = OperationId::from_bytes(id16(122));
+    let budget = GcReportBudget::default();
+
+    // Admit + enter Sealing as if an earlier in-process executor crashed/errored
+    // right after Sealing committed (same owner incarnation, no active sealer).
+    let dead_attempt = OperationId::from_bytes(id16(123));
+    let state = control
+        .begin_gc_report_attempt(report_id, dead_attempt, budget)
+        .unwrap();
+    assert!(matches!(
+        state,
+        versionfs_core::control::GcReportState::Sealing { .. }
+    ));
+
+    // Retrying under the SAME owner incarnation must immediately detect the dead
+    // executor and abort rather than hanging 5s or returning InProgress.
+    let err = versionfs_service::gc_report::run_mark_only_report(
+        &control,
+        &harness.authority,
+        &harness.object_store,
+        harness.rt.handle(),
+        ws,
+        report_id,
+        budget,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        versionfs_service::gc_report::GcReportError::Control(
+            versionfs_core::control::ControlError::Aborted
+        )
+    ));
+}
+
+#[test]
+fn batch_conflict_retries_until_durable_and_finalize_requires_sealed() {
+    use versionfs_core::gc::GcCandidatePage;
+    use versionfs_core::metadata::{
+        MetadataAuthority, MetadataCursor, MetadataError, MetadataPage, MetadataTxn,
+        MutationIdentity, ReconciledOutcome,
+    };
+
+    struct OneConflictAuthority {
+        inner: Arc<ToyKvMetadataAuthority>,
+        inject_conflict: AtomicBool,
+    }
+
+    impl MetadataAuthority for OneConflictAuthority {
+        type Snapshot = <ToyKvMetadataAuthority as MetadataAuthority>::Snapshot;
+
+        fn now(&self) -> MonotonicTime {
+            self.inner.now()
+        }
+
+        fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MetadataError> {
+            self.inner.get(key)
+        }
+
+        fn transact<R, F>(&self, op: MutationIdentity<'_>, body: F) -> Result<R, MetadataError>
+        where
+            F: FnMut(&mut dyn MetadataTxn) -> Result<R, MetadataError>,
+        {
+            if self.inject_conflict.swap(false, Ordering::AcqRel) {
+                return Err(MetadataError::Conflict);
+            }
+            self.inner.transact(op, body)
+        }
+
+        fn reconcile_unknown(
+            &self,
+            op: MutationIdentity<'_>,
+        ) -> Result<ReconciledOutcome, MetadataError> {
+            self.inner.reconcile_unknown(op)
+        }
+
+        fn snapshot(&self) -> Result<Self::Snapshot, MetadataError> {
+            self.inner.snapshot()
+        }
+
+        fn scan_prefix(
+            &self,
+            snapshot: &Self::Snapshot,
+            prefix: &[u8],
+            cursor: Option<&MetadataCursor>,
+            limit: std::num::NonZeroUsize,
+        ) -> Result<MetadataPage, MetadataError> {
+            self.inner.scan_prefix(snapshot, prefix, cursor, limit)
+        }
+    }
+
+    let harness = TestHarness::start();
+    let ws = WorkspaceId::from_bytes(id16(130));
+    let principal = PrincipalId::from_bytes(id16(131));
+    let wrapper = Arc::new(OneConflictAuthority {
+        inner: Arc::clone(&harness.authority),
+        inject_conflict: AtomicBool::new(false),
+    });
+    let control = WorkspaceControl::new(
+        Arc::clone(&wrapper),
+        ws,
+        harness.object_store.scope_id(ws),
+        principal,
+        harness.incarnation,
+    );
+
+    let report_id = OperationId::from_bytes(id16(132));
+    let root_attempt = OperationId::from_bytes(id16(133));
+    let inv_attempt = OperationId::from_bytes(id16(134));
+    let budget = GcReportBudget::default();
+
+    control
+        .begin_gc_report_attempt(report_id, root_attempt, budget)
+        .unwrap();
+
+    // finalize_gc_report must reject Sealing state (cannot skip Sealed).
+    let dummy_summary = versionfs_core::gc::GcReportSummary {
+        report_id,
+        boundary_time: harness.clock.now(),
+        sealed_root_count: 0,
+        marked_objects: 0,
+        observed_objects: 0,
+        observed_bytes: 0,
+        unreachable_objects: 0,
+        unreachable_bytes: 0,
+        candidate_page_count: 1,
+        inventory_started_unix_ms: 1,
+        inventory_finished_unix_ms: 2,
+        detail_expires_at: harness.clock.now().saturating_add_nanos(1_000_000),
+        detail_expires_at_unix_ms: u64::MAX,
+        owner_incarnation_u64: harness.incarnation.as_u64(),
+        completeness: GcReportCompleteness::Complete,
+    };
+    assert!(
+        control
+            .finalize_gc_report(budget, inv_attempt, &dummy_summary)
+            .is_err()
+    );
+
+    // Seal properly, then inject a Conflict on candidate batch persistence -> must retry & succeed.
+    control
+        .seal_gc_report_roots(report_id, root_attempt, budget)
+        .unwrap();
+    wrapper.inject_conflict.store(true, Ordering::Release);
+    control
+        .persist_gc_report_batch(
+            report_id,
+            inv_attempt,
+            0,
+            &[GcCandidatePage {
+                page_index: 0,
+                next_page: None,
+                entries: Vec::new(),
+            }],
+        )
+        .unwrap();
+    let published = control
+        .finalize_gc_report(budget, inv_attempt, &dummy_summary)
+        .unwrap();
+    assert_eq!(published, dummy_summary);
+    let (_, page0) = control
+        .get_gc_report(
+            report_id,
+            Some(0),
+            versionfs_service::gc_report::unix_ms_now(),
+        )
+        .unwrap();
+    assert!(page0.is_some());
+}
+
+#[test]
+fn work_queue_spill_pop_spill_tracks_disk_budget_accurately() {
+    use versionfs_core::gc::{DiskSpillWorkQueue, GcSpillBudget};
+
+    let dir = TempDir::new();
+    // 42 bytes per work-queue record; cap at 2 records = 84 bytes.
+    let budget = GcSpillBudget::new(84);
+    let mut queue = DiskSpillWorkQueue::new_with_budget(&dir.0, 4, budget.clone()).unwrap();
+
+    let mk_ref = |seed: u8| ObjectRef {
+        object_type: ObjectType::Extent,
+        object_id: ObjectId::from_bytes([seed; 32]),
+        encoded_len: 4096,
+    };
+
+    // Push 4 into RAM, 5th triggers spill of 2 items (84 bytes).
+    for i in 1..=5_u8 {
+        queue.push(mk_ref(i)).unwrap();
+    }
+    assert_eq!(budget.used_bytes(), 84);
+
+    // Pop 4 items: 3 from RAM, 4th reloads the 2-item spill chunk and releases all 84 bytes.
+    for _ in 0..4 {
+        assert!(queue.pop().unwrap().is_some());
+    }
+    assert_eq!(budget.used_bytes(), 0);
+
+    // 1 item remains in RAM; pushing 4 more fills RAM (3) + spills 2 (84 bytes) + 1 in RAM = 3 in
+    // RAM.
+    for i in 10..=13_u8 {
+        queue.push(mk_ref(i)).unwrap();
+    }
+    assert_eq!(budget.used_bytes(), 84);
+
+    // 1 more fills RAM to 4; the next push attempts a second spill exceeding the 84-byte cap ->
+    // fails.
+    queue.push(mk_ref(14)).unwrap();
+    assert!(queue.push(mk_ref(15)).is_err());
+}

@@ -7,17 +7,18 @@
 //! window, and persist bounded candidate pages in small batches without issuing
 //! any object deletions.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::runtime::{Handle, RuntimeFlavor};
-use versionfs_core::control::{ControlError, GcReportState, WorkspaceControl};
+use versionfs_core::control::{ControlError, GcReportState, OwnerIncarnation, WorkspaceControl};
 use versionfs_core::format::ObjectRef;
 use versionfs_core::gc::{
     CANDIDATE_PERSIST_BATCH_PAGES, DiskSpillVisitedSet, DiskSpillWorkQueue, GcCandidateEntry,
-    GcCandidatePage, GcError, GcReportBudget, GcReportCompleteness, GcReportSummary,
+    GcCandidatePage, GcError, GcReportBudget, GcReportCompleteness, GcReportSummary, GcSpillBudget,
     mark_reachable_closure,
 };
 use versionfs_core::identity::{ObjectId, ObjectStoreScopeId, OperationId, WorkspaceId};
@@ -97,11 +98,41 @@ pub fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn next_attempt_id() -> OperationId {
+fn active_sealers() -> &'static Mutex<HashSet<(WorkspaceId, OperationId, OperationId)>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<(WorkspaceId, OperationId, OperationId)>>> =
+        OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+struct ActiveSealerGuard {
+    key: (WorkspaceId, OperationId, OperationId),
+}
+
+impl ActiveSealerGuard {
+    fn enter(workspace_id: WorkspaceId, report_id: OperationId, attempt_id: OperationId) -> Self {
+        let key = (workspace_id, report_id, attempt_id);
+        let mut guard = active_sealers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(key);
+        Self { key }
+    }
+}
+
+impl Drop for ActiveSealerGuard {
+    fn drop(&mut self) {
+        let mut guard = active_sealers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&self.key);
+    }
+}
+
+fn next_attempt_id(owner_incarnation: OwnerIncarnation) -> OperationId {
     static NEXT_ATTEMPT_SEQ: AtomicU64 = AtomicU64::new(1);
     let seq = NEXT_ATTEMPT_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut bytes = [0_u8; 16];
-    bytes[0..8].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
+    bytes[0..8].copy_from_slice(&owner_incarnation.as_u64().to_be_bytes());
     bytes[8..16].copy_from_slice(&seq.to_be_bytes());
     OperationId::from_bytes(bytes)
 }
@@ -136,8 +167,9 @@ where
     }
 
     // Step 1: Admit or resume durable report lifecycle, enforcing caller/budget
-    // consistency, exclusive Sealing ownership, and permanent abort on snapshot loss.
-    let my_root_attempt_id = next_attempt_id();
+    // consistency, exclusive Sealing ownership, and permanent abort on snapshot loss
+    // or failed sealing executors.
+    let my_root_attempt_id = next_attempt_id(control.owner_incarnation());
     let mut sealed_pair = None;
     for _ in 0..1000 {
         match control.begin_gc_report_attempt(report_id, my_root_attempt_id, budget)? {
@@ -155,6 +187,8 @@ where
                 ..
             } => {
                 if active_attempt == my_root_attempt_id {
+                    let _sealer_guard =
+                        ActiveSealerGuard::enter(workspace_id, report_id, my_root_attempt_id);
                     sealed_pair = Some(control.seal_gc_report_roots(
                         report_id,
                         my_root_attempt_id,
@@ -162,7 +196,26 @@ where
                     )?);
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                let is_alive = active_sealers()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .contains(&(workspace_id, report_id, active_attempt));
+                if is_alive {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                match control.abort_stale_sealing_attempt(report_id, active_attempt, budget)? {
+                    GcReportState::Completed { summary, .. } => return Ok(summary),
+                    GcReportState::Sealed {
+                        root_attempt_id,
+                        header,
+                        ..
+                    } => {
+                        sealed_pair = Some((root_attempt_id, header));
+                        break;
+                    }
+                    _ => continue,
+                }
             }
             GcReportState::Admitted { .. } => {}
             GcReportState::Aborted { .. } => return Err(ControlError::Aborted.into()),
@@ -170,8 +223,8 @@ where
     }
     let (root_attempt_id, header) = sealed_pair.ok_or(ControlError::InProgress)?;
 
-    // Step 2: Traverse typed strong edges using bounded RAM + disk spill for both
-    // the visited set and the pending work queue.
+    // Step 2: Traverse typed strong edges using bounded RAM + shared disk spill
+    // budget for both the visited set and the pending work queue.
     static NEXT_SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
     let spill_seq = NEXT_SPILL_SEQ.fetch_add(1, Ordering::Relaxed);
     let spill_dir = std::env::temp_dir().join(format!(
@@ -180,8 +233,17 @@ where
     ));
     std::fs::create_dir(&spill_dir)?;
     let _spill_guard = SpillDirGuard(spill_dir.clone());
-    let mut visited = DiskSpillVisitedSet::new(&spill_dir, budget.max_in_memory_visited)?;
-    let mut work_queue = DiskSpillWorkQueue::new(&spill_dir, budget.max_in_memory_visited)?;
+    let spill_budget = GcSpillBudget::default();
+    let mut visited = DiskSpillVisitedSet::new_with_budget(
+        &spill_dir,
+        budget.max_in_memory_visited,
+        spill_budget.clone(),
+    )?;
+    let mut work_queue = DiskSpillWorkQueue::new_with_budget(
+        &spill_dir,
+        budget.max_in_memory_visited,
+        spill_budget,
+    )?;
     for page_idx in 0..header.root_page_count {
         let root_page = control.read_sealed_root_page(report_id, root_attempt_id, page_idx)?;
         for root in root_page.roots {
@@ -286,7 +348,7 @@ where
     // Persist candidate pages under a fresh `inventory_attempt_id` in bounded
     // batches so the authority commit gate is never held for a large transaction
     // and losing/competing attempts never mix pages with the winning summary.
-    let inventory_attempt_id = next_attempt_id();
+    let inventory_attempt_id = next_attempt_id(control.owner_incarnation());
     for (batch_idx, batch) in pages.chunks(CANDIDATE_PERSIST_BATCH_PAGES).enumerate() {
         control.persist_gc_report_batch(
             report_id,

@@ -3498,6 +3498,47 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         Ok(state)
     }
 
+    /// Reconciles and aborts a stale `Sealing` attempt in the same owner incarnation
+    /// whose in-process executor is no longer alive.
+    ///
+    /// If the seal or report already committed (for example after an unknown outcome),
+    /// returns that committed [`GcReportState`] instead of aborting.
+    pub fn abort_stale_sealing_attempt(
+        &self,
+        report_id: OperationId,
+        expected_attempt_id: OperationId,
+        budget: GcReportBudget,
+    ) -> Result<GcReportState, ControlError> {
+        let fp = self.gc_report_fingerprint(budget);
+        let state_key = gc_report_state_key(self.workspace_id, report_id);
+        let seal_outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"seal");
+        let _ = reconcile_outcome(self.authority.as_ref(), &seal_outcome_key)?;
+
+        if let Some(existing) = self.authority.get(&state_key)? {
+            let state = GcReportState::decode(&existing)
+                .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
+            let state = validate_gc_report_state(state, fp)?;
+            match &state {
+                GcReportState::Sealed { .. } | GcReportState::Completed { .. } => {
+                    return Ok(state);
+                }
+                GcReportState::Sealing {
+                    root_attempt_id, ..
+                } if *root_attempt_id != expected_attempt_id => {
+                    return Ok(state);
+                }
+                GcReportState::Sealing { .. } | GcReportState::Admitted { .. } => {}
+                GcReportState::Aborted { .. } => return Err(ControlError::Aborted),
+            }
+        }
+        self.abort_gc_report_attempt(
+            report_id,
+            fp,
+            "sealing executor exited before completing seal",
+        )?;
+        Err(ControlError::Aborted)
+    }
+
     fn abort_gc_report_attempt(
         &self,
         report_id: OperationId,
@@ -3604,7 +3645,14 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             ControlError::InvalidRequest("scan_page_size must be nonzero"),
         )?;
         let boundary_time = self.authority.now();
-        let snapshot = self.authority.snapshot()?;
+        let snapshot = match self.authority.snapshot() {
+            Ok(snap) => snap,
+            Err(err) => {
+                let err = map_metadata_error(err);
+                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                return Err(err);
+            }
+        };
         let scan_result =
             self.scan_sealed_roots_from_snapshot(&snapshot, boundary_time, page_limit);
         // Release the read-only snapshot explicitly before any persistence or object I/O.
@@ -3640,7 +3688,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         for (batch_idx, batch) in chunks.chunks(CANDIDATE_PERSIST_BATCH_PAGES).enumerate() {
             let mut encoded_batch = Vec::with_capacity(batch.len());
             for page in batch {
-                encoded_batch.push((page.page_index, page.encode()?));
+                let key = gc_report_root_page_key(
+                    self.workspace_id,
+                    report_id,
+                    root_attempt_id,
+                    page.page_index,
+                );
+                encoded_batch.push((key, page.encode()?));
             }
             let batch_outcome_key = gc_report_batch_outcome_key(
                 self.workspace_id,
@@ -3649,21 +3703,9 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 b"root-batch",
                 u32::try_from(batch_idx).unwrap_or(u32::MAX),
             );
-            let _ = reconcile_outcome(self.authority.as_ref(), &batch_outcome_key)?;
-            match self.transact_with_outcome(&batch_outcome_key, |txn| {
-                for (page_idx, bytes) in &encoded_batch {
-                    let key = gc_report_root_page_key(
-                        self.workspace_id,
-                        report_id,
-                        root_attempt_id,
-                        *page_idx,
-                    );
-                    txn.put(&key, bytes)?;
-                }
-                Ok(Vec::new())
-            }) {
-                Ok(_) | Err(ControlError::Conflict) => {}
-                Err(err) => return Err(err),
+            if let Err(err) = self.persist_encoded_batch(&batch_outcome_key, &encoded_batch) {
+                let _ = self.abort_gc_report_attempt(report_id, fp, &err.to_string());
+                return Err(err);
             }
         }
 
@@ -3884,7 +3926,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     ) -> Result<(), ControlError> {
         let mut encoded_pages = Vec::with_capacity(pages.len());
         for page in pages {
-            encoded_pages.push((page.page_index, page.encode()?));
+            let pkey = gc_report_page_key(
+                self.workspace_id,
+                report_id,
+                inventory_attempt_id,
+                page.page_index,
+            );
+            encoded_pages.push((pkey, page.encode()?));
         }
         let outcome_key = gc_report_batch_outcome_key(
             self.workspace_id,
@@ -3893,18 +3941,40 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             b"cand-batch",
             batch_index,
         );
-        let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
-        match self.transact_with_outcome(&outcome_key, |txn| {
-            for (idx, bytes) in &encoded_pages {
-                let pkey =
-                    gc_report_page_key(self.workspace_id, report_id, inventory_attempt_id, *idx);
-                txn.put(&pkey, bytes)?;
-            }
-            Ok(Vec::new())
-        }) {
-            Ok(_) | Err(ControlError::Conflict) => Ok(()),
-            Err(err) => Err(err),
+        self.persist_encoded_batch(&outcome_key, &encoded_pages)
+    }
+
+    fn persist_encoded_batch(
+        &self,
+        outcome_key: &[u8],
+        entries: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<(), ControlError> {
+        if reconcile_outcome(self.authority.as_ref(), outcome_key)?.is_some() {
+            return Ok(());
         }
+        let mut last_err = None;
+        for _ in 0..4 {
+            match self.transact_with_outcome(outcome_key, |txn| {
+                for (key, bytes) in entries {
+                    txn.put(key, bytes)?;
+                }
+                Ok(Vec::new())
+            }) {
+                Ok(_) => return Ok(()),
+                Err(
+                    err @ (ControlError::Conflict
+                    | ControlError::Metadata(MetadataError::UnknownOutcome { .. })
+                    | ControlError::Metadata(MetadataError::ReconciliationRequired { .. })),
+                ) => {
+                    if reconcile_outcome(self.authority.as_ref(), outcome_key)?.is_some() {
+                        return Ok(());
+                    }
+                    last_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or(ControlError::Conflict))
     }
 
     /// Atomically publishes the terminal [`GcReportSummary`] and binds it to
@@ -3939,10 +4009,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 match GcReportState::decode(&existing_state).map_err(to_metadata_error)? {
                     GcReportState::Completed { summary, .. } => return Ok(summary.encode()),
                     GcReportState::Aborted { .. } => return Err(reject("aborted")),
-                    GcReportState::Admitted { .. }
-                    | GcReportState::Sealing { .. }
-                    | GcReportState::Sealed { .. } => {}
+                    GcReportState::Admitted { .. } | GcReportState::Sealing { .. } => {
+                        return Err(reject("invalid_transition"));
+                    }
+                    GcReportState::Sealed { .. } => {}
                 }
+            } else {
+                return Err(reject("invalid_transition"));
             }
             txn.put(&sum_key, &sum_bytes)?;
             txn.put(&inv_key, inventory_attempt_id.as_bytes())?;

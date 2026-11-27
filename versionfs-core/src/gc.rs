@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 use crate::format::{
@@ -419,6 +421,71 @@ impl GcCandidatePage {
     }
 }
 
+/// Shared disk-byte budget across a report's visited-set and work-queue spill files.
+#[derive(Clone, Debug)]
+pub struct GcSpillBudget {
+    used_bytes: Arc<AtomicU64>,
+    max_bytes: u64,
+}
+
+impl Default for GcSpillBudget {
+    fn default() -> Self {
+        Self::new(SERVER_MAX_SPILL_BYTES)
+    }
+}
+
+impl GcSpillBudget {
+    /// Creates a new shared spill disk budget capped at `max_bytes`.
+    pub fn new(max_bytes: u64) -> Self {
+        Self {
+            used_bytes: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+        }
+    }
+
+    /// Returns the number of spill disk bytes currently accounted for.
+    pub fn used_bytes(&self) -> u64 {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+
+    fn try_reserve(&self, bytes: u64) -> Result<(), GcError> {
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = cur
+                .checked_add(bytes)
+                .filter(|&v| v <= self.max_bytes)
+                .ok_or_else(|| {
+                    GcError::SpillIo(std::io::Error::other("gc spill disk budget exhausted"))
+                })?;
+            match self.used_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        let mut cur = self.used_bytes.load(Ordering::Acquire);
+        loop {
+            let next = cur.saturating_sub(bytes);
+            match self.used_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
 struct SpillRun {
     path: PathBuf,
     file: Option<File>,
@@ -433,8 +500,7 @@ pub struct DiskSpillVisitedSet {
     max_in_memory: usize,
     spill_dir: PathBuf,
     spill_runs: Vec<SpillRun>,
-    spill_bytes_used: u64,
-    max_spill_bytes: u64,
+    budget: GcSpillBudget,
     total_marked: u64,
 }
 
@@ -443,6 +509,15 @@ impl DiskSpillVisitedSet {
     /// distinct IDs are held in RAM, capped by [`SERVER_MAX_SPILL_BYTES`] on disk
     /// and a bounded pool of open file descriptors.
     pub fn new(spill_dir: impl Into<PathBuf>, max_in_memory: usize) -> Result<Self, GcError> {
+        Self::new_with_budget(spill_dir, max_in_memory, GcSpillBudget::default())
+    }
+
+    /// Creates a bounded visited set sharing `budget` with other spill structures.
+    pub fn new_with_budget(
+        spill_dir: impl Into<PathBuf>,
+        max_in_memory: usize,
+        budget: GcSpillBudget,
+    ) -> Result<Self, GcError> {
         let spill_dir = spill_dir.into();
         std::fs::create_dir_all(&spill_dir)?;
         Ok(Self {
@@ -450,8 +525,7 @@ impl DiskSpillVisitedSet {
             max_in_memory: max_in_memory.max(1),
             spill_dir,
             spill_runs: Vec::new(),
-            spill_bytes_used: 0,
-            max_spill_bytes: SERVER_MAX_SPILL_BYTES,
+            budget,
             total_marked: 0,
         })
     }
@@ -522,11 +596,7 @@ impl DiskSpillVisitedSet {
             return Ok(());
         }
         let added_bytes = (self.in_memory.len() as u64).saturating_mul(32);
-        if self.spill_bytes_used.saturating_add(added_bytes) > self.max_spill_bytes {
-            return Err(GcError::SpillIo(std::io::Error::other(
-                "gc visited-set spill disk budget exhausted",
-            )));
-        }
+        self.budget.try_reserve(added_bytes)?;
         let mut ids: Vec<ObjectId> = self.in_memory.iter().copied().collect();
         ids.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         let min_id = ids[0];
@@ -534,22 +604,36 @@ impl DiskSpillVisitedSet {
         let run_path = self
             .spill_dir
             .join(format!("visited-run-{}.bin", self.spill_runs.len()));
-        let mut file = OpenOptions::new()
+        let mut file = match OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
-            .open(&run_path)?;
+            .open(&run_path)
+        {
+            Ok(f) => f,
+            Err(err) => {
+                self.budget.release(added_bytes);
+                return Err(err.into());
+            }
+        };
         for id in &ids {
-            file.write_all(id.as_bytes())?;
+            if let Err(err) = file.write_all(id.as_bytes()) {
+                self.budget.release(added_bytes);
+                let _ = std::fs::remove_file(&run_path);
+                return Err(err.into());
+            }
         }
-        file.flush()?;
+        if let Err(err) = file.flush() {
+            self.budget.release(added_bytes);
+            let _ = std::fs::remove_file(&run_path);
+            return Err(err.into());
+        }
         let cached_file = if self.spill_runs.len() < MAX_OPEN_SPILL_FDS {
             Some(file)
         } else {
             drop(file);
             None
         };
-        self.spill_bytes_used = self.spill_bytes_used.saturating_add(added_bytes);
         self.spill_runs.push(SpillRun {
             path: run_path,
             file: cached_file,
@@ -565,7 +649,9 @@ impl DiskSpillVisitedSet {
 impl Drop for DiskSpillVisitedSet {
     fn drop(&mut self) {
         for run in &self.spill_runs {
-            let _ = std::fs::remove_file(&run.path);
+            if std::fs::remove_file(&run.path).is_ok() {
+                self.budget.release((run.count as u64).saturating_mul(32));
+            }
         }
     }
 }
@@ -576,14 +662,22 @@ pub struct DiskSpillWorkQueue {
     max_in_memory: usize,
     spill_dir: PathBuf,
     spill_chunks: Vec<(PathBuf, usize)>,
-    spill_bytes_used: u64,
-    max_spill_bytes: u64,
+    budget: GcSpillBudget,
 }
 
 impl DiskSpillWorkQueue {
     /// Creates a bounded work queue spilling overflow chunks to `spill_dir`,
     /// capped by [`SERVER_MAX_SPILL_BYTES`] on disk.
     pub fn new(spill_dir: impl Into<PathBuf>, max_in_memory: usize) -> Result<Self, GcError> {
+        Self::new_with_budget(spill_dir, max_in_memory, GcSpillBudget::default())
+    }
+
+    /// Creates a bounded work queue sharing `budget` with other spill structures.
+    pub fn new_with_budget(
+        spill_dir: impl Into<PathBuf>,
+        max_in_memory: usize,
+        budget: GcSpillBudget,
+    ) -> Result<Self, GcError> {
         let spill_dir = spill_dir.into();
         std::fs::create_dir_all(&spill_dir)?;
         Ok(Self {
@@ -591,8 +685,7 @@ impl DiskSpillWorkQueue {
             max_in_memory: max_in_memory.max(1),
             spill_dir,
             spill_chunks: Vec::new(),
-            spill_bytes_used: 0,
-            max_spill_bytes: SERVER_MAX_SPILL_BYTES,
+            budget,
         })
     }
 
@@ -629,50 +722,56 @@ impl DiskSpillWorkQueue {
                 encoded_len: u64::from_le_bytes(len_bytes),
             });
         }
-        self.spill_bytes_used = self
-            .spill_bytes_used
-            .saturating_sub((count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
-        let _ = std::fs::remove_file(path);
-        self.spill_bytes_used = self
-            .spill_bytes_used
-            .saturating_sub((count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
+        if std::fs::remove_file(path).is_ok() {
+            self.budget
+                .release((count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
+        }
         Ok(self.in_memory.pop())
     }
 
     fn spill_oldest_chunk(&mut self) -> Result<(), GcError> {
         let spill_count = (self.in_memory.len() / 2).max(1);
-        let chunk: Vec<ObjectRef> = self.in_memory.drain(..spill_count).collect();
-        let chunk_bytes = (chunk.len() as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64);
-        if self.spill_bytes_used.saturating_add(chunk_bytes) > self.max_spill_bytes {
-            return Err(GcError::SpillIo(std::io::Error::other(
-                "gc work-queue spill disk budget exhausted",
-            )));
-        }
+        let chunk_bytes = (spill_count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64);
+        self.budget.try_reserve(chunk_bytes)?;
         let path = self
             .spill_dir
             .join(format!("work-chunk-{}.bin", self.spill_chunks.len()));
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)?;
+        let mut file = match OpenOptions::new().create_new(true).write(true).open(&path) {
+            Ok(f) => f,
+            Err(err) => {
+                self.budget.release(chunk_bytes);
+                return Err(err.into());
+            }
+        };
         let mut buf = [0_u8; WORK_QUEUE_RECORD_BYTES];
-        for item in &chunk {
+        for item in &self.in_memory[..spill_count] {
             buf[0..2].copy_from_slice(&(item.object_type as u16).to_le_bytes());
             buf[2..34].copy_from_slice(item.object_id.as_bytes());
             buf[34..42].copy_from_slice(&item.encoded_len.to_le_bytes());
-            file.write_all(&buf)?;
+            if let Err(err) = file.write_all(&buf) {
+                self.budget.release(chunk_bytes);
+                let _ = std::fs::remove_file(&path);
+                return Err(err.into());
+            }
         }
-        file.flush()?;
-        self.spill_bytes_used = self.spill_bytes_used.saturating_add(chunk_bytes);
-        self.spill_chunks.push((path, chunk.len()));
+        if let Err(err) = file.flush() {
+            self.budget.release(chunk_bytes);
+            let _ = std::fs::remove_file(&path);
+            return Err(err.into());
+        }
+        self.in_memory.drain(..spill_count);
+        self.spill_chunks.push((path, spill_count));
         Ok(())
     }
 }
 
 impl Drop for DiskSpillWorkQueue {
     fn drop(&mut self) {
-        for (path, _) in &self.spill_chunks {
-            let _ = std::fs::remove_file(path);
+        for (path, count) in &self.spill_chunks {
+            if std::fs::remove_file(path).is_ok() {
+                self.budget
+                    .release((*count as u64).saturating_mul(WORK_QUEUE_RECORD_BYTES as u64));
+            }
         }
     }
 }
