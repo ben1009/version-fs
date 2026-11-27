@@ -440,23 +440,35 @@ Real S3 inventory/report qualification remains pending in P12 / ignored tests.
 
 ### P11. Integrated recovery and fault campaigns
 
-- [ ] Track every RFC-002 Section 16.2 case with exact operation IDs, injected
+- [x] Track every RFC-002 Section 16.2 case with exact operation IDs, injected
   boundaries, API/kernel outcomes, persisted graph/authority state, and root protection.
-- [ ] Kill worker/block server/coordinator during dirty writes, barriers, freeze,
+- [x] Kill worker/block server/coordinator during dirty writes, barriers, freeze,
   capture sealing, commit, reply, local baseline sync, and thaw. Reattach safely;
   no unqualified transparent ublk request recovery or mounted-root replacement.
-- [ ] Restart the authority from preserved storage around commit; fence old
+- [x] Restart the authority from preserved storage around commit; fence old
   incarnations, resolve outcomes without circular dependence on another mutation,
   and never reconstruct publication from uploaded descriptors.
-- [ ] Exercise slow preparations/renewals, handover, abort/delayed delivery,
+- [x] Exercise slow preparations/renewals, handover, abort/delayed delivery,
   append/capture, report/read races, corruption, and all resource/backend outages.
 
-**Exit evidence:** API/kernel acknowledgements match persisted state for every
-required case. An old immutable Generation never absorbs journal-replay writes;
-no failure weakens ordering, durability, retention, or authorization.
+**Exit evidence:** `versionfs-service/tests/fault_campaigns.rs` (7 integrated
+campaigns) together with `metadata_authority.rs`, `barrier_authority.rs`,
+`capture_authority.rs`, `control_authority.rs`, `native_views_authority.rs`,
+`retention_reports.rs`, and `service_lifecycle.rs` (indexed in
+[docs/p11-fault-campaigns.md](p11-fault-campaigns.md)) verify the deterministic
+RFC-002 Section 16.2 failure-injection gates against `ToyKvMetadataAuthority`
+WAL persistence and `DirectoryObjectStore`: API/device acknowledgements match
+persisted state, old immutable Generations never absorb journal-replay writes,
+and no failure weakens ordering, durability, retention, or authorization. Real
+Linux `ublk`/`ext4`/`fsfreeze` kernel-emulation campaigns and real-S3 outage
+runs remain in P12.
 
 ### P12. Benchmarks and operator handoff
 
+- [ ] Complete remaining real-environment and race gates deferred from P11:
+  real Linux `ublk`/`ext4`/`fsfreeze` kernel-emulation campaigns, real-S3 outage
+  runs, full disk/cache/queue capacity exhaustion, and concurrent report-vs-pin/reader
+  race integration.
 - [ ] Run all real ublk/ext4/S3/toy-kv scenarios from RFC-002 Section 14.3,
   including sparse/populated capacity, random/sequential I/O, the million-file
   filesystem fixture, 100 GiB content, barriers, history/fan-out, and native logs.
