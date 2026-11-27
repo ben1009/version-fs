@@ -97,6 +97,15 @@ pub fn unix_ms_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn next_attempt_id() -> OperationId {
+    static NEXT_ATTEMPT_SEQ: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_ATTEMPT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = [0_u8; 16];
+    bytes[0..8].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
+    bytes[8..16].copy_from_slice(&seq.to_be_bytes());
+    OperationId::from_bytes(bytes)
+}
+
 /// Runs a bounded, mark-only retention report for `workspace_id`.
 ///
 /// The authority snapshot is acquired and dropped inside
@@ -127,13 +136,39 @@ where
     }
 
     // Step 1: Admit or resume durable report lifecycle, enforcing caller/budget
-    // consistency and aborting permanently if a prior snapshot was lost.
-    let header = match control.begin_gc_report_attempt(report_id, budget)? {
-        GcReportState::Completed { summary, .. } => return Ok(summary),
-        GcReportState::Sealed { header, .. } => header,
-        GcReportState::Admitted { .. } => control.seal_gc_report_roots(report_id, budget)?,
-        GcReportState::Aborted { .. } => return Err(ControlError::Aborted.into()),
-    };
+    // consistency, exclusive Sealing ownership, and permanent abort on snapshot loss.
+    let my_root_attempt_id = next_attempt_id();
+    let mut sealed_pair = None;
+    for _ in 0..1000 {
+        match control.begin_gc_report_attempt(report_id, my_root_attempt_id, budget)? {
+            GcReportState::Completed { summary, .. } => return Ok(summary),
+            GcReportState::Sealed {
+                root_attempt_id,
+                header,
+                ..
+            } => {
+                sealed_pair = Some((root_attempt_id, header));
+                break;
+            }
+            GcReportState::Sealing {
+                root_attempt_id: active_attempt,
+                ..
+            } => {
+                if active_attempt == my_root_attempt_id {
+                    sealed_pair = Some(control.seal_gc_report_roots(
+                        report_id,
+                        my_root_attempt_id,
+                        budget,
+                    )?);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            GcReportState::Admitted { .. } => {}
+            GcReportState::Aborted { .. } => return Err(ControlError::Aborted.into()),
+        }
+    }
+    let (root_attempt_id, header) = sealed_pair.ok_or(ControlError::InProgress)?;
 
     // Step 2: Traverse typed strong edges using bounded RAM + disk spill for both
     // the visited set and the pending work queue.
@@ -148,7 +183,7 @@ where
     let mut visited = DiskSpillVisitedSet::new(&spill_dir, budget.max_in_memory_visited)?;
     let mut work_queue = DiskSpillWorkQueue::new(&spill_dir, budget.max_in_memory_visited)?;
     for page_idx in 0..header.root_page_count {
-        let root_page = control.read_sealed_root_page(report_id, page_idx)?;
+        let root_page = control.read_sealed_root_page(report_id, root_attempt_id, page_idx)?;
         for root in root_page.roots {
             work_queue.push(root)?;
         }
@@ -248,11 +283,14 @@ where
         };
     }
 
-    // Persist candidate pages in bounded batches so the authority commit gate is
-    // never held for a single multi-megabyte transaction.
+    // Persist candidate pages under a fresh `inventory_attempt_id` in bounded
+    // batches so the authority commit gate is never held for a large transaction
+    // and losing/competing attempts never mix pages with the winning summary.
+    let inventory_attempt_id = next_attempt_id();
     for (batch_idx, batch) in pages.chunks(CANDIDATE_PERSIST_BATCH_PAGES).enumerate() {
         control.persist_gc_report_batch(
             report_id,
+            inventory_attempt_id,
             u32::try_from(batch_idx).unwrap_or(u32::MAX),
             batch,
         )?;
@@ -297,9 +335,9 @@ where
         completeness,
     };
 
-    // Atomically publish summary with first-writer-wins semantics and return the
-    // authoritative summary stored in metadata.
-    Ok(control.finalize_gc_report(budget, &summary)?)
+    // Atomically publish summary bound to `inventory_attempt_id` with
+    // first-writer-wins semantics and return the authoritative summary.
+    Ok(control.finalize_gc_report(budget, inventory_attempt_id, &summary)?)
 }
 
 fn flush_candidate_page(

@@ -675,6 +675,12 @@ fn concurrent_same_report_id_returns_identical_terminal_summary_and_rejects_budg
     let r2 = t2.join().unwrap().unwrap();
     assert_eq!(r1, r2);
 
+    // Out-of-range page lookup returns NotFound.
+    let oob_err = client
+        .get_gc_report(report_id, Some(r1.candidate_page_count))
+        .unwrap_err();
+    assert_eq!(oob_err.code, ServiceErrorCode::NotFound);
+
     // Retrying the same report_id with a different budget must fail with
     // OperationMismatch/Conflict.
     let mismatched_budget = GcReportBudget {
@@ -879,11 +885,16 @@ fn snapshot_loss_before_sealing_aborts_report_id_permanently() {
     );
 
     let report_id = OperationId::from_bytes(id16(82));
+    let root_attempt_id = OperationId::from_bytes(id16(83));
     let budget = GcReportBudget::default();
-    control.begin_gc_report_attempt(report_id, budget).unwrap();
+    control
+        .begin_gc_report_attempt(report_id, root_attempt_id, budget)
+        .unwrap();
 
     // Snapshot loss during root scanning fails AND durably aborts report_id.
-    let err = control.seal_gc_report_roots(report_id, budget).unwrap_err();
+    let err = control
+        .seal_gc_report_roots(report_id, root_attempt_id, budget)
+        .unwrap_err();
     assert!(matches!(
         err,
         versionfs_core::control::ControlError::Metadata(MetadataError::Backend(_))
@@ -891,10 +902,67 @@ fn snapshot_loss_before_sealing_aborts_report_id_permanently() {
 
     // Retrying with the same report_id remains permanently Aborted (never acquires a new snapshot).
     let retry_err = control
-        .begin_gc_report_attempt(report_id, budget)
+        .begin_gc_report_attempt(report_id, OperationId::from_bytes(id16(84)), budget)
         .unwrap_err();
     assert!(matches!(
         retry_err,
+        versionfs_core::control::ControlError::Aborted
+    ));
+}
+
+#[test]
+fn process_crash_during_sealing_aborts_report_id_on_restart() {
+    let dir = TempDir::new();
+    let meta_dir = dir.0.join("meta");
+    let obj_dir = dir.0.join("objects");
+    let clock = Arc::new(TestClock::new(1_000_000_000));
+    let authority = Arc::new(
+        ToyKvMetadataAuthority::open_with(
+            &meta_dir,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            Arc::new(NoFailures),
+        )
+        .unwrap(),
+    );
+    let inc1 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(110))).unwrap();
+    let object_store = Arc::new(DirectoryObjectStore::open(&obj_dir).unwrap());
+    let ws = WorkspaceId::from_bytes(id16(111));
+    let principal = PrincipalId::from_bytes(id16(112));
+
+    let control1 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc1,
+    );
+    let report_id = OperationId::from_bytes(id16(113));
+    let budget = GcReportBudget::default();
+    let state = control1
+        .begin_gc_report_attempt(report_id, OperationId::from_bytes(id16(114)), budget)
+        .unwrap();
+    assert!(matches!(
+        state,
+        versionfs_core::control::GcReportState::Sealing { .. }
+    ));
+
+    // Simulate process crash (SIGKILL before seal completed) and restart under a new incarnation.
+    let inc2 =
+        start_authority_owner(authority.as_ref(), OperationId::from_bytes(id16(115))).unwrap();
+    assert_ne!(inc1.as_u64(), inc2.as_u64());
+    let control2 = WorkspaceControl::new(
+        Arc::clone(&authority),
+        ws,
+        object_store.scope_id(ws),
+        principal,
+        inc2,
+    );
+    let err = control2
+        .begin_gc_report_attempt(report_id, OperationId::from_bytes(id16(116)), budget)
+        .unwrap_err();
+    assert!(matches!(
+        err,
         versionfs_core::control::ControlError::Aborted
     ));
 }

@@ -3409,9 +3409,18 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
     }
 
     /// Admits or resumes a durable mark-only GC report attempt.
+    ///
+    /// - Reconciles any prior unknown admission outcome before inspecting state.
+    /// - Rejects retries with mismatched principal or budget (`OperationMismatch`).
+    /// - Transitions `None | Admitted -> Sealing(owner_incarnation, root_attempt_id)` atomically so
+    ///   only one executor can acquire a metadata snapshot.
+    /// - If a prior `Sealing` state belongs to a different `OwnerIncarnation` (process crashed
+    ///   before sealing), durably aborts `report_id` so retries cannot pick a new snapshot
+    ///   boundary.
     pub fn begin_gc_report_attempt(
         &self,
         report_id: OperationId,
+        root_attempt_id: OperationId,
         budget: GcReportBudget,
     ) -> Result<GcReportState, ControlError> {
         let fp = self.gc_report_fingerprint(budget);
@@ -3422,17 +3431,42 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         if let Some(existing) = self.authority.get(&state_key)? {
             let state = GcReportState::decode(&existing)
                 .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
-            return validate_gc_report_state(state, fp);
+            let state = validate_gc_report_state(state, fp)?;
+            if let GcReportState::Sealing {
+                owner_incarnation_u64,
+                ..
+            } = state
+            {
+                if owner_incarnation_u64 != self.owner_incarnation.0 {
+                    let _ = self.abort_gc_report_attempt(
+                        report_id,
+                        fp,
+                        "snapshot lost after process restart before sealing",
+                    );
+                    return Err(ControlError::Aborted);
+                }
+                return Ok(state);
+            }
+            if !matches!(state, GcReportState::Admitted { .. }) {
+                return Ok(state);
+            }
         }
 
+        let sealing = GcReportState::Sealing {
+            fingerprint: fp,
+            owner_incarnation_u64: self.owner_incarnation.0,
+            root_attempt_id,
+        }
+        .encode()?;
         let committed = self.transact_with_outcome(&outcome_key, |txn| {
             if let Some(existing) = txn.get(&state_key)? {
-                return Ok(existing);
+                let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
+                if !matches!(decoded, GcReportState::Admitted { .. }) {
+                    return Ok(existing);
+                }
             }
-            let admitted = GcReportState::Admitted { fingerprint: fp };
-            let encoded = admitted.encode().map_err(to_metadata_error)?;
-            txn.put(&state_key, &encoded)?;
-            Ok(encoded)
+            txn.put(&state_key, &sealing)?;
+            Ok(sealing.clone())
         });
 
         let bytes = match committed {
@@ -3447,7 +3481,21 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         };
         let state = GcReportState::decode(&bytes)
             .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
-        validate_gc_report_state(state, fp)
+        let state = validate_gc_report_state(state, fp)?;
+        if let GcReportState::Sealing {
+            owner_incarnation_u64,
+            ..
+        } = state
+            && owner_incarnation_u64 != self.owner_incarnation.0
+        {
+            let _ = self.abort_gc_report_attempt(
+                report_id,
+                fp,
+                "snapshot lost after process restart before sealing",
+            );
+            return Err(ControlError::Aborted);
+        }
+        Ok(state)
     }
 
     fn abort_gc_report_attempt(
@@ -3467,7 +3515,10 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         match self.transact_with_outcome(&outcome_key, |txn| {
             if let Some(existing) = txn.get(&state_key)? {
                 let decoded = GcReportState::decode(&existing).map_err(to_metadata_error)?;
-                if !matches!(decoded, GcReportState::Admitted { .. }) {
+                if !matches!(
+                    decoded,
+                    GcReportState::Admitted { .. } | GcReportState::Sealing { .. }
+                ) {
                     return Ok(existing);
                 }
             }
@@ -3481,12 +3532,14 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
 
     /// Copies and seals retained/live volume, log, artifact, and provenance roots
     /// from one read-only authority snapshot, releases the snapshot before any
-    /// persistence or object-store I/O, and persists sealed roots in bounded pages.
+    /// persistence or object-store I/O, and persists sealed roots under `root_attempt_id`
+    /// before atomically publishing `(root_attempt_id, SealedRootHeader)`.
     pub fn seal_gc_report_roots(
         &self,
         report_id: OperationId,
+        root_attempt_id: OperationId,
         budget: GcReportBudget,
-    ) -> Result<SealedRootHeader, ControlError> {
+    ) -> Result<(OperationId, SealedRootHeader), ControlError> {
         let fp = self.gc_report_fingerprint(budget);
         let state_key = gc_report_state_key(self.workspace_id, report_id);
         let seal_outcome_key = gc_report_outcome_key(self.workspace_id, report_id, b"seal");
@@ -3498,12 +3551,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             {
                 GcReportState::Sealed {
                     fingerprint,
+                    root_attempt_id: winner,
                     header,
                 } => {
                     if fingerprint != fp {
                         return Err(ControlError::OperationMismatch);
                     }
-                    return Ok(header);
+                    return Ok((winner, header));
                 }
                 GcReportState::Completed { fingerprint, .. } => {
                     if fingerprint != fp {
@@ -3514,10 +3568,33 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     ));
                 }
                 GcReportState::Aborted { .. } => return Err(ControlError::Aborted),
+                GcReportState::Sealing {
+                    fingerprint,
+                    owner_incarnation_u64,
+                    root_attempt_id: active_attempt,
+                } => {
+                    if fingerprint != fp {
+                        return Err(ControlError::OperationMismatch);
+                    }
+                    if owner_incarnation_u64 != self.owner_incarnation.0 {
+                        let _ = self.abort_gc_report_attempt(
+                            report_id,
+                            fp,
+                            "snapshot lost after process restart before sealing",
+                        );
+                        return Err(ControlError::Aborted);
+                    }
+                    if active_attempt != root_attempt_id {
+                        return Err(ControlError::InProgress);
+                    }
+                }
                 GcReportState::Admitted { fingerprint } => {
                     if fingerprint != fp {
                         return Err(ControlError::OperationMismatch);
                     }
+                    return Err(ControlError::InvalidRequest(
+                        "gc report must enter Sealing state before seal_gc_report_roots",
+                    ));
                 }
             }
         }
@@ -3568,16 +3645,20 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             let batch_outcome_key = gc_report_batch_outcome_key(
                 self.workspace_id,
                 report_id,
+                root_attempt_id,
                 b"root-batch",
                 u32::try_from(batch_idx).unwrap_or(u32::MAX),
             );
             let _ = reconcile_outcome(self.authority.as_ref(), &batch_outcome_key)?;
             match self.transact_with_outcome(&batch_outcome_key, |txn| {
                 for (page_idx, bytes) in &encoded_batch {
-                    let key = gc_report_root_page_key(self.workspace_id, report_id, *page_idx);
-                    if txn.get(&key)?.is_none() {
-                        txn.put(&key, bytes)?;
-                    }
+                    let key = gc_report_root_page_key(
+                        self.workspace_id,
+                        report_id,
+                        root_attempt_id,
+                        *page_idx,
+                    );
+                    txn.put(&key, bytes)?;
                 }
                 Ok(Vec::new())
             }) {
@@ -3596,6 +3677,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         };
         let sealed_state = GcReportState::Sealed {
             fingerprint: fp,
+            root_attempt_id,
             header,
         }
         .encode()?;
@@ -3605,7 +3687,7 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                     GcReportState::Sealed { .. }
                     | GcReportState::Completed { .. }
                     | GcReportState::Aborted { .. } => return Ok(existing),
-                    GcReportState::Admitted { .. } => {}
+                    GcReportState::Admitted { .. } | GcReportState::Sealing { .. } => {}
                 }
             }
             txn.put(&state_key, &sealed_state)?;
@@ -3624,7 +3706,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         match GcReportState::decode(&bytes)
             .map_err(|e| ControlError::CorruptRecord(e.to_string()))?
         {
-            GcReportState::Sealed { header, .. } => Ok(header),
+            GcReportState::Sealed {
+                root_attempt_id: winner,
+                header,
+                ..
+            } => Ok((winner, header)),
             GcReportState::Aborted { .. } => Err(ControlError::Aborted),
             other => Err(ControlError::CorruptRecord(format!(
                 "unexpected state after seal: {other:?}"
@@ -3774,22 +3860,25 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         Ok((roots, uncertain_preparations, missing_metadata))
     }
 
-    /// Reads one persisted sealed root page for `report_id`.
+    /// Reads one persisted sealed root page for `(report_id, root_attempt_id)`.
     pub fn read_sealed_root_page(
         &self,
         report_id: OperationId,
+        root_attempt_id: OperationId,
         page_index: u32,
     ) -> Result<SealedRootPage, ControlError> {
-        let key = gc_report_root_page_key(self.workspace_id, report_id, page_index);
+        let key =
+            gc_report_root_page_key(self.workspace_id, report_id, root_attempt_id, page_index);
         let bytes = self.authority.get(&key)?.ok_or(ControlError::NotFound)?;
         SealedRootPage::decode(&bytes).map_err(|e| ControlError::CorruptRecord(e.to_string()))
     }
 
-    /// Persists one bounded batch of candidate pages without holding the authority
-    /// commit gate across the entire report.
+    /// Persists one bounded batch of candidate pages scoped to `inventory_attempt_id`
+    /// without holding the authority commit gate across the entire report.
     pub fn persist_gc_report_batch(
         &self,
         report_id: OperationId,
+        inventory_attempt_id: OperationId,
         batch_index: u32,
         pages: &[GcCandidatePage],
     ) -> Result<(), ControlError> {
@@ -3797,15 +3886,19 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         for page in pages {
             encoded_pages.push((page.page_index, page.encode()?));
         }
-        let outcome_key =
-            gc_report_batch_outcome_key(self.workspace_id, report_id, b"cand-batch", batch_index);
+        let outcome_key = gc_report_batch_outcome_key(
+            self.workspace_id,
+            report_id,
+            inventory_attempt_id,
+            b"cand-batch",
+            batch_index,
+        );
         let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
         match self.transact_with_outcome(&outcome_key, |txn| {
             for (idx, bytes) in &encoded_pages {
-                let pkey = gc_report_page_key(self.workspace_id, report_id, *idx);
-                if txn.get(&pkey)?.is_none() {
-                    txn.put(&pkey, bytes)?;
-                }
+                let pkey =
+                    gc_report_page_key(self.workspace_id, report_id, inventory_attempt_id, *idx);
+                txn.put(&pkey, bytes)?;
             }
             Ok(Vec::new())
         }) {
@@ -3814,22 +3907,26 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         }
     }
 
-    /// Atomically publishes the terminal [`GcReportSummary`] with first-writer-wins
-    /// idempotency, returning the authoritative summary persisted in metadata.
+    /// Atomically publishes the terminal [`GcReportSummary`] and binds it to
+    /// `inventory_attempt_id` with first-writer-wins idempotency, returning the
+    /// authoritative summary persisted in metadata.
     pub fn finalize_gc_report(
         &self,
         budget: GcReportBudget,
+        inventory_attempt_id: OperationId,
         summary: &GcReportSummary,
     ) -> Result<GcReportSummary, ControlError> {
         let fp = self.gc_report_fingerprint(budget);
         let state_key = gc_report_state_key(self.workspace_id, summary.report_id);
         let sum_key = gc_report_summary_key(self.workspace_id, summary.report_id);
+        let inv_key = gc_report_winning_inventory_key(self.workspace_id, summary.report_id);
         let outcome_key = gc_report_outcome_key(self.workspace_id, summary.report_id, b"finalize");
         let _ = reconcile_outcome(self.authority.as_ref(), &outcome_key)?;
 
         let sum_bytes = summary.encode();
         let completed_bytes = GcReportState::Completed {
             fingerprint: fp,
+            inventory_attempt_id,
             summary: summary.clone(),
         }
         .encode()?;
@@ -3842,10 +3939,13 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
                 match GcReportState::decode(&existing_state).map_err(to_metadata_error)? {
                     GcReportState::Completed { summary, .. } => return Ok(summary.encode()),
                     GcReportState::Aborted { .. } => return Err(reject("aborted")),
-                    GcReportState::Admitted { .. } | GcReportState::Sealed { .. } => {}
+                    GcReportState::Admitted { .. }
+                    | GcReportState::Sealing { .. }
+                    | GcReportState::Sealed { .. } => {}
                 }
             }
             txn.put(&sum_key, &sum_bytes)?;
+            txn.put(&inv_key, inventory_attempt_id.as_bytes())?;
             txn.put(&state_key, &completed_bytes)?;
             Ok(sum_bytes.clone())
         });
@@ -3864,12 +3964,11 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
             .map_err(|e| ControlError::CorruptRecord(e.to_string()))
     }
 
-    /// Reads a persisted mark-only GC report summary and optional candidate page.
+    /// Reads a persisted mark-only GC report summary and optional candidate page
+    /// from the winning `inventory_attempt_id`.
     ///
     /// Terminal summary metadata remains readable after detail expiry; requesting a
     /// candidate page past expiry returns [`ControlError::ReportExpired`].
-    /// Checks monotonic deadline within the same authority incarnation and
-    /// `detail_expires_at_unix_ms` across authority restarts.
     pub fn get_gc_report(
         &self,
         report_id: OperationId,
@@ -3903,7 +4002,19 @@ impl<A: MetadataAuthority> WorkspaceControl<A> {
         if expired {
             return Err(ControlError::ReportExpired);
         }
-        let pkey = gc_report_page_key(self.workspace_id, report_id, idx);
+        if idx >= summary.candidate_page_count {
+            return Err(ControlError::NotFound);
+        }
+        let inv_key = gc_report_winning_inventory_key(self.workspace_id, report_id);
+        let inv_bytes = self.authority.get(&inv_key)?.ok_or_else(|| {
+            ControlError::CorruptRecord("missing winning inventory attempt".into())
+        })?;
+        let inv_arr: [u8; 16] = inv_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| ControlError::CorruptRecord("invalid inventory attempt id".into()))?;
+        let inventory_attempt_id = OperationId::from_bytes(inv_arr);
+        let pkey = gc_report_page_key(self.workspace_id, report_id, inventory_attempt_id, idx);
         let page_bytes = self.authority.get(&pkey)?.ok_or(ControlError::NotFound)?;
         let page = GcCandidatePage::decode(&page_bytes)
             .map_err(|e| ControlError::CorruptRecord(e.to_string()))?;
@@ -6198,17 +6309,30 @@ pub enum GcReportState {
         /// Request fingerprint binding principal and clamped budget.
         fingerprint: [u8; 32],
     },
-    /// Authority snapshot roots were sealed and persisted in bounded pages.
+    /// One owner incarnation is actively scanning and sealing a metadata snapshot.
+    Sealing {
+        /// Request fingerprint binding principal and clamped budget.
+        fingerprint: [u8; 32],
+        /// Authority owner incarnation holding the active snapshot.
+        owner_incarnation_u64: u64,
+        /// Attempt ID under which root pages are staged prior to atomic seal.
+        root_attempt_id: OperationId,
+    },
+    /// Authority snapshot roots were sealed and atomically published under `root_attempt_id`.
     Sealed {
         /// Request fingerprint binding principal and clamped budget.
         fingerprint: [u8; 32],
+        /// Published root attempt ID.
+        root_attempt_id: OperationId,
         /// Sealed root header metadata.
         header: SealedRootHeader,
     },
-    /// Terminal summary was atomically published.
+    /// Terminal summary was atomically published and bound to `inventory_attempt_id`.
     Completed {
         /// Request fingerprint binding principal and clamped budget.
         fingerprint: [u8; 32],
+        /// Published inventory attempt ID whose candidate pages match `summary`.
+        inventory_attempt_id: OperationId,
         /// Winning terminal summary.
         summary: GcReportSummary,
     },
@@ -6229,20 +6353,34 @@ impl GcReportState {
                 e.u8(1);
                 e.fixed(fingerprint);
             }
+            Self::Sealing {
+                fingerprint,
+                owner_incarnation_u64,
+                root_attempt_id,
+            } => {
+                e.u8(5);
+                e.fixed(fingerprint);
+                e.u64_le(*owner_incarnation_u64);
+                e.fixed(root_attempt_id.as_bytes());
+            }
             Self::Sealed {
                 fingerprint,
+                root_attempt_id,
                 header,
             } => {
                 e.u8(2);
                 e.fixed(fingerprint);
+                e.fixed(root_attempt_id.as_bytes());
                 e.bytes(&header.encode())?;
             }
             Self::Completed {
                 fingerprint,
+                inventory_attempt_id,
                 summary,
             } => {
                 e.u8(3);
                 e.fixed(fingerprint);
+                e.fixed(inventory_attempt_id.as_bytes());
                 e.bytes(&summary.encode())?;
             }
             Self::Aborted {
@@ -6265,10 +6403,12 @@ impl GcReportState {
             },
             2 => Self::Sealed {
                 fingerprint: d.fixed()?,
+                root_attempt_id: OperationId::from_bytes(d.fixed()?),
                 header: SealedRootHeader::decode(d.bytes(4096)?)?,
             },
             3 => Self::Completed {
                 fingerprint: d.fixed()?,
+                inventory_attempt_id: OperationId::from_bytes(d.fixed()?),
                 summary: GcReportSummary::decode(d.bytes(4096)?)?,
             },
             4 => {
@@ -6282,6 +6422,11 @@ impl GcReportState {
                     reason,
                 }
             }
+            5 => Self::Sealing {
+                fingerprint: d.fixed()?,
+                owner_incarnation_u64: d.u64_le()?,
+                root_attempt_id: OperationId::from_bytes(d.fixed()?),
+            },
             _ => return Err(FormatError::InvalidEnvelope("invalid gc report state tag")),
         };
         d.finish()?;
@@ -6295,6 +6440,7 @@ fn validate_gc_report_state(
 ) -> Result<GcReportState, ControlError> {
     let fp = match &state {
         GcReportState::Admitted { fingerprint }
+        | GcReportState::Sealing { fingerprint, .. }
         | GcReportState::Sealed { fingerprint, .. }
         | GcReportState::Completed { fingerprint, .. }
         | GcReportState::Aborted { fingerprint, .. } => *fingerprint,
@@ -6330,6 +6476,7 @@ fn gc_report_outcome_key(workspace: WorkspaceId, report_id: OperationId, tag: &[
 fn gc_report_batch_outcome_key(
     workspace: WorkspaceId,
     report_id: OperationId,
+    attempt_id: OperationId,
     tag: &[u8],
     batch_index: u32,
 ) -> Vec<u8> {
@@ -6338,6 +6485,7 @@ fn gc_report_batch_outcome_key(
         b"gc-report/batch-outcome/",
         workspace.as_bytes(),
         report_id.as_bytes(),
+        attempt_id.as_bytes(),
         tag,
         &batch_index.to_be_bytes(),
     ]
@@ -6346,6 +6494,7 @@ fn gc_report_batch_outcome_key(
 fn gc_report_root_page_key(
     workspace: WorkspaceId,
     report_id: OperationId,
+    root_attempt_id: OperationId,
     page_index: u32,
 ) -> Vec<u8> {
     [
@@ -6353,6 +6502,7 @@ fn gc_report_root_page_key(
         b"gc-report/root-page/",
         workspace.as_bytes(),
         report_id.as_bytes(),
+        root_attempt_id.as_bytes(),
         &page_index.to_be_bytes(),
     ]
     .concat()
@@ -6366,12 +6516,27 @@ fn gc_report_summary_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<
     ]
     .concat()
 }
-fn gc_report_page_key(workspace: WorkspaceId, report_id: OperationId, page_index: u32) -> Vec<u8> {
+fn gc_report_winning_inventory_key(workspace: WorkspaceId, report_id: OperationId) -> Vec<u8> {
+    [
+        KEY_PREFIX,
+        b"gc-report/winning-inventory/",
+        workspace.as_bytes(),
+        report_id.as_bytes(),
+    ]
+    .concat()
+}
+fn gc_report_page_key(
+    workspace: WorkspaceId,
+    report_id: OperationId,
+    inventory_attempt_id: OperationId,
+    page_index: u32,
+) -> Vec<u8> {
     [
         KEY_PREFIX,
         b"gc-report/page/",
         workspace.as_bytes(),
         report_id.as_bytes(),
+        inventory_attempt_id.as_bytes(),
         &page_index.to_be_bytes(),
     ]
     .concat()
